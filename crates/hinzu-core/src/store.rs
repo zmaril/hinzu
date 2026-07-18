@@ -46,6 +46,27 @@ CREATE TABLE IF NOT EXISTS effect_summaries (
 );
 ";
 
+/// Read a six-column row into a typed tuple. Shared by the definitions and
+/// edges queries so the per-column `get` sequence lives in exactly one place.
+fn six_cols<A, B, C, D, E, F>(r: &rusqlite::Row) -> rusqlite::Result<(A, B, C, D, E, F)>
+where
+    A: rusqlite::types::FromSql,
+    B: rusqlite::types::FromSql,
+    C: rusqlite::types::FromSql,
+    D: rusqlite::types::FromSql,
+    E: rusqlite::types::FromSql,
+    F: rusqlite::types::FromSql,
+{
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
 /// A handle on the SQLite fact store.
 pub struct Store {
     conn: Connection,
@@ -125,16 +146,7 @@ impl Store {
         let mut defs = self
             .conn
             .prepare("SELECT id, display, language, file, line_start, line_end FROM definitions")?;
-        let rows = defs.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, u32>(4)?,
-                r.get::<_, u32>(5)?,
-            ))
-        })?;
+        let rows = defs.query_map([], six_cols::<String, String, String, String, u32, u32>)?;
         for row in rows {
             let (id, display, language, file, line_start, line_end) = row?;
             facts.add_def(Definition {
@@ -150,16 +162,7 @@ impl Store {
         let mut edges = self.conn.prepare(
             "SELECT caller, callee, kind, resolution, evidence_file, evidence_line FROM edges",
         )?;
-        let rows = edges.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, u32>(5)?,
-            ))
-        })?;
+        let rows = edges.query_map([], six_cols::<String, String, String, String, String, u32>)?;
         for row in rows {
             let (caller, callee, kind, resolution, evidence_file, evidence_line) = row?;
             facts.add_edge(Edge {
