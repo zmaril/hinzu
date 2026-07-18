@@ -45,7 +45,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::facts::{EdgeResolution, Effect, EffectRoot, FactSet, SymbolId};
+use crate::facts::{EdgeResolution, Effect, EffectRoot, FactSet, Language, SymbolId};
 
 /// One prefix→effect rule: a callee whose path (generic arguments stripped)
 /// contains `prefix` is a root of `effect`.
@@ -77,30 +77,54 @@ const TRUSTED_TRAIT_MARKERS: &[&str] = &[" as std::", " as core::", " as alloc::
 /// pure — the standard library is trusted.
 const TRUSTED_PATH_PREFIXES: &[&str] = &["std::", "core::", "alloc::"];
 
-/// hinzu's shipped effect-annotation defaults: the standard library's I/O and
-/// allocation surface plus a few common effectful crates, as a data file merged
-/// in at construction. Editing the trust table means editing that file, not
-/// this module.
+/// hinzu's shipped Rust effect-annotation defaults: the standard library's I/O
+/// and allocation surface plus a few common effectful crates, as a data file
+/// merged in at construction. Editing the trust table means editing that file,
+/// not this module.
 const STD_ANNOTATIONS: &str = include_str!("../annotations/std.toml");
 
+/// hinzu's shipped TypeScript / Node effect-annotation defaults: the Node
+/// runtime's built-in effect surface, mapped to the same shared vocabulary. The
+/// counterpart to `std.toml` for the TypeScript adapter's canonical external
+/// symbols (`node:fs::readFileSync`, `global::fetch`). It carries no `alloc`
+/// rules — there is no `alloc` effect for a garbage-collected runtime.
+const NODE_ANNOTATIONS: &str = include_str!("../annotations/node.toml");
+
 impl Default for RootSeeds {
-    /// The shipped defaults (from `annotations/std.toml`) with no policy
+    /// The shipped Rust defaults (from `annotations/std.toml`) with no policy
     /// overrides. `pure_prefixes` carries only what that file's `[trust]`
     /// vouches pure — the genuinely-pure rest of the standard library is the
     /// trusted-pure baseline, applied after the effect table, not a prefix rule.
     fn default() -> Self {
+        Self::with_base(STD_ANNOTATIONS)
+    }
+}
+
+impl RootSeeds {
+    /// A fresh table built from one built-in annotation file (`std.toml` or
+    /// `node.toml`), before any policy overrides.
+    fn with_base(base: &str) -> Self {
         let mut seeds = RootSeeds {
             seeds: Vec::new(),
             pure_prefixes: Vec::new(),
         };
         seeds
-            .merge_toml(STD_ANNOTATIONS)
-            .expect("built-in annotations/std.toml is valid");
+            .merge_toml(base)
+            .expect("built-in annotation file is valid");
         seeds
     }
-}
 
-impl RootSeeds {
+    /// The shipped defaults for a language: `std.toml` for Rust, `node.toml` for
+    /// TypeScript. The two never mix — a Rust `alloc`/`Vec::push` rule must not
+    /// fire on a TypeScript symbol, and a `node:fs` rule must not fire on a Rust
+    /// one — so each language starts from its own base.
+    pub fn for_language(language: Language) -> Self {
+        match language {
+            Language::Rust => Self::with_base(STD_ANNOTATIONS),
+            Language::TypeScript => Self::with_base(NODE_ANNOTATIONS),
+        }
+    }
+
     /// Parse the `[roots]` and `[trust]` sections of a `hinzu.toml` string and
     /// merge them onto the shipped defaults.
     ///
@@ -114,7 +138,15 @@ impl RootSeeds {
     /// effects, the same as a `[roots]` rule). An empty or absent section leaves
     /// the defaults untouched.
     pub fn from_toml(src: &str) -> Result<Self> {
-        let mut seeds = RootSeeds::default();
+        Self::from_toml_for(Language::Rust, src)
+    }
+
+    /// Like [`RootSeeds::from_toml`], but starting from the given language's
+    /// built-in annotation base — so a TypeScript project resolves its Node
+    /// built-ins and never sees a Rust `alloc` rule. The policy's `[roots]` /
+    /// `[trust]` rules merge on top identically for both languages.
+    pub fn from_toml_for(language: Language, src: &str) -> Result<Self> {
+        let mut seeds = RootSeeds::for_language(language);
         seeds.merge_toml(src)?;
         Ok(seeds)
     }
@@ -225,6 +257,17 @@ impl RootSeeds {
         self.seed(facts);
 
         let seen = SeenCallees::from_facts(facts);
+        // Callees already seeded as a real effect are accounted for and must not
+        // also become `Unknown`. This covers an adapter that seeds effect roots
+        // directly by declaration provenance (the TypeScript adapter's Node
+        // built-ins) even if this table's own rules would not name them, so a
+        // known effect is never double-reported as an uncertainty.
+        let real_roots: BTreeSet<&str> = facts
+            .roots
+            .iter()
+            .filter(|r| r.effect != Effect::Unknown)
+            .map(|r| r.symbol.as_str())
+            .collect();
         let mut present: BTreeSet<SymbolId> = facts
             .roots
             .iter()
@@ -237,7 +280,7 @@ impl RootSeeds {
             // An indirect call the driver could not resolve: unknown *target*.
             let unknown = if edge.resolution == EdgeResolution::Unresolved {
                 true
-            } else if seen.contains(&edge.callee) {
+            } else if seen.contains(&edge.callee) || real_roots.contains(edge.callee.as_str()) {
                 false
             } else {
                 // A foreign, no-body callee: unknown only if nothing resolved it.
@@ -761,5 +804,75 @@ mod tests {
             seeds.effect_of("redis::Client::get::<&str>"),
             Some(Effect::Net)
         );
+    }
+
+    #[test]
+    fn typescript_base_resolves_node_builtins_and_omits_rust_alloc() {
+        // The TypeScript base (`node.toml`) maps the adapter's canonical symbols
+        // to the shared vocabulary.
+        let seeds = RootSeeds::for_language(Language::TypeScript);
+        assert_eq!(seeds.effect_of("node:fs::readFileSync"), Some(Effect::Fs));
+        assert_eq!(seeds.effect_of("global::fetch"), Some(Effect::Net));
+        assert_eq!(seeds.effect_of("global::Math.random"), Some(Effect::Random));
+        assert_eq!(
+            seeds.effect_of("node:child_process::spawn"),
+            Some(Effect::Process)
+        );
+        // No `alloc` bleeds in from the Rust table: a TypeScript method named
+        // `push` is not an allocation effect (there is no `alloc` for TS).
+        assert_eq!(seeds.effect_of("src/list#List.push"), None);
+        // And a project `[trust]` line still declares a db package's effect.
+        let seeds =
+            RootSeeds::from_toml_for(Language::TypeScript, "[trust]\n\"pg\" = [\"db\"]\n").unwrap();
+        assert_eq!(seeds.effect_of("pg::Client::query"), Some(Effect::Db));
+    }
+
+    #[test]
+    fn typescript_npm_call_is_unknown_but_node_builtin_root_is_not() {
+        // A TypeScript fact set as the adapter emits it: a local function calls a
+        // Node built-in (seeded as an fs root by the adapter) and an unvouched npm
+        // package (no root).
+        let mut facts = FactSet::default();
+        facts.add_def(crate::facts::Definition {
+            id: "src/io#readConfig".to_string(),
+            display: "readConfig".to_string(),
+            language: Language::TypeScript,
+            file: "src/io.ts".to_string(),
+            line_start: 1,
+            line_end: 3,
+        });
+        facts.add_edge(Edge::call(
+            "src/io#readConfig",
+            "node:fs::readFileSync",
+            "src/io.ts",
+            2,
+        ));
+        facts.add_edge(Edge::call(
+            "src/io#readConfig",
+            "left-pad::leftPad",
+            "src/io.ts",
+            3,
+        ));
+        // The adapter seeds the Node built-in directly by declaration provenance.
+        facts.add_root(EffectRoot {
+            symbol: "node:fs::readFileSync".to_string(),
+            effect: Effect::Fs,
+        });
+
+        RootSeeds::for_language(Language::TypeScript).seed_unknowns(&mut facts);
+
+        let unknowns: BTreeSet<&str> = facts
+            .roots
+            .iter()
+            .filter(|r| r.effect == Effect::Unknown)
+            .map(|r| r.symbol.as_str())
+            .collect();
+        // The npm call is Unknown; the built-in fs root is accounted for, not
+        // double-reported as an uncertainty.
+        assert_eq!(unknowns, BTreeSet::from(["left-pad::leftPad"]));
+        assert!(facts
+            .roots
+            .iter()
+            .any(|r| r.effect == Effect::Fs && r.symbol == "node:fs::readFileSync"));
     }
 }

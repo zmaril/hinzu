@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- TypeScript adapter (slice 2) — `hinzu check <ts-project>` now works, through
+  the same pipeline as Rust: adapter, SQLite fact store, DBSP propagation,
+  `hinzu.toml` policy, violations. The adapter (`adapters/typescript/`) is a
+  native TypeScript compiler-API extractor: it builds a program from the
+  project's `tsconfig`, walks each file with an enclosing-function stack, and
+  resolves callees with `getResolvedSignature`, emitting hinzu's `FactSet` JSON —
+  both `call` and `reference` edges, with effect roots seeded by declaration
+  provenance. `hinzu check` routes by project type: a `Cargo.toml` takes the Rust
+  StableMIR path, a `tsconfig.json` / `package.json` the TypeScript adapter (set
+  `HINZU_TS_ADAPTER` to override its location). Node builtins map to hinzu's one
+  flat, shared effect vocabulary — `fs`, `net`, `process`, `env`, `clock`,
+  `random`, the same names Rust uses; TypeScript seeds that subset and there is
+  deliberately no `alloc` for a garbage-collected runtime. A third-party npm
+  package the checker cannot see through is `Unknown` and fails by default, until
+  a `[trust]` line vouches for it, the same as Rust. hinzu ships a built-in
+  TypeScript annotation set, `crates/hinzu-core/annotations/node.toml` (the
+  counterpart to `std.toml`), so `Unknown` classification and `[roots]`/`[trust]`
+  overrides work identically for both languages. See
+  [`notes/typescript-catalog.md`](./notes/typescript-catalog.md).
 - Honest treatment of unseen externals — the `Unknown` marker. A call the
   analyzer cannot see through — a foreign, no-body callee that no rule resolved,
   or an indirect call (function pointer / `dyn`) the driver marked unresolved —

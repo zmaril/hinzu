@@ -1,0 +1,76 @@
+{
+  "definitions": [
+    {
+      "id": "src/io#readConfig",
+      "display": "readConfig",
+      "language": "typescript",
+      "file": "src/io.ts",
+      "line_start": 4,
+      "line_end": 7
+    },
+    {
+      "id": "src/core#parse",
+      "display": "parse",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 6,
+      "line_end": 13
+    },
+    {
+      "id": "src/core#countKeys",
+      "display": "countKeys",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 15,
+      "line_end": 17
+    },
+    {
+      "id": "src/core#loadAndSummarize",
+      "display": "loadAndSummarize",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 20,
+      "line_end": 23
+    }
+  ],
+  "edges": [
+    {
+      "caller": "src/io#readConfig",
+      "callee": "node:fs::readFileSync",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/io.ts",
+      "evidence_line": 6
+    },
+    {
+      "caller": "src/core#loadAndSummarize",
+      "callee": "src/core#parse",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 21
+    },
+    {
+      "caller": "src/core#loadAndSummarize",
+      "callee": "src/io#readConfig",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 21
+    },
+    {
+      "caller": "src/core#loadAndSummarize",
+      "callee": "src/core#countKeys",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 22
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "node:fs::readFileSync",
+      "effect": "fs"
+    }
+  ]
+}

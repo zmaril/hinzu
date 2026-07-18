@@ -184,3 +184,38 @@ DBSP (`dbsp` 0.322) reproduced the reference effect summaries exactly on the pi 
 | add an edge into a hub (in-degree 223) | 431 funcs | ~13.5 ms | ~1.7x |
 
 Cost tracks the change: a one-call-site edit recomputes almost instantly, retraction correctly un-taints downstream functions, and a genuinely broad change does proportional work. A bake-off confirmed `ascent` and Cozo reproduce the same batch answer, but DBSP subsumes the batch case and adds incrementality, so it is the single engine.
+
+## TypeScript adapter (shipped, slice 2)
+
+The TypeScript adapter is now in the tree at `adapters/typescript/`, and
+`hinzu check <ts-project>` runs it end to end through the same pipeline as Rust.
+It is a native compiler-API extractor (TypeScript 5.9): build one program from
+the project's `tsconfig`, walk each source file with a stack of enclosing
+functions, and resolve each call with `checker.getResolvedSignature()`. It emits
+hinzu's `FactSet` JSON directly — definitions, `call` and `reference` edges, and
+effect roots seeded by the callee's declaration provenance.
+
+`hinzu check` routes by project type: a `Cargo.toml` takes the StableMIR path, a
+`tsconfig.json` / `package.json` the TypeScript adapter (shelled out to
+`node analyze.mjs`; `HINZU_TS_ADAPTER` overrides its location, and the run fails
+with an honest message when Node or the adapter is missing rather than faking an
+analysis). Everything downstream is shared: the SQLite store, DBSP propagation,
+and the `hinzu.toml` policy check.
+
+Effect roots use the one flat, shared vocabulary — `fs`, `net`, `process`, `env`,
+`clock`, `random` — the same names as Rust; TypeScript seeds that subset, and
+there is no `alloc` for a garbage-collected runtime (see
+[`typescript-catalog.md`](./typescript-catalog.md)). A third-party npm package the
+checker cannot see through is `Unknown` and fails by default, until a `[trust]`
+line vouches for it — identical to Rust's unseen-external handling. The built-in
+Node annotation set lives in `crates/hinzu-core/annotations/node.toml`, the
+counterpart to `std.toml`.
+
+Re-running the shared pipeline over pi (earendil-works/pi) proves it on real
+code: the adapter extracted 16,056 definitions and 41,980 edges (137 reference,
+11,168 into unresolved npm), seeding 104 effect roots, in about 18 seconds; an
+illustrative functional-core policy over the render and prompt layers then flagged
+109 forbidden-effect violations (77 net, 16 fs, 16 process) with evidence paths
+such as `TUI.doRender -> node:fs::mkdirSync` and `stream -> (anonymous) ->
+global::fetch`, plus 661 `Unknown` warnings naming the npm packages the checker
+could not see through (chalk, semver, yaml, openai, typebox, and more).

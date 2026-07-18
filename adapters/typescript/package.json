@@ -1,0 +1,19 @@
+{
+  "name": "hinzu-typescript-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The hinzu TypeScript adapter — a compiler-API extractor emitting hinzu FactSet JSON.",
+  "type": "module",
+  "bin": {
+    "hinzu-ts": "analyze.mjs"
+  },
+  "scripts": {
+    "analyze": "node analyze.mjs"
+  },
+  "dependencies": {
+    "typescript": "5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19"
+  }
+}

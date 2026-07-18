@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod rust_adapter;
+mod ts_adapter;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,7 +9,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use hinzu_core::effects::{EffectEngine, NaiveEngine};
-use hinzu_core::facts::FactSet;
+use hinzu_core::facts::{FactSet, Language};
 use hinzu_core::policy::{OnUnknown, Policy};
 use hinzu_core::roots::RootSeeds;
 use hinzu_dbsp::DbspEngine;
@@ -105,7 +106,10 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
     // propagation runs, so effects that leave the workspace still light up.
     let policy_src = read_policy_src(&args)?;
     let policy = Policy::from_toml(&policy_src)?;
-    let seeds = RootSeeds::from_toml(&policy_src)?;
+    // Seed from the language's own built-in annotation base: `std.toml` for Rust,
+    // `node.toml` for TypeScript. The language is read from the facts themselves,
+    // so `--facts` JSON routes the same way a live extraction does.
+    let seeds = RootSeeds::from_toml_for(facts_language(&facts), &policy_src)?;
     // Under `on_unknown = ignore` an unseen external is read as pure (the old
     // behavior), so seed effect roots only. Otherwise also seed an `Unknown`
     // root for every unseen callee, so uncertainty propagates and is reported.
@@ -136,14 +140,37 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
         return FactSet::from_json(&json)
             .with_context(|| format!("parsing facts from {}", path.display()));
     }
+    // A Cargo.toml routes to the Rust StableMIR path; a tsconfig/package.json to
+    // the TypeScript compiler-API adapter. Rust wins a tie so a Rust crate with a
+    // stray package.json is not misrouted.
     if rust_adapter::is_cargo_project(&args.path) {
         return rust_adapter::extract_facts(&args.path)
             .with_context(|| format!("extracting Rust facts from {}", args.path.display()));
     }
+    if ts_adapter::is_ts_project(&args.path) {
+        return ts_adapter::extract_facts(&args.path)
+            .with_context(|| format!("extracting TypeScript facts from {}", args.path.display()));
+    }
     anyhow::bail!(
-        "{} is not a cargo project — pass --facts <json> to analyze pre-extracted facts",
+        "{} is neither a cargo project nor a TypeScript project — pass --facts <json> to analyze \
+         pre-extracted facts",
         args.path.display()
     )
+}
+
+/// The language to seed effect roots for: TypeScript if any definition is
+/// TypeScript, else Rust. Reading it from the facts keeps `--facts` JSON and a
+/// live extraction on the same path.
+fn facts_language(facts: &FactSet) -> Language {
+    if facts
+        .defs
+        .values()
+        .any(|d| d.language == Language::TypeScript)
+    {
+        Language::TypeScript
+    } else {
+        Language::Rust
+    }
 }
 
 /// Read the policy file source from `--policy`, else `hinzu.toml` in the target
