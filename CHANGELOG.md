@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Toolchain pin (`rust-toolchain.toml`): the workspace is pinned to stable
+  1.96.0. rustc 1.97.x hits an internal compiler error building the `dbsp`
+  dependency (a `dyn_clone` vtable-slot panic in the new trait solver); 1.96.0
+  compiles it cleanly. The pin can be lifted once the upstream regression is
+  fixed. The StableMIR driver keeps its own nightly toolchain file.
 - DBSP engine (`hinzu-dbsp`): the `DbspEngine` plugs into the `EffectEngine`
   seam and propagates effects with a recursive DBSP (Feldera) circuit —
   `effect(caller, e) :- edge(caller, callee), effect(callee, e)` over the union
