@@ -8,6 +8,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Python adapter — **ty as the sole resolution backend** (no fallback). The
+  adapter resolves call sites with **ty** (Astral's Rust type checker), driven
+  over its **LSP** (`ty server`, stdio JSON-RPC): it opens every source file,
+  settles the first check pass, then pipelines a `textDocument/definition` at each
+  callee token and maps the definition target (ty's vendored typeshed, or an
+  owned/third-party module) plus the enclosing qualname to a symbol and effect.
+  The earlier Jedi fallback is **removed**: ty is the only backend, kept behind
+  the `FactSet` seam for a future native in-process ty. If the `ty` binary is
+  absent the adapter exits nonzero with an honest message — never a faked or
+  weaker resolution. `HINZU_TY` overrides the ty binary path. The AST walk, caller
+  attribution, reference edges, and the whole owned/effect/stdlib/third-party
+  classification are backend-independent. On `housekeeping`, ty resolves 89.5% of
+  call sites, drives `fs`-effect coverage to 117 edges by resolving the un-typed
+  `pathlib` chains a name-resolver misses, and keeps the `Unknown` finding pile at
+  86 — un-typed `.is_dir()` / `.mkdir()` gaps become precise `forbids fs` findings
+  instead of "cannot certify." Unresolved sites still fail closed as `Unknown`
+  under `on_unknown = fail`, so precision rises without weakening soundness.
+- Python adapter — **recognize the interpreter's real stdlib as a ty definition
+  target**, fixing imported-stdlib resolution on headless CI runners. ty resolves
+  an imported stdlib symbol to whichever declaration it finds: its VENDORED
+  typeshed stub on most hosts, but the interpreter's REAL stdlib source
+  (`.../lib/python3.11/subprocess.py`) on a headless GitHub Actions runner, whose
+  interpreter ships a full stdlib. The adapter's target-provenance mapping only
+  recognized the vendored-typeshed and site-packages paths, so it dropped a
+  real-stdlib target as an unknown `OTHER` — turning `subprocess.run` into an
+  unresolved `Unknown` while `builtins.open` (a C builtin, always vendored)
+  resolved. This looked like ty "returning null for imported-stdlib" but was a
+  classification gap: `module_of_target` now recognizes a `.../pythonX.Y/…` stdlib
+  path (source or stub, excluding site-packages) as STDLIB. The adapter also pins
+  ty's target `python-version`/`python-platform` in the LSP `initialize`
+  (`initializationOptions`, `diagnosticMode: workspace`) so the typeshed is
+  selected deterministically. This lets the `py-check` CI job run its live fixture
+  assertion on **ty** (pinned `ty==0.0.61`), the same backend used locally and in
+  real use, and dump ty resolution diagnostics (a `textDocument/definition` probe
+  + ty server logs) each run. The stable Rust jobs stay backend-free — their Python
+  coverage is the committed sample-facts test, which runs from JSON with no ty. The
+  intent remains a native in-process ty backend behind the same `FactSet` seam once
+  ty ships a stable Rust library API; pyrefly was evaluated and near-tied but ty was
+  chosen (Astral trajectory + native-later intent), and zuban is excluded (AGPL).
+  See [`notes/python-catalog.md`](./notes/python-catalog.md).
+- Python adapter (slice 3) — `hinzu check <python-project>` now works, through
+  the same pipeline as Rust and TypeScript: adapter, SQLite fact store, DBSP
+  propagation, `hinzu.toml` policy, violations. The adapter
+  (`adapters/python/`) is a name-resolution extractor: the standard-library
+  `ast` module walks each file with an enclosing-function stack, and ty (over its
+  LSP) resolves each call site's callee, emitting hinzu's `FactSet` JSON — `call`
+  and `reference` edges, effect roots seeded by declaration provenance, and, for
+  every call site ty cannot resolve, an edge with `resolution: "unresolved"`.
+  `hinzu check` routes by project type: a
+  `Cargo.toml` takes the Rust StableMIR path, a `tsconfig.json` / `package.json`
+  the TypeScript adapter, a `pyproject.toml` / `setup.py` / `setup.cfg` the
+  Python adapter (set `HINZU_PY_ADAPTER` / `HINZU_PYTHON` to override). Python
+  seeds the shared vocabulary subset `fs`, `net`, `process`, `env`, `clock`,
+  `random` — the same names Rust and TypeScript use, no `alloc` for a
+  garbage-collected runtime; the bare `pathlib.Path(...)` constructor is pure,
+  only its I/O methods are `fs`. Python is still the weakest-resolution adapter —
+  an unresolved site becomes an `Unknown` that fails closed under the default
+  `on_unknown = fail`, which is what keeps it sound. hinzu ships a built-in Python
+  annotation set, `crates/hinzu-core/annotations/python.toml` (the counterpart to
+  `std.toml` / `node.toml`). A native in-process ty backend is the planned future
+  resolution primitive behind the same `FactSet` seam, once ty ships a stable
+  Rust library API. See [`notes/python-catalog.md`](./notes/python-catalog.md).
 - TypeScript adapter (slice 2) — `hinzu check <ts-project>` now works, through
   the same pipeline as Rust: adapter, SQLite fact store, DBSP propagation,
   `hinzu.toml` policy, violations. The adapter (`adapters/typescript/`) is a

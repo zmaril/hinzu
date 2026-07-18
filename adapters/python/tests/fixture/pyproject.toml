@@ -1,0 +1,16 @@
+# A minimal project marker so `hinzu check` routes this fixture to the Python
+# adapter (a `pyproject.toml` / `setup.py` / `setup.cfg` selects Python). It also
+# gives ty a proper project + a pinned target environment, so its vendored
+# typeshed stdlib resolves deterministically instead of depending on ty's
+# environment auto-discovery (unreliable on headless CI runners). The adapter
+# also pins the same target in the LSP `initialize`; this file makes a plain
+# `ty check` of the fixture deterministic too.
+[project]
+name = "hinzu-python-fixture"
+version = "0.0.0"
+description = "Functional-core fixture for the hinzu Python adapter."
+requires-python = ">=3.11"
+
+[tool.ty.environment]
+python-version = "3.11"
+python-platform = "linux"

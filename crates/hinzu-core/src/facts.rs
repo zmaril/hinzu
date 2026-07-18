@@ -12,12 +12,13 @@ use serde::{Deserialize, Serialize};
 /// (package/crate + version + descriptor path). Survives repeated analysis.
 pub type SymbolId = String;
 
-/// The languages hinzu adapters target first.
+/// The languages hinzu adapters target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     Rust,
     TypeScript,
+    Python,
 }
 
 impl Language {
@@ -26,6 +27,7 @@ impl Language {
         match self {
             Language::Rust => "rust",
             Language::TypeScript => "typescript",
+            Language::Python => "python",
         }
     }
 }
@@ -38,6 +40,7 @@ impl FromStr for Language {
         match s {
             "rust" => Ok(Language::Rust),
             "typescript" => Ok(Language::TypeScript),
+            "python" => Ok(Language::Python),
             other => anyhow::bail!("unknown language: {other}"),
         }
     }

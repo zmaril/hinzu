@@ -90,6 +90,14 @@ const STD_ANNOTATIONS: &str = include_str!("../annotations/std.toml");
 /// rules — there is no `alloc` effect for a garbage-collected runtime.
 const NODE_ANNOTATIONS: &str = include_str!("../annotations/node.toml");
 
+/// hinzu's shipped Python effect-annotation defaults: the CPython standard
+/// library's I/O surface (plus a few well-known effectful third-party packages),
+/// mapped to the same shared vocabulary. The counterpart to `std.toml` /
+/// `node.toml` for the Python adapter's canonical external symbols
+/// (`subprocess::run`, `builtins::open`, `pathlib::Path.mkdir`). It carries no
+/// `alloc` rules — there is no `alloc` effect for a garbage-collected runtime.
+const PYTHON_ANNOTATIONS: &str = include_str!("../annotations/python.toml");
+
 impl Default for RootSeeds {
     /// The shipped Rust defaults (from `annotations/std.toml`) with no policy
     /// overrides. `pure_prefixes` carries only what that file's `[trust]`
@@ -122,6 +130,7 @@ impl RootSeeds {
         match language {
             Language::Rust => Self::with_base(STD_ANNOTATIONS),
             Language::TypeScript => Self::with_base(NODE_ANNOTATIONS),
+            Language::Python => Self::with_base(PYTHON_ANNOTATIONS),
         }
     }
 
@@ -874,5 +883,83 @@ mod tests {
             .roots
             .iter()
             .any(|r| r.effect == Effect::Fs && r.symbol == "node:fs::readFileSync"));
+    }
+
+    #[test]
+    fn python_base_resolves_stdlib_and_omits_alloc() {
+        // The Python base (`python.toml`) maps the adapter's canonical symbols to
+        // the shared vocabulary, using the same segment-aligned matcher.
+        let seeds = RootSeeds::for_language(Language::Python);
+        assert_eq!(seeds.effect_of("builtins::open"), Some(Effect::Fs));
+        assert_eq!(seeds.effect_of("subprocess::run"), Some(Effect::Process));
+        assert_eq!(seeds.effect_of("os::system"), Some(Effect::Process));
+        assert_eq!(
+            seeds.effect_of("urllib::request.urlopen"),
+            Some(Effect::Net)
+        );
+        assert_eq!(seeds.effect_of("os::environ"), Some(Effect::Env));
+        assert_eq!(seeds.effect_of("time::monotonic"), Some(Effect::Clock));
+        assert_eq!(seeds.effect_of("secrets::token_hex"), Some(Effect::Random));
+        // A resolved pathlib I/O method is `fs`; the bare constructor is pure —
+        // the adapter never emits an effect edge for `pathlib::Path`.
+        assert_eq!(seeds.effect_of("pathlib::Path.mkdir"), Some(Effect::Fs));
+        assert_eq!(seeds.effect_of("pathlib::Path"), None);
+        assert_eq!(seeds.effect_of("pathlib::Path.with_suffix"), None);
+        // No `alloc` bleeds in from the Rust table: a Python method named `push`
+        // is not an allocation effect (there is no `alloc` for Python).
+        assert_eq!(seeds.effect_of("src/list.py#List.push"), None);
+        // And a project `[trust]` line still declares a db package's effect.
+        let seeds = RootSeeds::from_toml_for(Language::Python, "[trust]\n\"psycopg\" = [\"db\"]\n")
+            .unwrap();
+        assert_eq!(seeds.effect_of("psycopg::connect"), Some(Effect::Db));
+    }
+
+    #[test]
+    fn python_thirdparty_call_is_unknown_but_stdlib_root_is_not() {
+        // A Python fact set as the adapter emits it: a local function calls a
+        // stdlib effect (seeded as a process root by the adapter) and an unvouched
+        // third-party package (an edge with no root).
+        let mut facts = FactSet::default();
+        facts.add_def(crate::facts::Definition {
+            id: "src/ctx.py#run".to_string(),
+            display: "run".to_string(),
+            language: Language::Python,
+            file: "src/ctx.py".to_string(),
+            line_start: 1,
+            line_end: 3,
+        });
+        facts.add_edge(Edge::call(
+            "src/ctx.py#run",
+            "subprocess::run",
+            "src/ctx.py",
+            2,
+        ));
+        facts.add_edge(Edge::call(
+            "src/ctx.py#run",
+            "yaml::safe_load",
+            "src/ctx.py",
+            3,
+        ));
+        // The adapter seeds the stdlib effect directly by declaration provenance.
+        facts.add_root(EffectRoot {
+            symbol: "subprocess::run".to_string(),
+            effect: Effect::Process,
+        });
+
+        RootSeeds::for_language(Language::Python).seed_unknowns(&mut facts);
+
+        let unknowns: BTreeSet<&str> = facts
+            .roots
+            .iter()
+            .filter(|r| r.effect == Effect::Unknown)
+            .map(|r| r.symbol.as_str())
+            .collect();
+        // The third-party call is Unknown; the stdlib process root is accounted
+        // for, not double-reported as an uncertainty.
+        assert_eq!(unknowns, BTreeSet::from(["yaml::safe_load"]));
+        assert!(facts
+            .roots
+            .iter()
+            .any(|r| r.effect == Effect::Process && r.symbol == "subprocess::run"));
     }
 }

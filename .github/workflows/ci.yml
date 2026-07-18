@@ -129,3 +129,67 @@ jobs:
       # compile within budget.
       - name: hinzu check the TypeScript fixture (functional-core leak)
         run: cargo test -p hinzu-cli --test ts_check -- --ignored --exact check_typescript_project_end_to_end
+
+  # Run `hinzu check` on the Python fixture end to end: build the CLI on stable,
+  # install ty (the adapter's sole resolution backend), and check the fixture
+  # project through the SHARED pipeline (adapter -> SQLite -> DBSP -> policy). It
+  # must flag the functional-core leaks with their evidence paths.
+  #
+  # ty ON THE HEADLESS RUNNER. On this runner ty resolves `import subprocess` to
+  # the interpreter's REAL stdlib source (`.../lib/python3.11/subprocess.py`), not
+  # its vendored typeshed stub. The adapter's `module_of_target` recognizes that
+  # real-stdlib path as STDLIB (alongside vendored typeshed + site-packages), so
+  # `subprocess.run` resolves here exactly as it does locally against vendored
+  # typeshed (see notes/python-catalog.md). So this job runs its live assertion on
+  # ty (pinned `ty==0.0.61`), the same backend used locally and in real use — no
+  # fallback. The diagnostics step below dumps a definition probe + ty server logs.
+  #
+  # Isolated from the `rust` job like `self-check` and `ts-check` are. Python and
+  # ty live ONLY here; the stable Rust jobs never install them and never depend
+  # on Python — their Python coverage is the committed sample-facts test
+  # (`check_python_facts_reports_the_core_violations`), which runs from JSON with
+  # no backend. This job builds the CLI on the workspace pin (1.96.0, via
+  # rust-toolchain.toml) and never touches the nightly driver.
+  py-check:
+    name: py-check
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # ty is the adapter's sole backend. `ast` is stdlib; this installs the
+      # pinned `ty==0.0.61` from requirements.txt (the `ty` binary lands on PATH).
+      - name: install the Python adapter's resolution backend (ty)
+        working-directory: adapters/python
+        run: pip install -r requirements.txt
+      # Diagnostics: record ty's version and exactly how it resolves the fixture's
+      # environment and imported-stdlib symbols on THIS runner, so a resolution
+      # regression yields a real log (env discovery, python-version/platform, and
+      # a `subprocess.run` definition probe) rather than a bare test failure.
+      - name: ty resolution diagnostics on this runner
+        working-directory: adapters/python
+        env:
+          RUST_LOG: "ty_server=debug,ty_ide=debug,ty_module_resolver=debug,ty_python_semantic=debug"
+        run: |
+          ty --version
+          echo "--- ty check -vvv (environment + module resolution) ---"
+          ty check --project tests/fixture --python-version 3.11 \
+            --python-platform linux --exit-zero -vvv 2>&1 | \
+            grep -iE "python version|platform|stdlib|search path|vendored|requires-python|not found|subprocess" || true
+          echo "--- ty LSP definition probe (subprocess.run vs open, with server logs) ---"
+          python3 tests/ty_lsp_probe.py
+          echo "--- adapter dry run (ty backend, stderr diagnostics) ---"
+          python3 analyze.py tests/fixture >/dev/null
+      # The live adapter path, on ty: the ignored py_check test builds the CLI
+      # (debug) itself via assert_cmd and drives it over the fixture — the adapter
+      # extracts facts with ty, they propagate, and the functional-core leaks must
+      # be flagged. One build (no separate release step) keeps the cold `dbsp`
+      # compile within budget.
+      - name: hinzu check the Python fixture with ty (functional-core leaks)
+        run: cargo test -p hinzu-cli --test py_check -- --ignored --exact check_python_project_end_to_end
