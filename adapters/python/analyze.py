@@ -736,15 +736,26 @@ class TyResolver:
 
             qlist = list(queries)
             raw = self._pipeline(client, uri, sources, qlist)
-            # Retry-on-null once: a null early in the first pass may just mean the
-            # workspace had not finished checking that file. Genuine unresolvables
-            # stay null, so this is a bounded second pass, not per-site polling.
-            nulls = [q for q in qlist if raw.get(q) is None]
-            if nulls:
-                retry = self._pipeline(client, uri, sources, nulls)
-                for q, v in retry.items():
+            # Retry-on-null with backoff: a null early on may just mean the
+            # workspace had not finished checking that file, or ty answered a
+            # request inconsistently under load. Re-fire only the still-null set,
+            # a few times with a short sleep between passes, stopping as soon as a
+            # pass reclaims nothing. Genuine unresolvables stay null, so this is a
+            # bounded handful of extra passes, not per-site polling.
+            import time  # noqa: PLC0415 — only when the ty backend runs
+
+            for delay in (0.3, 0.6, 1.2, 2.0):
+                nulls = [q for q in qlist if raw.get(q) is None]
+                if not nulls:
+                    break
+                time.sleep(delay)
+                reclaimed = 0
+                for q, v in self._pipeline(client, uri, sources, nulls).items():
                     if v is not None:
                         raw[q] = v
+                        reclaimed += 1
+                if reclaimed == 0:
+                    break
             return {q: self._resolution(raw.get(q)) for q in qlist}
         finally:
             client.shutdown()
