@@ -1,23 +1,42 @@
 # hinzu
 
-A Rust command-line tool, laid out as a Cargo workspace so the engine and the
-shell stay separate.
+hinzu is a language-independent analysis layer that sits above existing
+compilers and type checkers. It doesn't parse source or add a new language —
+it consumes the semantic information a compiler has already computed (which
+function a call resolves to, what type an expression has, which symbols are
+mutated, which values escape) and normalizes it into a common set of facts.
+Whole-program analyses then run over those facts instead of over syntax.
+
+The first analysis is **effect analysis**: finding where a program observes or
+changes the outside world — filesystem, network, databases, clocks, randomness,
+processes — and enforcing architectural boundaries such as a pure functional
+core wrapped in an imperative shell. Because the reasoning works on normalized
+facts rather than any one language's syntax, the same engine can serve many
+languages, and further analyses (purity, capabilities, taint, dependency and
+ownership analysis) reuse the same foundation. Every conclusion keeps its
+evidence, so a reported effect can be traced back through the call path to the
+operation that caused it.
+
+The guiding idea: compilers already hold the deepest understanding of their
+languages, so hinzu preserves that knowledge after compilation and makes it
+reusable, rather than reconstructing approximations from source. See
+[notes/design.md](notes/design.md) for the full design and philosophy.
+
+> **Status: early scaffolding.** The Cargo workspace, CLI, and CI are in place;
+> the CLI exposes a single `run` placeholder while the analysis surface
+> described in the design doc is built out. New functionality slots into an
+> established shape rather than a blank repo.
+
+## Layout
 
 The workspace splits into two crates:
 
-- **`hinzu-core`** — the library. All the real work lives here so it stays
+- **`hinzu-core`** — the library: fact extraction, the normalized fact
+  database, and the analysis engines. All the real work lives here so it stays
   testable without going through argv.
 - **`hinzu-cli`** — a thin shell that parses arguments (with
   [clap](https://docs.rs/clap)) and hands off to `hinzu-core`. It builds the
   `hinzu` binary.
-
-This is early scaffolding: the CLI exposes a single `run` placeholder command
-while the actual surface is designed. Everything below already works, so new
-functionality slots into an established shape rather than a blank repo.
-
-See [notes/design.md](notes/design.md) for the design — a language-independent
-analysis layer that extracts semantic facts from existing compilers and reasons
-over them, with effect analysis as the first application.
 
 ## Install
 
