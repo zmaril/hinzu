@@ -12,3 +12,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `hinzu` binary), with an `hinzu run` placeholder command.
 - CI (fmt, clippy, test), Dependabot, CODEOWNERS, and the fleet housekeeping,
   Straitjacket, conventional-commits, codespell, and vale workflows.
+- Design doc (`notes/design.md`): compiler-facts, a language-independent
+  semantic analysis foundation with effect analysis as the first application.
