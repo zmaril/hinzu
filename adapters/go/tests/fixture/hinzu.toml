@@ -1,0 +1,19 @@
+# The fixture's functional-core policy. `core/` is the pure core — no
+# filesystem, network, or subprocess effects, however deep the call chain.
+# `effects/` is the sanctioned adapter layer, where those effects are allowed to
+# live. `hinzu check` must flag `LoadAndSummarize` (in the core) for reaching the
+# filesystem through `ReadConfig`, and `BuildAndReport` for spawning a subprocess
+# through `RunTool`, each with the evidence path down to the stdlib root.
+
+[analysis]
+on_unknown = "fail"
+
+# The functional core: no effects. `effects/` is carved out below.
+[region.core]
+paths  = ["core/*.go"]
+forbid = ["fs", "net", "process"]
+
+# The adapter layer — where the filesystem and subprocess effects belong.
+[region.effects]
+paths = ["effects/*.go"]
+allow = ["fs", "net", "process", "env", "clock", "random"]

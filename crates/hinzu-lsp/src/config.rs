@@ -13,15 +13,15 @@
 //!   loaded straight from the shipped annotation table so there is one source of
 //!   truth (`python.toml` for Python).
 //!
-//! Adding a language (Go over gopls, and so on) is a new config file plus its
-//! provenance/effect rows — no new extractor code. Python is the shipped,
-//! green deliverable; a Go config stub lives beside it to keep that seam honest.
+//! Adding a language is a new config file plus its provenance/effect rows — no
+//! new extractor code. Python (over ty) and Go (over gopls) are both shipped,
+//! green deliverables driven by this one config type.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use hinzu_core::facts::Effect;
+use hinzu_core::facts::{Effect, Language};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -115,6 +115,16 @@ pub struct LanguageConfig {
 }
 
 impl LanguageConfig {
+    /// The hinzu-core [`Language`] this config produces facts for, parsed from
+    /// its `language_id`. Every definition the extractor emits is stamped with
+    /// it, so `hinzu check`'s language-aware root seeding (`go.toml` for Go,
+    /// `python.toml` for Python) resolves the stdlib effects the same way for a
+    /// live run and for `--facts` JSON. An unrecognized `language_id` falls back
+    /// to Rust, which never fires a language-specific annotation rule.
+    pub fn language(&self) -> Language {
+        self.language_id.parse().unwrap_or(Language::Rust)
+    }
+
     /// Classify an external callee's defining-file path into `(package, origin)`
     /// by the first matching provenance rule. `None` means no rule claimed it —
     /// an unmapped foreign file, which becomes `Unknown` / fail-closed.

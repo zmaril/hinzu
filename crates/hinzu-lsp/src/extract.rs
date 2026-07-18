@@ -5,7 +5,8 @@
 //! hinzu's [`FactSet`] directly, in-process — no JSON round-trip through a
 //! script.
 //!
-//! Pipeline (the Go/gopls spike, ported to Rust and generalized):
+//! Pipeline (the Go/gopls spike, ported to Rust and generalized; it now drives
+//! both Go and Python through the same code):
 //!   1. spawn the server; `initialize` (advertising callHierarchy + documentSymbol,
 //!      the project `rootUri`, and the config's `initializationOptions`);
 //!      `initialized`; `didOpen` every matched file; wait for the workspace to
@@ -347,7 +348,7 @@ impl<'c> Extractor<'c> {
                     Definition {
                         id: id.clone(),
                         display: qual.clone(),
-                        language: hinzu_core::facts::Language::Python,
+                        language: self.cfg.language(),
                         file: relpath.to_string(),
                         line_start: lo,
                         line_end: hi,

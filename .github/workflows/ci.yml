@@ -190,3 +190,62 @@ jobs:
       # keeps the cold `dbsp` compile within budget.
       - name: hinzu check the Python fixture with ty (functional-core leaks)
         run: cargo test -p hinzu-cli --test py_check -- --ignored --exact check_python_project_end_to_end
+
+  # Run `hinzu check` on the Go fixture end to end: build the CLI on stable,
+  # install gopls (the Go path's sole resolution backend), and check the fixture
+  # module through the SHARED pipeline (adapter -> SQLite -> DBSP -> policy). It
+  # must flag the functional-core leaks with their evidence paths.
+  #
+  # gopls needs a Go toolchain to typecheck the module. `gopls@v0.23.0` requires
+  # Go >= 1.26, so this job installs Go 1.26 with `setup-go` — that keeps the
+  # gopls build (and its runtime typechecking of the fixture) on one toolchain, no
+  # `GOTOOLCHAIN` auto-download. The fixture is stdlib-only, so `go mod download`
+  # fetches nothing; it is run to prove the module resolves before gopls drives.
+  #
+  # Isolated from the `rust` job like `self-check`, `ts-check`, and `py-check`
+  # are. Go and gopls live ONLY here; the stable Rust jobs never install them and
+  # never depend on Go — their Go coverage is the committed sample-facts test
+  # (`check_go_facts_reports_the_core_violations`), which runs from JSON with no
+  # backend. This job builds the CLI on the workspace pin (1.96.0, via
+  # rust-toolchain.toml) and never touches the nightly driver.
+  go-check:
+    name: go-check
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      # gopls is the Go path's sole resolution backend, spawned by the all-Rust
+      # generic LSP extractor (`hinzu-lsp`). Pin `gopls@v0.23.0` so the build is
+      # reproducible, and put the module bin dir on PATH so the `gopls` binary is
+      # found by the extractor's server-availability check.
+      - name: install the Go resolution backend (gopls)
+        run: |
+          go install golang.org/x/tools/gopls@v0.23.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # Prove the fixture module resolves (stdlib-only, so nothing is fetched).
+      - name: go mod download for the fixture
+        working-directory: adapters/go/tests/fixture
+        run: go mod download
+      # Diagnostics: gopls version and an all-Rust dry run of the extractor over
+      # the fixture with its stderr summary (files/definitions/edges/roots), so a
+      # resolution regression yields a real log rather than a bare test failure.
+      - name: gopls resolution diagnostics on this runner
+        run: |
+          gopls version
+          echo "--- hinzu-lsp extractor dry run over the fixture (gopls backend, stderr) ---"
+          HINZU_LSP_DEBUG=1 cargo run -p hinzu-lsp --example extract -- \
+            adapters/go/tests/fixture >/dev/null
+      # The live path, on gopls: the ignored go_check test builds the CLI (debug)
+      # itself via assert_cmd and drives it over the fixture — the ALL-RUST
+      # extractor drives gopls over its LSP, the facts propagate, and the
+      # functional-core leaks must be flagged. One build (no separate release step)
+      # keeps the cold `dbsp` compile within budget.
+      - name: hinzu check the Go fixture with gopls (functional-core leaks)
+        run: cargo test -p hinzu-cli --test go_check -- --ignored --exact check_go_project_end_to_end

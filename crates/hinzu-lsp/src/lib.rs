@@ -9,9 +9,9 @@
 //! server binaries it invokes (ty for Python, gopls for Go), which hinzu does not
 //! write.
 //!
-//! Python (over Astral's `ty`) is the shipped, tested language. A Go config stub
-//! lives beside it to keep the "new language = new config, not new code" seam
-//! honest.
+//! Python (over Astral's `ty`) and Go (over `gopls`) are the shipped, tested
+//! languages — each a config file and its provenance/effect rows, sharing this
+//! one extractor with no per-language code.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -30,14 +30,19 @@ pub use extract::Extractor;
 /// the typeshed/real-stdlib/site-packages provenance rules).
 pub const PYTHON_CONFIG: &str = include_str!("../configs/python.toml");
 
-/// The shipped Go config stub — proof the extractor generalizes; not wired into
-/// `hinzu check` routing yet (a separate decision), but it parses and carries a
-/// real gopls provenance/effect ruleset.
+/// The shipped Go config (gopls server command, `**/*.go` globs, GOROOT +
+/// module-cache provenance rules). Wired into `hinzu check` routing for a
+/// `go.mod` project, driving the same generic extractor Python uses.
 pub const GO_CONFIG: &str = include_str!("../configs/go.toml");
 
 /// The Python effect map is the very same shipped annotation table hinzu-core
 /// seeds from — one source of truth, no drift.
 pub const PYTHON_ANNOTATIONS: &str = include_str!("../../hinzu-core/annotations/python.toml");
+
+/// The Go effect map, the very same shipped annotation table hinzu-core seeds
+/// from (`os/exec` → process, `os::ReadFile` → fs, `net/http` → net) — one
+/// source of truth, no drift.
+pub const GO_ANNOTATIONS: &str = include_str!("../../hinzu-core/annotations/go.toml");
 
 /// Build the Python [`LanguageConfig`], pinning ty's target `python-version` and
 /// `python-platform` so its vendored typeshed stdlib resolves deterministically.
@@ -52,6 +57,14 @@ pub fn python_config() -> Result<LanguageConfig> {
         host_python_platform().to_string(),
     );
     LanguageConfig::from_parts(PYTHON_CONFIG, PYTHON_ANNOTATIONS, &subst)
+}
+
+/// Build the Go [`LanguageConfig`]. Go needs no host-specific substitution
+/// (gopls infers GOROOT / the module cache itself), so the substitution map is
+/// empty; the effect map is the shipped `go.toml` annotation table.
+pub fn go_config() -> Result<LanguageConfig> {
+    let subst = BTreeMap::new();
+    LanguageConfig::from_parts(GO_CONFIG, GO_ANNOTATIONS, &subst)
 }
 
 /// ty's `python-platform` spelling for the host OS.
@@ -71,9 +84,25 @@ fn host_python_platform() -> &'static str {
 /// overrides its path) — an honest nonzero error otherwise; there is no fallback
 /// resolver and no faked analysis.
 pub fn extract_python(project: &Path) -> Result<FactSet> {
-    let cfg = python_config()?;
+    run_extraction(python_config()?, project)
+}
+
+/// Extract effect facts from a Go module by driving gopls over its LSP, all in
+/// Rust. Returns the parsed [`FactSet`]; the extractor logs a one-line
+/// diagnostics summary to stderr. The `gopls` binary must be present
+/// (`HINZU_GOPLS` overrides its path) — an honest nonzero error otherwise; there
+/// is no fallback resolver and no faked analysis. gopls typechecks the module
+/// itself, so the module should build (its dependencies fetched) for calls into
+/// dependencies to resolve.
+pub fn extract_go(project: &Path) -> Result<FactSet> {
+    run_extraction(go_config()?, project)
+}
+
+/// Confirm the config's language server is available, canonicalize the project
+/// root (LSP servers want an absolute `file://` root), and run the generic
+/// extractor. The shared tail of every per-language entry point.
+fn run_extraction(cfg: LanguageConfig, project: &Path) -> Result<FactSet> {
     ensure_server_available(&cfg)?;
-    // LSP servers want an absolute `file://` root, so canonicalize first.
     let project = project
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("resolving project path {}: {e}", project.display()))?;
@@ -91,24 +120,30 @@ fn ensure_server_available(cfg: &LanguageConfig) -> Result<()> {
     if which(bin).is_none() {
         anyhow::bail!(
             "the `{bin}` language server was not found — it is the {} adapter's resolution \
-             backend. Install it (for Python: `uv tool install ty` or `pip install ty`) or set \
-             HINZU_TY to its path.",
+             backend. Install it (for Python: `uv tool install ty` or `pip install ty`; for Go: \
+             `go install golang.org/x/tools/gopls@latest`) or set the override env var \
+             (HINZU_TY / HINZU_GOPLS) to its path.",
             cfg.language_id,
         );
     }
     Ok(())
 }
 
-/// Resolve the language server's argv, applying the `HINZU_TY` override for the
-/// Python backend so the extractor spawns the overridden binary, not the default.
-/// The single place the override lives — [`Extractor::run`] and
-/// [`ensure_server_available`] both go through here.
+/// Resolve the language server's argv, applying the per-backend binary override
+/// (`HINZU_TY` for Python, `HINZU_GOPLS` for Go) so the extractor spawns the
+/// overridden binary, not the default. The single place the overrides live —
+/// [`Extractor::run`] and [`ensure_server_available`] both go through here.
 pub fn resolved_server_cmd(cfg: &LanguageConfig) -> Vec<String> {
     let mut cmd = cfg.server_cmd.clone();
-    if cfg.language_id == "python" {
-        if let Ok(ty) = std::env::var("HINZU_TY") {
+    let override_var = match cfg.language_id.as_str() {
+        "python" => Some("HINZU_TY"),
+        "go" => Some("HINZU_GOPLS"),
+        _ => None,
+    };
+    if let Some(var) = override_var {
+        if let Ok(bin) = std::env::var(var) {
             if let Some(first) = cmd.first_mut() {
-                *first = ty;
+                *first = bin;
             }
         }
     }
@@ -135,13 +170,110 @@ mod tests {
     #[test]
     fn shipped_configs_parse() {
         python_config().expect("python config parses");
-        let mut subst = BTreeMap::new();
-        subst.insert("go_version".to_string(), "1.24".to_string());
-        LanguageConfig::from_parts(GO_CONFIG, GO_ANNOTATIONS_FOR_TEST, &subst)
-            .expect("go stub parses");
+        go_config().expect("go config parses");
     }
 
-    /// A tiny inline effect map so the Go-stub parse test needs no shipped file.
-    const GO_ANNOTATIONS_FOR_TEST: &str =
-        "[roots]\n\"os/exec\" = \"process\"\n\"os::Getenv\" = \"env\"\n";
+    #[test]
+    fn go_config_shape_and_effect_map() {
+        let cfg = go_config().expect("go config parses");
+        assert_eq!(cfg.language_id, "go");
+        assert_eq!(cfg.language(), hinzu_core::facts::Language::Go);
+        // gopls is spawned as an stdio LSP server.
+        assert_eq!(cfg.server_cmd.first().map(String::as_str), Some("gopls"));
+        // Go effects are package-granular and do NOT inherit to a nested import
+        // path — `net/url` stays pure even though `net` is net.
+        assert!(!cfg.package_effects_inherit);
+        assert_eq!(
+            cfg.effect_of("net/url::Parse", "net/url"),
+            None,
+            "net/url is pure URL algebra, independent of net"
+        );
+
+        // Whole-package process rule.
+        assert_eq!(
+            cfg.effect_of("os/exec::Command", "os/exec"),
+            Some(hinzu_core::facts::Effect::Process)
+        );
+        // The effect-mixed `os`: a file operation is fs, an accessor is env, and
+        // the pure remainder (os.Exit) is neither.
+        assert_eq!(
+            cfg.effect_of("os::ReadFile", "os"),
+            Some(hinzu_core::facts::Effect::Fs)
+        );
+        assert_eq!(
+            cfg.effect_of("os::Getenv", "os"),
+            Some(hinzu_core::facts::Effect::Env)
+        );
+        assert_eq!(cfg.effect_of("os::Exit", "os"), None);
+        // net whole-package, and a protocol package built on it.
+        assert_eq!(
+            cfg.effect_of("net/http::Get", "net/http"),
+            Some(hinzu_core::facts::Effect::Net)
+        );
+    }
+
+    #[test]
+    fn go_provenance_classifies_goroot_and_module_cache() {
+        use crate::config::Origin;
+        let cfg = go_config().expect("go config parses");
+        // A plain GOROOT layout: `.../go/src/<import path>/<file>.go`.
+        assert_eq!(
+            cfg.package_of("/usr/local/go/src/os/exec/exec.go"),
+            Some(("os/exec".to_string(), Origin::Stdlib))
+        );
+        // A top-level stdlib package.
+        assert_eq!(
+            cfg.package_of("/usr/local/go/src/os/file.go"),
+            Some(("os".to_string(), Origin::Stdlib))
+        );
+        // A VERSIONED GOROOT dir (`go1.24.7`), what a GOTOOLCHAIN switch leaves
+        // on PATH — the observed layout on this dev host.
+        assert_eq!(
+            cfg.package_of("/usr/local/go1.24.7/src/os/exec/exec.go"),
+            Some(("os/exec".to_string(), Origin::Stdlib))
+        );
+        assert_eq!(
+            cfg.package_of("/usr/local/go1.24.7/src/fmt/print.go"),
+            Some(("fmt".to_string(), Origin::Stdlib))
+        );
+        // The GitHub `setup-go` toolcache layout, with version + arch dirs
+        // between `go` and `src` — the robust GOROOT rule still resolves it.
+        assert_eq!(
+            cfg.package_of("/opt/hostedtoolcache/go/1.24.7/x64/src/net/http/client.go"),
+            Some(("net/http".to_string(), Origin::Stdlib))
+        );
+        // A DOWNLOADED toolchain's stdlib, shipped under the module cache — still
+        // stdlib, matched before the general module rule. (The `@` is spliced in
+        // via `concat!` so the literal is not mistaken for an email address by
+        // tooling that rewrites those.)
+        assert_eq!(
+            cfg.package_of(concat!(
+                "/root/go/pkg/mod/golang.org/toolchain",
+                "@",
+                "v0.0.1-go1.26.5.linux-amd64/src/os/exec/exec.go"
+            )),
+            Some(("os/exec".to_string(), Origin::Stdlib))
+        );
+        // A module dependency in the module cache.
+        assert_eq!(
+            cfg.package_of(concat!(
+                "/root/go/pkg/mod/github.com/mattn/go-colorable",
+                "@",
+                "v0.1.13/color.go"
+            )),
+            Some(("github.com/mattn/go-colorable".to_string(), Origin::Module))
+        );
+        // A subpackage of a module keeps its full import path.
+        assert_eq!(
+            cfg.package_of(concat!(
+                "/root/go/pkg/mod/golang.org/x/net",
+                "@",
+                "v0.27.0/context/ctxhttp/ctxhttp.go"
+            )),
+            Some((
+                "golang.org/x/net/context/ctxhttp".to_string(),
+                Origin::Module
+            ))
+        );
+    }
 }

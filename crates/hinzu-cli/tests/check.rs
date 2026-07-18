@@ -61,7 +61,7 @@ fn check_without_facts_on_a_non_cargo_path_fails_honestly() {
 
     let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     assert!(
-        err.contains("is not a cargo, TypeScript, or Python project"),
+        err.contains("is not a cargo, TypeScript, Python, or Go project"),
         "stderr was:\n{err}"
     );
 }

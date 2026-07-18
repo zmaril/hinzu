@@ -19,6 +19,7 @@ pub enum Language {
     Rust,
     TypeScript,
     Python,
+    Go,
 }
 
 impl Language {
@@ -28,6 +29,7 @@ impl Language {
             Language::Rust => "rust",
             Language::TypeScript => "typescript",
             Language::Python => "python",
+            Language::Go => "go",
         }
     }
 }
@@ -41,6 +43,7 @@ impl FromStr for Language {
             "rust" => Ok(Language::Rust),
             "typescript" => Ok(Language::TypeScript),
             "python" => Ok(Language::Python),
+            "go" => Ok(Language::Go),
             other => anyhow::bail!("unknown language: {other}"),
         }
     }

@@ -220,7 +220,7 @@ such as `TUI.doRender -> node:fs::mkdirSync` and `stream -> (anonymous) ->
 global::fetch`, plus 661 `Unknown` warnings naming the npm packages the checker
 could not see through (chalk, semver, yaml, openai, typebox, and more).
 
-## The generic Rust LSP adapter — hinzu's new baseline mechanism (Python shipped)
+## The generic Rust LSP adapter — hinzu's new baseline mechanism (Python and Go shipped)
 
 hinzu's baseline extraction mechanism is now a **generic, language-agnostic LSP
 adapter, all in Rust** (`crates/hinzu-lsp`): a synchronous Rust LSP client plus an
@@ -252,9 +252,22 @@ ty-over-LSP resolution are now the Rust extractor, driven by
 detection routes a `pyproject.toml` / `setup.py` / `setup.cfg` to it; `HINZU_TY`
 overrides the ty binary, `HINZU_PY_VERSION` pins ty's target Python version
 (default `3.11`). ty is the sole resolution backend — a missing `ty` is an honest
-nonzero failure, never a faked analysis. Adding Go (or another language) is a new
-config file plus its provenance/effect rows — a Go config stub ships beside the
-Python one to keep that seam honest — not new extractor code.
+nonzero failure, never a faked analysis.
+
+**Go, over gopls, is the second shipped language — and the proof that a new
+language is a new config, not new code.** Go rides the exact same extractor:
+project detection routes a `go.mod` to it, gopls (the Go team's language server)
+is the resolution backend, and the whole Go surface lives in
+`crates/hinzu-lsp/configs/go.toml` (server command, `**/*.go` globs, GOROOT +
+module-cache provenance) plus the shipped `go.toml` effect map
+(`crates/hinzu-core/annotations/go.toml`). `HINZU_GOPLS` overrides the gopls
+binary; a missing gopls is the same honest nonzero failure. Go's provenance is
+package-granular by import path and does **not** inherit to a nested import path
+(`net/url` is pure, independent of `net` — the opposite of Python's dotted-module
+inheritance), and Go interface dispatch rides the extractor's existing
+`textDocument/implementation` follow-up (a CHA over-approximation). See
+[`go-catalog.md`](./go-catalog.md). Adding a further language is, again, a config
+file plus its provenance/effect rows — not new extractor code.
 
 The seeded categories are the shared vocabulary, minus `alloc`: `fs`, `net`,
 `process`, `env`, `clock`, and `random`. The native StableMIR driver remains

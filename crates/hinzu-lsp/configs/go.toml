@@ -1,32 +1,90 @@
-# A Go config STUB for hinzu's generic LSP extractor — proof that a new language
-# is a new config, not new extractor code. It is NOT wired into `hinzu check`
-# routing (a separate decision), but it parses and carries a real gopls
-# provenance ruleset, so the seam the Python config exercises is honestly generic.
+# The Go language config for hinzu's generic LSP extractor. Everything the
+# extractor needs to turn a Go module into hinzu facts lives here as data; the
+# extractor code knows nothing Go-specific. The resolution backend is gopls (the
+# Go team's language server) over its stdio LSP — the sole backend, kept behind
+# this config seam exactly like ty is for Python.
 #
 # Go over gopls was the spike that proved `callHierarchy/outgoingCalls` yields
-# caller->callee edges with no per-language parser (100% function coverage on a
-# real Go repo). Wiring it on would add: a Go effect-map annotation table (the
-# `os/exec -> process`, `net/http -> net`, `os::Getenv -> env` rows), a
-# `hinzu check` routing row for `go.mod`, and a CI job with gopls — all config and
-# glue, no extractor change.
+# caller->callee edges with no per-language parser. Wiring it on is this config
+# plus its effect map — no extractor change. The EFFECT MAP is NOT in this file:
+# it is loaded from the shipped annotation table
+# `crates/hinzu-core/annotations/go.toml` ([roots]), so hinzu-core's own root
+# seeding and this extractor read one source of truth. A `<pkg>::<qual>` row
+# there is a specific rule (`os::ReadFile`), a bare `<pkg>` row a whole-package
+# rule (`os/exec`).
 
 language_id = "go"
+# gopls' stdio LSP server.
 server_cmd = ["gopls", "serve"]
 file_globs = ["**/*.go"]
+# A Go effect does NOT inherit to a nested import path: `net/url` is pure URL
+# algebra, independent of `net` being net. (Python is the opposite — a
+# whole-module effect inherits to submodules — so its config sets this true.)
+# The separator is `/`, but with inheritance off it is only informational.
+package_effects_inherit = false
+package_separator = "/"
+# `vendor/` is a build artifact (fetched dependency copies) and `testdata/` is
+# gopls-ignored fixture data, not compiled source.
 exclude_dirs = [".git", "vendor", "testdata"]
-exclude_suffixes = ["_test.go"]
+# `_test.go` files ARE analyzed: a project's tests are part of what a
+# functional-core policy governs (a test that leaks an effect into the pure core
+# is exactly the kind of thing to catch), and gopls typechecks them alongside the
+# package. A project that wants tests exempt carves them out with a region rule
+# in its `hinzu.toml`, not by dropping them from extraction.
+exclude_suffixes = []
 
-# gopls needs no special initializationOptions for this extraction.
+# gopls needs no special initializationOptions for callHierarchy extraction; it
+# infers GOROOT and the module cache from the module it opens.
 [init_options]
 
-# The Go toolchain's standard library, under GOROOT's `src`.
+# The cold-start ready probe: an in-memory, build-excluded doc referencing
+# `exec.Command`, polled until its definition resolves into GOROOT's `os/exec`
+# — proof the workspace is warm before the real extraction fires. The
+# `//go:build ignore` line keeps the probe out of the real package build, so it
+# never conflicts with the module's own `package` clause; gopls still resolves
+# its import. `character` 8 sits on the `Command` token of `exec.Command`.
+[ready_probe]
+filename = "hinzu_lsp_ready_.go"
+text = "//go:build ignore\n\npackage main\n\nimport \"os/exec\"\n\nvar _ = exec.Command\n"
+line = 6
+character = 8
+expect = ["os/exec", "/src/"]
+
+# --- provenance: a definition-target file uri -> (package, origin) -------------
+# First match wins. `origin = stdlib` is trusted-pure baseline unless the effect
+# map names the symbol; `origin = module` (a third-party dependency) is Unknown /
+# fail-closed unless a `[trust]` line vouches for it. The captured package is the
+# Go import path, which the effect map keys on.
+
+# A DOWNLOADED Go toolchain's standard library, shipped as a module in the
+# module cache (`.../pkg/mod/golang.org/toolchain@<ver>/src/os/exec/exec.go`)
+# when `GOTOOLCHAIN` fetches a newer Go than the host. This is still the standard
+# library, so it must be classified `stdlib` — and it lives under `/pkg/mod/`, so
+# it MUST be matched before the general module rule below or it would be mistaken
+# for a third-party dependency. The capture is the import path.
 [[provenance]]
-regex = '/go(?:/[0-9.]+)?/src/(.+)/[^/]+\.go$'
+regex = '/pkg/mod/golang\.org/toolchain@[^/]+/src/(.+)/[^/]+\.go$'
 package = '$1'
 origin = 'stdlib'
 
-# A module dependency in the Go module cache: `.../pkg/mod/<module>@<ver>/...`.
+# A module dependency in the module cache: `.../pkg/mod/<module>@<ver>/<sub>/x.go`.
+# `$1` is the module path, `$2` the (optional) subpackage tail, joined into the
+# full import path.
 [[provenance]]
 regex = '/pkg/mod/(.+?)@[^/]+((?:/.+?)?)/[^/]+\.go$'
 package = '$1$2'
 origin = 'module'
+
+# The Go toolchain's standard library, under GOROOT's `src`. Robust to the ways a
+# GOROOT directory is named and nested: a plain install (`.../go/src/...`), a
+# versioned install (`.../go1.24.7/src/...`, what a `GOTOOLCHAIN` switch leaves on
+# PATH), and the GitHub `setup-go` toolcache layout, which inserts version + arch
+# dirs between `go` and `src` (`.../go/1.24.7/x64/src/net/http/client.go`). The
+# `go[0-9.]*` segment absorbs the version suffix and `(?:[^/]+/){0,4}?` lazily
+# absorbs the intermediate dirs. The capture is the import path (`os/exec`,
+# `net/http`). Module-cache paths are claimed by the rules above first, so this
+# only ever sees a genuine GOROOT.
+[[provenance]]
+regex = '/go[0-9.]*/(?:[^/]+/){0,4}?src/(.+)/[^/]+\.go$'
+package = '$1'
+origin = 'stdlib'
