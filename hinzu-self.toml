@@ -1,0 +1,37 @@
+# hinzu's own functional-core boundary — the policy the `self-check` CI job
+# enforces on hinzu-core. It is the regression guard that keeps effects out of
+# the analysis engine: parsing, propagation, and policy checking must reach no
+# filesystem, network, database, subprocess, or environment effect, however deep
+# the call chain. Effects are confined to the one module that is meant to have
+# them — the SQLite fact store — and the orchestration seam that drives it.
+#
+# This lives beside the general-purpose example in `hinzu.toml`; that file shows
+# the format with a broad `adapters/**` carve-out, while this one states
+# hinzu-core's actual layout, where the store sits directly in `src/`.
+
+[analysis]
+ignore = ["**/tests/**"]
+
+# The functional core: the fact schema, the propagation engine, the policy
+# check, and the root-seeding config. No effects, however deep the call chain.
+# A nested carve-out below overrides this for the files that are allowed effects.
+[region.core]
+paths  = ["crates/hinzu-core/src/**"]
+forbid = ["fs", "net", "db", "process", "env"]
+
+# The sanctioned effect layer. `store.rs` is the durable fact store — where the
+# SQLite database effect (through `rusqlite` / the bundled `libsqlite3_sys`, and
+# the file it opens) is meant to live. `lib.rs` is the orchestration seam whose
+# `check_facts` opens that store, so it inherits the database effect honestly.
+# Everything else in hinzu-core stays pure.
+[region.store]
+paths = ["crates/hinzu-core/src/store.rs", "crates/hinzu-core/src/lib.rs"]
+allow = ["fs", "db"]
+
+# Trusted external summaries: effects that flow through a registry dependency,
+# whose body the driver never sees. The store's real I/O is all SQLite, so a
+# call into `rusqlite` (or its bundled `libsqlite3_sys` C shim) is a database
+# effect. These extend the built-in default seed (std::* plus a few crates).
+[roots]
+"rusqlite::" = "db"
+"libsqlite3_sys::" = "db"

@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hinzu_core::effects::{EffectEngine, NaiveEngine};
 use hinzu_core::facts::FactSet;
 use hinzu_core::policy::Policy;
+use hinzu_core::roots::RootSeeds;
 use hinzu_dbsp::DbspEngine;
 
 #[derive(Parser)]
@@ -91,13 +92,21 @@ fn report_error(e: anyhow::Error) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The `hinzu check` flow. Loads facts (from `--facts` JSON for now — the Rust
-/// adapter is a later phase), runs the engine and the policy check, prints the
-/// report, and returns a non-zero code when violations are found so it is
-/// usable as a CI gate.
+/// The `hinzu check` flow. Loads facts (from `--facts` JSON, or by extracting
+/// them live with the StableMIR driver), seeds effect roots, runs the engine
+/// and the policy check, prints the report, and returns a non-zero code when
+/// violations are found so it is usable as a CI gate.
 fn check(args: CheckArgs) -> Result<ExitCode> {
-    let facts = load_facts(&args)?;
-    let policy = load_policy(&args)?;
+    let mut facts = load_facts(&args)?;
+
+    // The policy file carries both the region rules and the `[roots]` seed
+    // table, so read it once and parse both. Seeding turns edges into a
+    // registry dependency (say `rusqlite::…`) into effect roots before
+    // propagation runs, so effects that leave the workspace still light up.
+    let policy_src = read_policy_src(&args)?;
+    let policy = Policy::from_toml(&policy_src)?;
+    let seeds = RootSeeds::from_toml(&policy_src)?;
+    seeds.seed(&mut facts);
 
     let outcome = args.engine.run(facts, args.db.as_deref(), &policy)?;
     print!("{}", outcome.report);
@@ -130,16 +139,16 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
     )
 }
 
-/// Load the policy from `--policy`, else `hinzu.toml` in the target project,
-/// else `hinzu.toml` at the current directory.
-fn load_policy(args: &CheckArgs) -> Result<Policy> {
+/// Read the policy file source from `--policy`, else `hinzu.toml` in the target
+/// project, else `hinzu.toml` at the current directory. The caller parses the
+/// regions and the `[roots]` seed table from the same string.
+fn read_policy_src(args: &CheckArgs) -> Result<String> {
     let path = match &args.policy {
         Some(p) => p.clone(),
         None => default_policy_path(&args.path)?,
     };
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading policy from {}", path.display()))?;
-    Policy::from_toml(&src)
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("reading policy from {}", path.display()))
 }
 
 /// Find the default policy file: `hinzu.toml` in the project, else in the

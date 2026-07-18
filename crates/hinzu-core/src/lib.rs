@@ -16,6 +16,7 @@ use anyhow::Result;
 pub mod effects;
 pub mod facts;
 pub mod policy;
+pub mod roots;
 pub mod store;
 
 /// Shared builders for the unit tests across the engine's modules, kept in one

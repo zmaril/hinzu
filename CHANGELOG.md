@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Configurable effect-root seeding (`hinzu-core::roots`): a prefix table maps a
+  callee's path to an effect category, so calls that leave the analyzed
+  workspace into a registry dependency become effect roots. A built-in default
+  covers the standard library (`std::fs`, `std::net`, `std::process`,
+  `std::time`, `std::env`) plus a few common crates — `rand` for randomness and
+  `rusqlite` / `libsqlite3_sys` for the database — and a `[roots]` section in
+  the policy file extends or overrides it. The match strips generic arguments
+  first, so a type such as `rusqlite::Error` inside a `Result` never seeds a
+  spurious root. `hinzu check` seeds the fact set before propagation. This is
+  what lets the tool see that a program whose I/O is all SQLite is effectful at
+  all; a standard-library-only seed found nothing in it.
+- Functional-core self-check: `hinzu check` now runs on hinzu-core itself in
+  CI, as a regression guard. A dedicated policy (`hinzu-self.toml`) states the
+  boundary — the fact schema, the propagation engine, and the policy check must
+  reach no filesystem, network, database, subprocess, or environment effect,
+  and effects are confined to the SQLite fact store (`store.rs`) and the seam
+  that drives it (`check_facts` in `lib.rs`). A new `self-check` CI job builds
+  the CLI on stable and the StableMIR driver on its nightly, extracts facts
+  from hinzu-core, and fails on any leak. The job is isolated from the stable
+  `rust` job: the nightly only ever builds the driver and hinzu-core-under-the-
+  driver, never the workspace or its `dbsp` dependency. See
+  `notes/self-check.md`.
+
 - Toolchain pin (`rust-toolchain.toml`): the workspace is pinned to stable
   1.96.0. rustc 1.97.x hits an internal compiler error building the `dbsp`
   dependency (a `dyn_clone` vtable-slot panic in the new trait solver); 1.96.0
