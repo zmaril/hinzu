@@ -16,6 +16,24 @@ pub mod effects;
 pub mod facts;
 pub mod policy;
 
+/// Shared builders for the unit tests across the engine's modules, kept in one
+/// place so the `Edge` construction isn't copy-pasted per test module.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::facts::{Edge, EdgeKind};
+
+    /// A `Call` edge from `caller` to `callee` with placeholder provenance.
+    pub(crate) fn edge(caller: &str, callee: &str) -> Edge {
+        Edge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            kind: EdgeKind::Call,
+            evidence_file: "x.rs".to_string(),
+            evidence_line: 1,
+        }
+    }
+}
+
 use effects::propagate;
 use facts::{Definition, Edge, EdgeKind, Effect, EffectRoot, FactSet, Language};
 use policy::{check, Policy, Region};

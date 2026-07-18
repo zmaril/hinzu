@@ -86,17 +86,8 @@ pub fn propagate(facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::{Edge, EdgeKind, EffectRoot};
-
-    fn edge(caller: &str, callee: &str) -> Edge {
-        Edge {
-            caller: caller.to_string(),
-            callee: callee.to_string(),
-            kind: EdgeKind::Call,
-            evidence_file: "x.rs".to_string(),
-            evidence_line: 1,
-        }
-    }
+    use crate::facts::EffectRoot;
+    use crate::test_support::edge;
 
     fn fs_root(sym: &str) -> EffectRoot {
         EffectRoot {

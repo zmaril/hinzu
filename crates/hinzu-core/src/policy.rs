@@ -83,7 +83,8 @@ pub fn check(
 mod tests {
     use super::*;
     use crate::effects::propagate;
-    use crate::facts::{Definition, Edge, EdgeKind, EffectRoot, Language};
+    use crate::facts::{Definition, EffectRoot, Language};
+    use crate::test_support::edge as call;
 
     fn def(id: &str, file: &str) -> Definition {
         Definition {
@@ -93,16 +94,6 @@ mod tests {
             file: file.to_string(),
             line_start: 1,
             line_end: 5,
-        }
-    }
-
-    fn call(caller: &str, callee: &str) -> Edge {
-        Edge {
-            caller: caller.to_string(),
-            callee: callee.to_string(),
-            kind: EdgeKind::Call,
-            evidence_file: "x.rs".to_string(),
-            evidence_line: 1,
         }
     }
 
