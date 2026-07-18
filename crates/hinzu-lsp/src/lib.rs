@@ -84,14 +84,7 @@ pub fn extract_python(project: &Path) -> Result<FactSet> {
 /// absolute, existing path), so a missing tool is an honest capability edge
 /// rather than a spawn error mid-run. `HINZU_TY` overrides ty's binary.
 fn ensure_server_available(cfg: &LanguageConfig) -> Result<()> {
-    let mut cmd = cfg.server_cmd.clone();
-    if cfg.language_id == "python" {
-        if let Ok(ty) = std::env::var("HINZU_TY") {
-            if let Some(first) = cmd.first_mut() {
-                *first = ty;
-            }
-        }
-    }
+    let cmd = resolved_server_cmd(cfg);
     let Some(bin) = cmd.first() else {
         anyhow::bail!("the {} config has an empty server command", cfg.language_id);
     };
@@ -106,8 +99,10 @@ fn ensure_server_available(cfg: &LanguageConfig) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `HINZU_TY` (or the config's server binary) so the extractor spawns the
-/// overridden binary, not the default. Applied by [`Extractor`] via the config.
+/// Resolve the language server's argv, applying the `HINZU_TY` override for the
+/// Python backend so the extractor spawns the overridden binary, not the default.
+/// The single place the override lives — [`Extractor::run`] and
+/// [`ensure_server_available`] both go through here.
 pub fn resolved_server_cmd(cfg: &LanguageConfig) -> Vec<String> {
     let mut cmd = cfg.server_cmd.clone();
     if cfg.language_id == "python" {

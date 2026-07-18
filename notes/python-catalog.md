@@ -73,7 +73,7 @@ all in Rust — not a Python script. The retired `analyze.py` / `lspclient.py` p
 is replaced by a synchronous Rust LSP client plus a language-agnostic extractor
 parameterized by a per-language config
 (`crates/hinzu-lsp/configs/python.toml`): the ty server command, file globs, ty's
-`initializationOptions`, the provenance rules, and (loaded from this very
+`initializationOptions`, the provenance rules, and (loaded from this same
 `python.toml`) the effect map. **ty** (Astral's Rust type checker) is the sole
 resolution backend; the only non-Rust artifact on the whole path is the external
 `ty` binary the client spawns.
