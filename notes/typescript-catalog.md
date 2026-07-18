@@ -83,3 +83,41 @@ hinzu-core carries the same table as a shipped annotation set,
 `std.toml` — so its `Unknown` classification agrees with what the adapter seeds,
 and a project's `[roots]` / `[trust]` overrides apply identically across both
 languages.
+
+## The shipped library pack
+
+`node.toml` covers the Node runtime's own surface. A second shipped set,
+`crates/hinzu-core/annotations/node-libs.toml`, covers the npm packages the fleet
+reaches most often, so a plain functional-core check stops reporting them as
+`Unknown` without a project having to write a `[trust]` line for each one. It is
+merged onto `node.toml` for the TypeScript language base, and a project's own
+`hinzu.toml` still overrides anything in it.
+
+The pack follows one hard rule: a package, or a call within it, that performs I/O
+is never marked pure. A mixed package is annotated at its effectful entry points,
+and only its genuinely-pure remainder is vouched pure. Two packages show why the
+granularity matters:
+
+- **drizzle-orm** is split at the seam between building a query and running it.
+  The query builders — `eq`, `and`, `or`, `sql`, `asc`, `desc`, `relations`, and
+  the comparison and aggregate helpers — build SQL fragments in memory and are
+  pure. Only the execution surface reaches the database and is `db`: `.select`,
+  `.from`, `.where`, `.insert`, `.values`, `.update`, `.set`, `.delete`,
+  `.returning`, `.transaction`, `.execute`, and the `.all` / `.run` / `.get`
+  drivers. Keeping `eq(users.id, 1)` out of `db` is the accuracy win — it is a
+  pure value, not a read.
+- **bun-types** is the Bun runtime's ambient types. Its `bun:test` API — `expect`,
+  `describe`, `test`, and the `to*` matcher families — is pure and is the largest
+  single source of `Unknown` in a test-heavy repo. Bun's actual I/O is graded:
+  `Bun.spawn` and `Bun.spawnSync` are `process`, `Bun.file` and `Bun.write` are
+  `fs`, and `Bun.serve` is `net`.
+
+The rest of the pack is whole-package: `@electric-sql/pglite` is `db`; `elysia`,
+`@elysiajs/eden`, and `@modelcontextprotocol/sdk` are `net`; `@disponent/node` is
+`process`. The UI and utility packages — react, react-dom, zustand, the xterm and
+CodeMirror widgets, `@mantine/core`, `@dnd-kit/core`, ts-pattern, and
+`@sinclair/typebox` — carry nothing in hinzu's vocabulary and are vouched pure,
+with one caveat: the vocabulary is `fs` / `net` / `db` / `process` / `env` /
+`clock` / `random`, so a package whose only side effect is on the DOM or a
+rendered view is "pure" only in that vocabulary. DOM and render effects are
+outside it and are not modeled.

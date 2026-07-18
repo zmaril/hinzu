@@ -56,6 +56,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaving the forbidden-effect count unchanged — no real leak appears or vanishes.
   See [`notes/rust-libs-catalog.md`](./notes/rust-libs-catalog.md).
 
+- **A shipped TypeScript / npm library annotation pack
+  (`crates/hinzu-core/annotations/node-libs.toml`) — common packages now grade to
+  a real effect instead of a bare `Unknown`.** The counterpart to the `node.toml`
+  runtime pack, merged onto it as a built-in TypeScript default (a project's own
+  `hinzu.toml` still overrides it). It covers the packages the fleet reaches most
+  often, graded granularly against the hard rule that nothing doing I/O is ever
+  marked pure. drizzle-orm is split at the seam that matters: its query builders
+  (`eq`, `and`, `or`, `sql`, `asc`, `relations`, the comparison and aggregate
+  helpers) are pure in-memory values, while only its execution surface
+  (`.select`, `.from`, `.insert`, `.update`, `.delete`, `.transaction`, `.execute`,
+  `.all` / `.run` / `.get`) is `db` — so `eq(users.id, 1)` stops being read as a
+  database read. bun-types is split the same way: the `bun:test` API (`expect`,
+  `describe`, the `to*` matchers) is pure while `Bun.spawn` / `Bun.spawnSync` is
+  `process`, `Bun.file` / `Bun.write` is `fs`, and `Bun.serve` is `net`.
+  @electric-sql/pglite is `db`; elysia, @elysiajs/eden, and
+  @modelcontextprotocol/sdk are `net`; @disponent/node is `process`. The UI and
+  utility packages (react, react-dom, zustand, the xterm and CodeMirror widgets,
+  @mantine/core, @dnd-kit/core, ts-pattern, @sinclair/typebox) are vouched pure,
+  with one honest caveat: hinzu's vocabulary is fs/net/db/process/env/clock/random,
+  so a DOM or render side effect is outside it and is not modeled. See
+  [`notes/typescript-catalog.md`](./notes/typescript-catalog.md).
+
 - **Go is a first-class language, over gopls — the proof that a new language is a
   new config, not new extractor code.** `hinzu check` routes a `go.mod` module to
   the same generic Rust LSP extractor Python uses, driving gopls (the Go team's

@@ -1,0 +1,233 @@
+# hinzu's built-in TypeScript / npm *library* effect annotations — the common-
+# package counterpart to `node.toml`. `node.toml` covers the Node runtime's own
+# built-in surface (`node:fs`, `global::fetch`, …); this file covers the npm
+# packages the fleet reaches most often, so a plain functional-core check stops
+# reporting them as `Unknown` ("cannot certify") without a project having to
+# write a `[trust]` line for each one.
+#
+# It is merged onto `node.toml` for the TypeScript language base (see
+# `crates/hinzu-core/src/roots.rs`), and a project's own `hinzu.toml`
+# `[roots]` / `[trust]` still overrides anything here — a rule with the same
+# prefix wins, a new prefix is added.
+#
+# The matcher is the same one `node.toml` uses. The TypeScript adapter
+# (`adapters/typescript/analyze.mjs`) names every external call by its
+# declaration provenance as `<package>::<member>` — `drizzle-orm::eq`,
+# `@electric-sql/pglite::exec`, `react::useState`. `[roots]` maps a callee-path
+# prefix to one effect, matched on whole `::`-delimited segments (so
+# `"drizzle-orm::select"` matches that exact member, never `selectFoo`);
+# `[trust] "x" = "pure"` vouches a path effect-free (it clears `Unknown`), matched
+# as a substring so a bare package prefix covers all its members at once.
+#
+# THE HARD RULE, applied to every entry below: a package (or a call within it)
+# that performs I/O is NEVER marked pure. A false "pure" is a silent hole in a
+# functional-core gate, so a *mixed* package is annotated at its effectful entry
+# points and only its genuinely-pure remainder is vouched pure — drizzle's query
+# builders (`eq`, `and`, `sql`) are pure while its execution surface (`.select`,
+# `.insert`, `.transaction`) is `db`; Bun's test matchers are pure while
+# `Bun.spawn` / `Bun.file` / `Bun.serve` are `process` / `fs` / `net`.
+#
+# There is deliberately NO `alloc` here — as in `node.toml`, a garbage-collected
+# runtime has no `alloc` effect. And the pure UI/util packages below carry a
+# standing caveat: hinzu's vocabulary is `fs`/`net`/`db`/`process`/`env`/`clock`/
+# `random`, so a package whose only side effect is on the DOM or a rendered view
+# (React's render tree, xterm's terminal, CodeMirror's editor) is "pure" only in
+# that vocabulary — DOM/render effects are outside it and are not modeled.
+
+# =============================================================================
+#  Pure packages — nothing in hinzu's effect vocabulary.
+# =============================================================================
+#
+# UI and utility libraries that touch no filesystem, socket, database, process,
+# environment, clock, or randomness. Vouched pure wholesale. (Their DOM / render
+# side effects are outside hinzu's vocabulary — see the caveat above.)
+
+[trust]
+
+# --- React and view state — render-tree and in-memory store effects only -----
+"react" = "pure"
+"react-dom" = "pure"
+"zustand" = "pure"
+
+# --- terminal / editor widgets — DOM-side rendering, outside the vocabulary ---
+"@xterm/xterm" = "pure"
+"@xterm/addon-fit" = "pure"
+"@codemirror/state" = "pure"
+"@codemirror/view" = "pure"
+"@codemirror/lang-javascript" = "pure"
+"@mantine/core" = "pure"
+"@dnd-kit/core" = "pure"
+
+# --- pure value / type utilities ---------------------------------------------
+# ts-pattern is exhaustive pattern matching; typebox builds and checks JSON
+# schemas — both compute over in-memory values.
+"ts-pattern" = "pure"
+"@sinclair/typebox" = "pure"
+
+# --- drizzle-orm query builders (the pure half of a mixed package) -----------
+# The expression, comparison, and aggregate helpers build SQL fragments in
+# memory; they do NOT touch the database. Only drizzle's execution surface does,
+# and it is `db` in the [roots] table below. Keeping these out of `db` is the
+# accuracy win: `eq(users.id, 1)` is a pure value, not a database read.
+"drizzle-orm::eq" = "pure"
+"drizzle-orm::ne" = "pure"
+"drizzle-orm::gt" = "pure"
+"drizzle-orm::gte" = "pure"
+"drizzle-orm::lt" = "pure"
+"drizzle-orm::lte" = "pure"
+"drizzle-orm::and" = "pure"
+"drizzle-orm::or" = "pure"
+"drizzle-orm::not" = "pure"
+"drizzle-orm::isNull" = "pure"
+"drizzle-orm::isNotNull" = "pure"
+"drizzle-orm::inArray" = "pure"
+"drizzle-orm::notInArray" = "pure"
+"drizzle-orm::like" = "pure"
+"drizzle-orm::notLike" = "pure"
+"drizzle-orm::ilike" = "pure"
+"drizzle-orm::notIlike" = "pure"
+"drizzle-orm::between" = "pure"
+"drizzle-orm::notBetween" = "pure"
+"drizzle-orm::exists" = "pure"
+"drizzle-orm::notExists" = "pure"
+"drizzle-orm::arrayContains" = "pure"
+"drizzle-orm::arrayContained" = "pure"
+"drizzle-orm::arrayOverlaps" = "pure"
+"drizzle-orm::asc" = "pure"
+"drizzle-orm::desc" = "pure"
+"drizzle-orm::sql" = "pure"
+"drizzle-orm::relations" = "pure"
+"drizzle-orm::sum" = "pure"
+"drizzle-orm::sumDistinct" = "pure"
+"drizzle-orm::avg" = "pure"
+"drizzle-orm::avgDistinct" = "pure"
+"drizzle-orm::count" = "pure"
+"drizzle-orm::countDistinct" = "pure"
+"drizzle-orm::min" = "pure"
+"drizzle-orm::max" = "pure"
+"drizzle-orm::alias" = "pure"
+"drizzle-orm::aliasedTable" = "pure"
+"drizzle-orm::getTableName" = "pure"
+"drizzle-orm::getTableColumns" = "pure"
+"drizzle-orm::getOperators" = "pure"
+"drizzle-orm::getOrderByOperators" = "pure"
+
+# --- Bun's test API — assertions and lifecycle hooks, all in-memory ----------
+# `bun-types` is the Bun runtime's ambient types; its `bun:test` globals are the
+# largest single source of Unknown in the fleet (test files dominate). They are
+# genuinely pure. Bun's actual I/O entry points (`Bun.spawn`, `Bun.file`,
+# `Bun.serve`, …) are effect roots in the [roots] table below; because `[trust]`
+# is consulted for `Unknown` classification only and never erases a seeded effect
+# root, these pure vouches cannot shadow them.
+#
+# The `to*` families are matched as substrings, so one prefix covers a whole
+# matcher family (`toBe` → `toBeNull`, `toBeInstanceOf`, `toBeGreaterThan`, …).
+"bun-types::expect" = "pure"
+"bun-types::describe" = "pure"
+"bun-types::test" = "pure"
+"bun-types::it" = "pure"
+"bun-types::beforeEach" = "pure"
+"bun-types::afterEach" = "pure"
+"bun-types::beforeAll" = "pure"
+"bun-types::afterAll" = "pure"
+"bun-types::mock" = "pure"
+"bun-types::spyOn" = "pure"
+"bun-types::jest" = "pure"
+"bun-types::toBe" = "pure"
+"bun-types::toEqual" = "pure"
+"bun-types::toStrictEqual" = "pure"
+"bun-types::toContain" = "pure"
+"bun-types::toHave" = "pure"
+"bun-types::toMatch" = "pure"
+"bun-types::toThrow" = "pure"
+"bun-types::toInclude" = "pure"
+"bun-types::toStartWith" = "pure"
+"bun-types::toEndWith" = "pure"
+"bun-types::toResolve" = "pure"
+"bun-types::toReject" = "pure"
+"bun-types::resolves" = "pure"
+"bun-types::rejects" = "pure"
+# Event-object methods Bun types expose (`preventDefault`, `stopPropagation`) are
+# DOM-shaped and carry no effect in hinzu's vocabulary.
+"bun-types::preventDefault" = "pure"
+"bun-types::stopPropagation" = "pure"
+
+# =============================================================================
+#  Effectful and mixed packages — annotated at their effect roots.
+# =============================================================================
+
+[roots]
+
+# --- database ----------------------------------------------------------------
+# @electric-sql/pglite is a WASM Postgres: connection, query, execute, live
+# subscriptions. The whole package is a `db` surface.
+"@electric-sql/pglite" = "db"
+
+# drizzle-orm's EXECUTION surface: the statement entry points and the chain
+# methods that build and run a query against the database. The query builders
+# (`eq`, `and`, `sql`, …) are pure and vouched above; these are the calls that
+# actually reach the database. Marking the statement-building chain `db` is the
+# honest over-approximation — these methods exist only within a live query.
+"drizzle-orm::select" = "db"
+"drizzle-orm::selectDistinct" = "db"
+"drizzle-orm::from" = "db"
+"drizzle-orm::where" = "db"
+"drizzle-orm::insert" = "db"
+"drizzle-orm::values" = "db"
+"drizzle-orm::update" = "db"
+"drizzle-orm::set" = "db"
+"drizzle-orm::delete" = "db"
+"drizzle-orm::returning" = "db"
+"drizzle-orm::transaction" = "db"
+"drizzle-orm::orderBy" = "db"
+"drizzle-orm::groupBy" = "db"
+"drizzle-orm::having" = "db"
+"drizzle-orm::limit" = "db"
+"drizzle-orm::offset" = "db"
+"drizzle-orm::innerJoin" = "db"
+"drizzle-orm::leftJoin" = "db"
+"drizzle-orm::rightJoin" = "db"
+"drizzle-orm::fullJoin" = "db"
+"drizzle-orm::onConflictDoUpdate" = "db"
+"drizzle-orm::onConflictDoNothing" = "db"
+"drizzle-orm::onDuplicateKeyUpdate" = "db"
+"drizzle-orm::execute" = "db"
+"drizzle-orm::prepare" = "db"
+"drizzle-orm::all" = "db"
+"drizzle-orm::run" = "db"
+"drizzle-orm::get" = "db"
+"drizzle-orm::findMany" = "db"
+"drizzle-orm::findFirst" = "db"
+"drizzle-orm::migrate" = "db"
+
+# --- network -----------------------------------------------------------------
+# elysia is an HTTP server framework; @elysiajs/eden is its typed HTTP client;
+# the MCP SDK speaks JSON-RPC over a transport (stdio or HTTP). All are `net`.
+"elysia" = "net"
+"@elysiajs/eden" = "net"
+"@modelcontextprotocol/sdk" = "net"
+
+# --- process -----------------------------------------------------------------
+# @disponent/node dispatches work to coding agents in local tmux / remote
+# environments — a subprocess and environment-control surface.
+"@disponent/node" = "process"
+
+# --- Bun runtime I/O (the effectful half of `bun-types`) ---------------------
+# The subprocess API.
+"bun-types::spawn" = "process"
+"bun-types::spawnSync" = "process"
+"bun-types::$" = "process"
+"bun-types::kill" = "process"
+# The filesystem API: `Bun.file`, `Bun.write`, and the `Bun.Glob` scanners.
+"bun-types::file" = "fs"
+"bun-types::write" = "fs"
+"bun-types::scan" = "fs"
+"bun-types::scanSync" = "fs"
+"bun-types::exists" = "fs"
+# The network API: `Bun.serve`, `Bun.connect`, `Bun.listen`, and stopping a server.
+"bun-types::serve" = "net"
+"bun-types::connect" = "net"
+"bun-types::listen" = "net"
+"bun-types::stop" = "net"
+# Randomness.
+"bun-types::randomUUID" = "random"
