@@ -2,8 +2,14 @@
 # enforces on hinzu-core. It is the regression guard that keeps effects out of
 # the analysis engine: parsing, propagation, and policy checking must reach no
 # filesystem, network, database, subprocess, or environment effect, however deep
-# the call chain. Effects are confined to the one module that is meant to have
-# them — the SQLite fact store — and the orchestration seam that drives it.
+# the call chain. Those effects are confined to the one module that is meant to
+# have them — the SQLite fact store — and the orchestration seam that drives it.
+#
+# Heap allocation (the `alloc` effect) is TRACKED but not forbidden: hinzu-core
+# allocates everywhere (every Vec, String, BTreeMap) and that is fine for a
+# functional core. So every region allows `alloc` and forbids the real I/O
+# effects. See the `[region.hot]` example in `hinzu.toml` for a policy that
+# instead forbids `alloc`.
 #
 # This lives beside the general-purpose example in `hinzu.toml`; that file shows
 # the format with a broad `adapters/**` carve-out, while this one states
@@ -12,26 +18,52 @@
 [analysis]
 ignore = ["**/tests/**"]
 
+# An unseen external call the analysis cannot resolve is a violation: hinzu
+# cannot certify a functional core while it reaches code it cannot see. The
+# built-in std/core/alloc annotations plus the [trust] list below account for
+# every external hinzu-core actually reaches, so this stays honestly green.
+on_unknown = "fail"
+
 # The functional core: the fact schema, the propagation engine, the policy
-# check, and the root-seeding config. No effects, however deep the call chain.
-# A nested carve-out below overrides this for the files that are allowed effects.
+# check, and the root-seeding config. It may allocate and nothing else — `allow
+# = ["alloc"]` forbids every real I/O effect (fs, net, db, clock, random,
+# process, env). A nested carve-out below overrides this for the store.
 [region.core]
 paths  = ["crates/hinzu-core/src/**"]
-forbid = ["fs", "net", "db", "process", "env"]
+allow  = ["alloc"]
 
 # The sanctioned effect layer. `store.rs` is the durable fact store — where the
 # SQLite database effect (through `rusqlite` / the bundled `libsqlite3_sys`, and
 # the file it opens) is meant to live. `lib.rs` is the orchestration seam whose
 # `check_facts` opens that store, so it inherits the database effect honestly.
-# Everything else in hinzu-core stays pure.
+# Both may allocate, touch the filesystem, and use the database; nothing else.
 [region.store]
 paths = ["crates/hinzu-core/src/store.rs", "crates/hinzu-core/src/lib.rs"]
-allow = ["fs", "db"]
+allow = ["fs", "db", "alloc"]
 
 # Trusted external summaries: effects that flow through a registry dependency,
 # whose body the driver never sees. The store's real I/O is all SQLite, so a
 # call into `rusqlite` (or its bundled `libsqlite3_sys` C shim) is a database
-# effect. These extend the built-in default seed (std::* plus a few crates).
+# effect. These extend the built-in std/core/alloc defaults.
 [roots]
 "rusqlite::" = "db"
 "libsqlite3_sys::" = "db"
+
+# The pure third-party crates hinzu-core reaches. Each is an auditable vouch:
+# these libraries parse or build values in memory and carry no I/O effect, so a
+# call into one clears to pure instead of Unknown. Removing any line below turns
+# the calls it covers back into Unknown findings — the whole point of the guard.
+#
+#   anyhow      — error construction and `.context(...)` (format_err, context)
+#   toml        — `toml::from_str` parsing a policy string
+#   serde_json  — `serde_json::from_str` parsing a facts JSON string
+#
+# serde and glob are reached too, but only through std trait methods
+# (`<glob::Pattern as Clone>::clone`, iterator adapters), which the built-in
+# trusted-pure baseline already clears; they are listed here for the record.
+[trust]
+"anyhow" = "pure"
+"toml" = "pure"
+"serde_json" = "pure"
+"serde" = "pure"
+"glob" = "pure"

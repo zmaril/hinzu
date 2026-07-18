@@ -2,7 +2,7 @@
 //! region that forbids it. Regions match source files with globs, so the policy
 //! lives outside the source (`hinzu.toml`), not in annotations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
@@ -11,6 +11,72 @@ use serde::Deserialize;
 
 use crate::effects::EffectSummary;
 use crate::facts::{Effect, FactSet, SymbolId};
+
+/// What to do when a callable in a checked region is (transitively) `Unknown` —
+/// it reaches an unseen external call the analysis could not resolve. Set by
+/// `[analysis] on_unknown`; the default is [`OnUnknown::Fail`], because a
+/// functional core cannot be certified pure while it reaches code we cannot see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OnUnknown {
+    /// An `Unknown`-reaching callable in a forbidding region is a violation and
+    /// exits nonzero. The safe default.
+    #[default]
+    Fail,
+    /// Report the `Unknown`, but do not fail the run (exit stays zero).
+    Warn,
+    /// Treat `Unknown` as pure — the old, unsound behavior. Opt in explicitly.
+    Ignore,
+}
+
+impl FromStr for OnUnknown {
+    type Err = anyhow::Error;
+
+    /// Parse the `[analysis] on_unknown` spelling.
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "fail" => Ok(OnUnknown::Fail),
+            "warn" => Ok(OnUnknown::Warn),
+            "ignore" => Ok(OnUnknown::Ignore),
+            other => anyhow::bail!("unknown on_unknown value '{other}': use fail, warn, or ignore"),
+        }
+    }
+}
+
+/// Whether a finding fails the run (`Error`) or is merely reported (`Warning`).
+/// Forbidden-effect violations are always errors; an `Unknown` finding is an
+/// error under `on_unknown = "fail"` and a warning under `"warn"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+/// Why a callable was flagged: it reaches a forbidden real effect, or it reaches
+/// an `Unknown` external the analysis could not resolve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Finding {
+    /// Reaches a forbidden real effect (`fs`, `net`, …).
+    ForbiddenEffect,
+    /// Cannot be certified: reaches an unseen external. `callee` is the offending
+    /// external symbol (the tail of the evidence path); `flavor` says whether the
+    /// callee's *effect* was unknown or its *target* was unresolved.
+    Unknown {
+        callee: SymbolId,
+        flavor: UnknownFlavor,
+    },
+}
+
+/// The two ways a call becomes `Unknown`: a foreign callee with no body that no
+/// annotation, root, or trusted-pure baseline covered (`UnknownEffect`), or an
+/// indirect call (function pointer / `dyn`) whose target could not be resolved
+/// (`UnknownTarget`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnknownFlavor {
+    /// We saw the callee's path but not its body, and nothing vouched for it.
+    Effect,
+    /// We could not even resolve which function the call site targets.
+    Target,
+}
 
 /// An architectural region: a set of path globs and the effects forbidden
 /// within them. A region either forbids a set of effects or allows a set — an
@@ -41,11 +107,13 @@ impl Region {
     }
 }
 
-/// The full policy — regions plus the globs that exclude files entirely.
+/// The full policy — regions, the globs that exclude files entirely, and what
+/// to do about `Unknown`.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     pub regions: Vec<Region>,
     pub ignore: Vec<Pattern>,
+    pub on_unknown: OnUnknown,
 }
 
 impl Policy {
@@ -80,29 +148,58 @@ impl Policy {
     }
 }
 
-/// A callable that reaches a forbidden effect from a forbidding region, with
-/// the evidence path that explains why.
+/// A flagged callable, with the evidence path that explains why. Either it
+/// reaches a forbidden real effect, or — with [`Finding::Unknown`] — it reaches
+/// an unseen external the analysis could not certify.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
     pub symbol: SymbolId,
     pub display: String,
     pub file: String,
     pub region: String,
+    /// The effect the region forbade, or [`Effect::Unknown`] for an unknown
+    /// finding.
     pub effect: Effect,
     pub evidence: Vec<SymbolId>,
+    /// Why it was flagged, and — for a forbidden effect vs. an unknown external —
+    /// how the report should read.
+    pub finding: Finding,
+    /// Whether this fails the run or is only reported (see [`OnUnknown`]).
+    pub severity: Severity,
+}
+
+impl Violation {
+    /// Whether this finding fails the run (an [`Severity::Error`]). Warnings
+    /// (from `on_unknown = "warn"`) are reported but do not fail.
+    pub fn is_error(&self) -> bool {
+        self.severity == Severity::Error
+    }
 }
 
 /// Check every definition's effect summary against the policy.
 ///
 /// Each definition is governed by the single most-specific region whose globs
 /// match its file (a nested `adapters` carve-out overrides the broader `core`),
-/// unless the policy's `ignore` globs exclude the file. The definition violates
-/// when that region forbids an effect its summary reaches.
+/// unless the policy's `ignore` globs exclude the file. The definition is
+/// flagged when that region forbids a real effect its summary reaches, and —
+/// unless `on_unknown = "ignore"` — when its summary reaches an `Unknown`
+/// external from a region that forbids anything (an unseen external could be
+/// hiding any effect, so it cannot be certified against a non-empty forbid set).
 pub fn check(
     facts: &FactSet,
     summaries: &BTreeMap<SymbolId, EffectSummary>,
     policy: &Policy,
 ) -> Vec<Violation> {
+    // The callees of unresolved (fn-pointer / dyn) edges: an `Unknown` whose
+    // evidence path ends at one of these is a *target*-unknown, not an
+    // effect-unknown. Everything else is an effect-unknown.
+    let unresolved: BTreeSet<&str> = facts
+        .edges
+        .iter()
+        .filter(|e| e.resolution == crate::facts::EdgeResolution::Unresolved)
+        .map(|e| e.callee.as_str())
+        .collect();
+
     let mut violations = Vec::new();
 
     for def in facts.defs.values() {
@@ -123,26 +220,52 @@ pub fn check(
                         region: region.name.clone(),
                         effect: *effect,
                         evidence: summary.evidence.get(effect).cloned().unwrap_or_default(),
+                        finding: Finding::ForbiddenEffect,
+                        severity: Severity::Error,
                     });
                 }
+            }
+
+            // An unseen external is uncertain: it could be doing anything the
+            // region forbids. So a region that forbids *any* real effect cannot
+            // certify a callable that reaches `Unknown`. A pure allow-everything
+            // region (empty forbid) has nothing to hide, so it is exempt.
+            if policy.on_unknown != OnUnknown::Ignore
+                && !region.forbid.is_empty()
+                && summary.effects.contains(&Effect::Unknown)
+            {
+                let evidence = summary
+                    .evidence
+                    .get(&Effect::Unknown)
+                    .cloned()
+                    .unwrap_or_default();
+                let callee = evidence.last().cloned().unwrap_or_default();
+                let flavor = if unresolved.contains(callee.as_str()) {
+                    UnknownFlavor::Target
+                } else {
+                    UnknownFlavor::Effect
+                };
+                let severity = match policy.on_unknown {
+                    OnUnknown::Fail => Severity::Error,
+                    OnUnknown::Warn => Severity::Warning,
+                    OnUnknown::Ignore => unreachable!("guarded above"),
+                };
+                violations.push(Violation {
+                    symbol: def.id.clone(),
+                    display: def.display.clone(),
+                    file: def.file.clone(),
+                    region: region.name.clone(),
+                    effect: Effect::Unknown,
+                    evidence,
+                    finding: Finding::Unknown { callee, flavor },
+                    severity,
+                });
             }
         }
     }
 
     violations
 }
-
-/// Every effect category, in policy-file order — the universe an `allow` list
-/// is subtracted from to derive what a region forbids.
-const ALL_EFFECTS: [Effect; 7] = [
-    Effect::Fs,
-    Effect::Net,
-    Effect::Db,
-    Effect::Clock,
-    Effect::Random,
-    Effect::Process,
-    Effect::Env,
-];
 
 // --- the `hinzu.toml` wire shape ---------------------------------------------
 
@@ -161,6 +284,9 @@ struct AnalysisDoc {
     confidence_threshold: Option<String>,
     #[serde(default)]
     ignore: Vec<String>,
+    /// `fail` (default), `warn`, or `ignore` — what to do about `Unknown`.
+    #[serde(default)]
+    on_unknown: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +302,10 @@ struct RegionDoc {
 impl PolicyDoc {
     fn into_policy(self) -> Result<Policy> {
         let ignore = compile_globs(&self.analysis.ignore)?;
+        let on_unknown = match &self.analysis.on_unknown {
+            Some(s) => OnUnknown::from_str(s).context("parsing [analysis] on_unknown")?,
+            None => OnUnknown::default(),
+        };
 
         let mut regions = Vec::with_capacity(self.region.len());
         for (name, region) in self.region {
@@ -188,7 +318,11 @@ impl PolicyDoc {
             });
         }
 
-        Ok(Policy { regions, ignore })
+        Ok(Policy {
+            regions,
+            ignore,
+            on_unknown,
+        })
     }
 }
 
@@ -201,7 +335,7 @@ impl RegionDoc {
             (false, true) => parse_effects(&self.forbid),
             (true, false) => {
                 let allowed = parse_effects(&self.allow)?;
-                Ok(ALL_EFFECTS
+                Ok(Effect::REAL
                     .into_iter()
                     .filter(|e| !allowed.contains(e))
                     .collect())
@@ -222,9 +356,22 @@ fn compile_globs(globs: &[String]) -> Result<Vec<Pattern>> {
         .collect()
 }
 
-/// Parse a list of effect spellings into categories.
+/// Parse a list of effect spellings into categories. Rejects `"unknown"`: it is
+/// not a category a region can forbid or allow — uncertainty is governed by
+/// `[analysis] on_unknown`, so naming it here is almost always a mistake.
 fn parse_effects(names: &[String]) -> Result<Vec<Effect>> {
-    names.iter().map(|n| Effect::from_str(n)).collect()
+    names
+        .iter()
+        .map(|n| {
+            let effect = Effect::from_str(n)?;
+            if effect == Effect::Unknown {
+                anyhow::bail!(
+                    "'unknown' is not a region effect; control it with [analysis] on_unknown"
+                );
+            }
+            Ok(effect)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -328,6 +475,113 @@ allow = ["fs", "net", "process", "env"]
                 "adapter_fn".to_string(),
                 "std::fs::read".to_string()
             ]
+        );
+        assert_eq!(core_v.finding, Finding::ForbiddenEffect);
+        assert!(core_v.is_error());
+    }
+
+    #[test]
+    fn on_unknown_defaults_to_fail_and_rejects_a_named_region_effect() {
+        // Default when the key is absent.
+        assert_eq!(
+            Policy::from_toml(FIXTURE).unwrap().on_unknown,
+            OnUnknown::Fail
+        );
+        // `unknown` is not a category a region may name.
+        let bad = "[region.core]\npaths=[\"x\"]\nforbid=[\"unknown\"]\n";
+        assert!(Policy::from_toml(bad).is_err());
+    }
+
+    /// A core-forbidding policy with the given `on_unknown` setting.
+    fn policy_with_on_unknown(mode: &str) -> Policy {
+        let src = format!(
+            "[analysis]\non_unknown = \"{mode}\"\n\
+             [region.core]\npaths = [\"crates/*/src/**\"]\nforbid = [\"fs\", \"net\"]\n"
+        );
+        Policy::from_toml(&src).unwrap()
+    }
+
+    /// A core function reaching an `Unknown` external, for the on_unknown cases.
+    fn unknown_facts() -> (FactSet, BTreeMap<SymbolId, EffectSummary>) {
+        let mut facts = FactSet::default();
+        facts.add_def(def("core_fn", "crates/hinzu-core/src/core.rs"));
+        facts.add_edge(Edge::call(
+            "core_fn",
+            "serde_json::from_str",
+            "crates/hinzu-core/src/core.rs",
+            3,
+        ));
+        facts.add_root(EffectRoot {
+            symbol: "serde_json::from_str".to_string(),
+            effect: Effect::Unknown,
+        });
+        let summaries = NaiveEngine.propagate(&facts);
+        (facts, summaries)
+    }
+
+    #[test]
+    fn on_unknown_fail_flags_a_distinct_unknown_error() {
+        let policy = policy_with_on_unknown("fail");
+        let (facts, summaries) = unknown_facts();
+        let violations = check(&facts, &summaries, &policy);
+        assert_eq!(violations.len(), 1);
+        let v = &violations[0];
+        assert!(v.is_error());
+        assert_eq!(v.effect, Effect::Unknown);
+        assert_eq!(
+            v.finding,
+            Finding::Unknown {
+                callee: "serde_json::from_str".to_string(),
+                flavor: UnknownFlavor::Effect,
+            }
+        );
+        // The evidence path ends at the offending external.
+        assert_eq!(v.evidence.last().unwrap(), "serde_json::from_str");
+    }
+
+    #[test]
+    fn on_unknown_warn_reports_but_does_not_fail() {
+        let policy = policy_with_on_unknown("warn");
+        let (facts, summaries) = unknown_facts();
+        let violations = check(&facts, &summaries, &policy);
+        assert_eq!(violations.len(), 1);
+        assert!(!violations[0].is_error());
+        assert_eq!(violations[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn on_unknown_ignore_treats_unknown_as_pure() {
+        let policy = policy_with_on_unknown("ignore");
+        let (facts, summaries) = unknown_facts();
+        assert!(check(&facts, &summaries, &policy).is_empty());
+    }
+
+    #[test]
+    fn an_unresolved_indirect_call_is_a_target_unknown() {
+        let policy = Policy::from_toml(FIXTURE).unwrap();
+        let mut facts = FactSet::default();
+        facts.add_def(def("core_fn", "crates/hinzu-core/src/core.rs"));
+        facts.add_edge(Edge {
+            caller: "core_fn".to_string(),
+            callee: "<indirect>".to_string(),
+            kind: crate::facts::EdgeKind::Call,
+            resolution: crate::facts::EdgeResolution::Unresolved,
+            evidence_file: "crates/hinzu-core/src/core.rs".to_string(),
+            evidence_line: 3,
+        });
+        facts.add_root(EffectRoot {
+            symbol: "<indirect>".to_string(),
+            effect: Effect::Unknown,
+        });
+        let summaries = NaiveEngine.propagate(&facts);
+        let violations = check(&facts, &summaries, &policy);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].finding,
+            Finding::Unknown {
+                callee: "<indirect>".to_string(),
+                flavor: UnknownFlavor::Target,
+            }
         );
     }
 }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use hinzu_core::effects::{EffectEngine, NaiveEngine};
 use hinzu_core::facts::FactSet;
-use hinzu_core::policy::Policy;
+use hinzu_core::policy::{OnUnknown, Policy};
 use hinzu_core::roots::RootSeeds;
 use hinzu_dbsp::DbspEngine;
 
@@ -106,7 +106,14 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
     let policy_src = read_policy_src(&args)?;
     let policy = Policy::from_toml(&policy_src)?;
     let seeds = RootSeeds::from_toml(&policy_src)?;
-    seeds.seed(&mut facts);
+    // Under `on_unknown = ignore` an unseen external is read as pure (the old
+    // behavior), so seed effect roots only. Otherwise also seed an `Unknown`
+    // root for every unseen callee, so uncertainty propagates and is reported.
+    if policy.on_unknown == OnUnknown::Ignore {
+        seeds.seed(&mut facts);
+    } else {
+        seeds.seed_unknowns(&mut facts);
+    }
 
     let outcome = args.engine.run(facts, args.db.as_deref(), &policy)?;
     print!("{}", outcome.report);

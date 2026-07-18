@@ -53,3 +53,8 @@ execSync
 buildSystemPrompt
 pi.dev
 earendil
+serde
+serde_json
+anyhow
+turbofish
+UFCS
