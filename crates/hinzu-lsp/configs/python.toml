@@ -1,0 +1,96 @@
+# The Python language config for hinzu's generic LSP extractor. Everything the
+# extractor needs to turn a Python project into hinzu facts lives here as data;
+# the extractor code knows nothing Python-specific. The resolution backend is ty
+# (Astral's Rust type checker) over its LSP — the sole backend, kept behind this
+# config seam so a native in-process ty backend can replace it later without
+# touching the extractor.
+#
+# The EFFECT MAP is NOT in this file: it is loaded from the shipped annotation
+# table `crates/hinzu-core/annotations/python.toml` ([roots]), so hinzu-core's own
+# root seeding and this extractor read one source of truth. A `<pkg>::<qual>` row
+# there is a specific rule (`os::system`), a bare `<pkg>` row a whole-module rule
+# (`subprocess`).
+
+language_id = "python"
+# ty's LSP server. `HINZU_TY` overrides the binary at runtime.
+server_cmd = ["ty", "server"]
+file_globs = ["**/*.py"]
+# A Python whole-module effect inherits to submodules: `urllib.request` is net
+# because `urllib` is, `http.server` net because `http` is. (Go is the opposite —
+# `net/url` is pure, independent of `net` — so its config leaves this false.)
+package_effects_inherit = true
+package_separator = "."
+exclude_dirs = [
+    ".git", "__pycache__", ".venv", "venv", "env", ".env", "build", "dist",
+    ".eggs", ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "node_modules", "site-packages",
+]
+exclude_suffixes = []
+
+# ty's LSP `initializationOptions` (its GlobalOptions), passed at the top level —
+# NOT nested under `settings`, which ty rejects. `diagnosticMode = workspace`
+# makes ty index the whole project so cross-module definitions settle. The pinned
+# `python-version` / `python-platform` (filled from HINZU_PY_VERSION / the host)
+# select ty's vendored typeshed stdlib deterministically instead of leaving it to
+# ty's environment inference.
+[init_options]
+diagnosticMode = "workspace"
+
+[init_options.configuration.environment]
+"python-version" = "{python_version}"
+"python-platform" = "{python_platform}"
+
+# The cold-start ready probe: an in-memory doc referencing `subprocess.run`,
+# polled until its definition resolves into ty's typeshed — proof the workspace is
+# warm before the real extraction fires (ported from the script adapter's
+# `_await_ready`). `character` 13 sits on the `run` token of `subprocess.run`.
+[ready_probe]
+filename = "__hinzu_lsp_ready__.py"
+text = "import subprocess\nsubprocess.run\n"
+line = 1
+character = 13
+expect = ["subprocess", "/typeshed/"]
+
+# --- provenance: a definition-target file uri -> (package, origin) -------------
+# First match wins. `origin = stdlib` is trusted-pure baseline unless the effect
+# map names the symbol; `origin = module` (third-party) is Unknown / fail-closed.
+# These MUST NOT hardcode ty's vendored-typeshed hash directory — they detect the
+# `/typeshed/<hash>/stdlib/` marker, so a ty version bump that changes the hash
+# still resolves. `normalize` turns a `foo/__init__` / `foo/bar` path tail into
+# the dotted module `foo` / `foo.bar`.
+
+# ty's vendored typeshed stdlib: .../typeshed/<hash>/stdlib/<module>.pyi
+[[provenance]]
+regex = '/typeshed/[^/]+/stdlib/(.+)\.pyi$'
+package = '$1'
+origin = 'stdlib'
+normalize = true
+
+# ty's vendored typeshed third-party stubs: .../typeshed/<hash>/stubs/<dist>/<module>.pyi
+[[provenance]]
+regex = '/typeshed/[^/]+/stubs/[^/]+/(.+)\.pyi$'
+package = '$1'
+origin = 'module'
+normalize = true
+
+# An installed third-party package (site-packages / dist-packages).
+[[provenance]]
+regex = '/(?:site|dist)-packages/(.+)\.pyi?$'
+package = '$1'
+origin = 'module'
+normalize = true
+
+# The interpreter's REAL CPython stdlib source: a def under `.../pythonX.Y/<module>.py[i]`
+# that is NOT site-packages (handled above). ty resolves imported stdlib to its
+# vendored typeshed on most hosts, but on some — notably a headless CI runner whose
+# interpreter ships a full stdlib — it resolves `import subprocess` to the real
+# `.../lib/python3.11/subprocess.py`. That is still the stdlib, so classify it as
+# stdlib rather than dropping it as unknown (which would fail closed on a
+# legitimate stdlib effect). `lib-dynload` C-extension shims and private `_vendor`
+# trees are not importable stdlib module names, so they are rejected.
+[[provenance]]
+regex = '/python\d+(?:\.\d+)?/(.+)\.pyi?$'
+package = '$1'
+origin = 'stdlib'
+normalize = true
+reject_prefixes = ["lib-dynload.", "_vendor."]

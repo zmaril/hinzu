@@ -163,33 +163,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # ty is the adapter's sole backend. `ast` is stdlib; this installs the
-      # pinned `ty==0.0.61` from requirements.txt (the `ty` binary lands on PATH).
-      - name: install the Python adapter's resolution backend (ty)
-        working-directory: adapters/python
-        run: pip install -r requirements.txt
-      # Diagnostics: record ty's version and exactly how it resolves the fixture's
-      # environment and imported-stdlib symbols on THIS runner, so a resolution
-      # regression yields a real log (env discovery, python-version/platform, and
-      # a `subprocess.run` definition probe) rather than a bare test failure.
+      # ty is the Python path's sole resolution backend, spawned by the all-Rust
+      # generic LSP extractor (`hinzu-lsp`). Pin `ty==0.0.61` so the `ty` binary
+      # lands on PATH; there is no Python adapter package to install any more.
+      - name: install the Python resolution backend (ty)
+        run: pip install ty==0.0.61
+      # Diagnostics: record ty's version and how it resolves the fixture's
+      # environment and imported-stdlib symbols on THIS runner (the headless-runner
+      # real-stdlib case), so a resolution regression yields a real log rather than
+      # a bare test failure. The last step is an all-Rust dry run of the extractor
+      # over the fixture with its stderr diagnostics — no Python driver involved.
       - name: ty resolution diagnostics on this runner
-        working-directory: adapters/python
-        env:
-          RUST_LOG: "ty_server=debug,ty_ide=debug,ty_module_resolver=debug,ty_python_semantic=debug"
         run: |
           ty --version
           echo "--- ty check -vvv (environment + module resolution) ---"
-          ty check --project tests/fixture --python-version 3.11 \
+          ty check --project adapters/python/tests/fixture --python-version 3.11 \
             --python-platform linux --exit-zero -vvv 2>&1 | \
             grep -iE "python version|platform|stdlib|search path|vendored|requires-python|not found|subprocess" || true
-          echo "--- ty LSP definition probe (subprocess.run vs open, with server logs) ---"
-          python3 tests/ty_lsp_probe.py
-          echo "--- adapter dry run (ty backend, stderr diagnostics) ---"
-          python3 analyze.py tests/fixture >/dev/null
-      # The live adapter path, on ty: the ignored py_check test builds the CLI
-      # (debug) itself via assert_cmd and drives it over the fixture — the adapter
-      # extracts facts with ty, they propagate, and the functional-core leaks must
-      # be flagged. One build (no separate release step) keeps the cold `dbsp`
-      # compile within budget.
+          echo "--- hinzu-lsp extractor dry run over the fixture (ty backend, stderr) ---"
+          HINZU_LSP_DEBUG=1 cargo run -p hinzu-lsp --example extract -- \
+            adapters/python/tests/fixture >/dev/null
+      # The live path, on ty: the ignored py_check test builds the CLI (debug)
+      # itself via assert_cmd and drives it over the fixture — the ALL-RUST
+      # extractor drives ty over its LSP, the facts propagate, and the
+      # functional-core leaks must be flagged. One build (no separate release step)
+      # keeps the cold `dbsp` compile within budget.
       - name: hinzu check the Python fixture with ty (functional-core leaks)
         run: cargo test -p hinzu-cli --test py_check -- --ignored --exact check_python_project_end_to_end

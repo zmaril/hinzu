@@ -1,10 +1,11 @@
-//! The shared out-of-process adapter harness. The TypeScript and Python adapters
-//! are both external scripts (`node analyze.mjs`, `python3 analyze.py`) that read
-//! a project and write hinzu's `FactSet` JSON to stdout, logging to stderr. Only
-//! the Rust path differs (a linked StableMIR driver). This module holds the one
-//! shell-out-capture-parse body they share, so `ts_adapter` and `py_adapter` keep
-//! just their own project detection and binary/script location — the parts that
-//! genuinely differ per language.
+//! The out-of-process script-adapter harness for the TypeScript path. The
+//! TypeScript adapter is an external Node script (`node analyze.mjs`) that reads a
+//! project and writes hinzu's `FactSet` JSON to stdout, logging to stderr. This
+//! module holds the shell-out-capture-parse body it uses.
+//!
+//! The Rust (StableMIR driver) and Python (in-process `hinzu-lsp` generic LSP
+//! extractor) paths do not use this harness — Rust is a linked driver, and Python
+//! is now driven all-in-Rust over ty's LSP, no script subprocess.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,8 +16,8 @@ use hinzu_core::facts::FactSet;
 /// Locate an adapter's entry script: an explicit environment override (which
 /// must point at a real file), else the in-tree copy at `adapters/<subdir>/
 /// <script>` relative to this crate's manifest. `missing_hint` completes the
-/// honest error when neither is present. Shared by the TypeScript and Python
-/// harnesses, whose only differences here are the names.
+/// honest error when neither is present. Used by the TypeScript harness (the
+/// only script adapter left).
 pub fn locate_script(
     env_var: &str,
     subdir: &str,
@@ -48,14 +49,14 @@ pub fn locate_script(
 
 /// How to run one external script adapter over a project.
 pub struct ScriptAdapter {
-    /// The language name, for error messages ("TypeScript", "Python").
+    /// The language name, for error messages ("TypeScript").
     pub language: &'static str,
-    /// The interpreter binary (`node`, `python3`).
+    /// The interpreter binary (`node`).
     pub binary: String,
-    /// The adapter entry script (`analyze.mjs`, `analyze.py`).
+    /// The adapter entry script (`analyze.mjs`).
     pub script: PathBuf,
-    /// Run with the project as the working directory. TypeScript needs this so
-    /// `tsc` resolves the project's own `node_modules`; Python does not.
+    /// Run with the project as the working directory, so `tsc` resolves the
+    /// project's own `node_modules`.
     pub cwd_is_project: bool,
 }
 

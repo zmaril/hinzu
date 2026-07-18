@@ -220,49 +220,79 @@ such as `TUI.doRender -> node:fs::mkdirSync` and `stream -> (anonymous) ->
 global::fetch`, plus 661 `Unknown` warnings naming the npm packages the checker
 could not see through (chalk, semver, yaml, openai, typebox, and more).
 
-## Python adapter (shipped, slice 3)
+## The generic Rust LSP adapter — hinzu's new baseline mechanism (Python shipped)
 
-The Python adapter is now in the tree at `adapters/python/`, and
-`hinzu check <python-project>` runs it end to end through the same pipeline as
-Rust and TypeScript. It is a type-directed extractor: the standard-library
-`ast` module walks each file with a stack of enclosing functions (the caller),
-and ty (Astral's Rust type checker), driven over its LSP, resolves each call
-site's callee — the definition's target file plus the enclosing qualname supply
-the `full_name` and module path. It emits hinzu's `FactSet` JSON directly —
-definitions, `call` and `reference` edges, and effect roots seeded by the
-callee's declaration provenance. ty is the sole resolution backend; there is no
-fallback resolver.
+hinzu's baseline extraction mechanism is now a **generic, language-agnostic LSP
+adapter, all in Rust** (`crates/hinzu-lsp`): a synchronous Rust LSP client plus an
+extractor that knows no specific language — it is parameterized entirely by a
+per-language config (server command, file globs, the server's
+`initializationOptions`, provenance rules, and the effect map). Point it at any
+language server that speaks `documentSymbol` + `callHierarchy` and it emits
+hinzu's `FactSet` in-process — no per-language parser, no script subprocess, no
+JSON round-trip. The only non-Rust artifacts left on the path are the external
+server binaries it invokes (ty for Python, gopls for Go), which hinzu does not
+write.
 
-Project detection adds one row to the routing table: a `pyproject.toml`,
-`setup.py`, or `setup.cfg` selects the Python adapter, which the CLI runs as
-`python3 analyze.py` (`HINZU_PYTHON` picks the interpreter, `HINZU_PY_ADAPTER`
-the script, `HINZU_TY` the `ty` binary; a missing `python3` or `ty` is an honest
-nonzero failure, not a faked analysis). From the extracted facts onward nothing
-is language-specific — the same store, engine, and policy check that Rust and
-TypeScript already feed.
+The pipeline is the Go/gopls spike, ported to Rust and generalized: spawn the
+server and `initialize`; `didOpen` every matched file and wait for the workspace
+to settle (plus a ready-probe so resolution does not race cold start);
+`documentSymbol` per file → definitions; `prepareCallHierarchy` +
+`callHierarchy/outgoingCalls` per definition → caller→callee `call` edges (a
+local callee mapped back to its definition by source location, since call
+hierarchy drops the receiver); each external callee's defining-file uri →
+provenance → effect via the config map, with the callee's class-qualified name
+(`pathlib::Path.is_file`) reconstructed from the target file's own
+`documentSymbol`.
 
-The seeded categories are the shared vocabulary again, minus `alloc`: `fs`,
-`net`, `process`, `env`, `clock`, and `random`, keyed on ty's resolved
-`full_name`. One Python-specific care is the `pathlib.Path` constructor, which is
-pure — only its I/O methods count as `fs`. The shipped annotation set is
-`crates/hinzu-core/annotations/python.toml`, and
-[`python-catalog.md`](./python-catalog.md) records the full mapping.
+**Python, over ty, is the shipped language.** It replaces the old out-of-process
+`analyze.py` script entirely — its AST walk, caller attribution, and
+ty-over-LSP resolution are now the Rust extractor, driven by
+`crates/hinzu-lsp/configs/python.toml` plus the shipped `python.toml` effect map
+(one source of truth, shared with hinzu-core's own root seeding). Project
+detection routes a `pyproject.toml` / `setup.py` / `setup.cfg` to it; `HINZU_TY`
+overrides the ty binary, `HINZU_PY_VERSION` pins ty's target Python version
+(default `3.11`). ty is the sole resolution backend — a missing `ty` is an honest
+nonzero failure, never a faked analysis. Adding Go (or another language) is a new
+config file plus its provenance/effect rows — a Go config stub ships beside the
+Python one to keep that seam honest — not new extractor code.
 
-Python is still the weakest-resolution adapter, because duck-typed receivers,
-decorators, and dynamic import fall outside any resolver. That is where
-Unknown-by-default earns its keep — each unresolved site is emitted as an
-unknown-target edge, becomes an `Unknown`, and fails closed under the default
-`on_unknown = fail`, so a call hinzu cannot see through reads as "cannot certify,"
-never as false-pure. Running the shared pipeline over housekeeping (a pure-Python
-fleet auditor, 82 files, 486 definitions) with an illustrative functional-core
-policy proves it: ty resolved 89.5% of 2,449 call sites and seeded 22 effect
-roots, driving `fs` coverage to 117 call edges because a real type system closes
-the un-typed `pathlib` gap — `(ctx.workdir / name).is_file()` and
-`target.parent.mkdir()` resolve to precise `pathlib::Path` `fs` roots instead of
-Unknowns. The policy then flagged 20 forbidden-effect violations (14 process, 6
-fs) with evidence paths such as `policy_conflicts -> member_config -> _file_text
--> RepoContext.try_api -> RepoContext.api -> run -> subprocess::run`, plus 86
-`Unknown` findings. Because ty runs over its LSP as a subprocess today, a native
-in-process ty backend is the planned future resolution primitive behind the same
-`FactSet` seam once ty ships a stable Rust library API; see
-[`python-catalog.md`](./python-catalog.md).
+The seeded categories are the shared vocabulary, minus `alloc`: `fs`, `net`,
+`process`, `env`, `clock`, and `random`. The native StableMIR driver remains
+hinzu's Rust-precision path; the generic LSP adapter is the baseline everywhere
+else.
+
+### Honest fidelity: call-only
+
+The generic extractor is **call-only**. `callHierarchy/outgoingCalls` reports only
+the calls the server resolved, so — unlike the old AST walk — it does not see three
+things: higher-order `reference` edges (a function passed as a
+value/callback/decorator); an ambient attribute read such as `os.environ`; and a
+call site the server could not resolve at all. All three need a language body walk,
+deferred to a future language-agnostic tree-sitter rung (also Rust). Unknown-by-default over the
+calls it *does* resolve keeps the result sound — a resolved call into an unvouched
+third-party package is an `Unknown` that fails closed under `on_unknown = fail`,
+never a silent pure.
+
+### Measured on housekeeping (before → after)
+
+Running the shared pipeline over housekeeping (a pure-Python fleet auditor) with
+the same illustrative functional-core policy, comparing the retired `analyze.py`
+(AST + ty-definition) with the new all-Rust `callHierarchy` extractor:
+
+| | old `analyze.py` | new Rust LSP adapter |
+| --- | --- | --- |
+| definitions | 486 | 471 (the 15 are `__init__`, which ty's documentSymbol omits — mostly ignored `tests/`) |
+| forbidden-effect violations | **20 (6 fs, 14 process)** | **20 (6 fs, 14 process)** — exact, same evidence paths |
+| `fs`-effect call edges | 117 | 114 |
+| effect roots | 22 (fs 11, clock 3, net 6, env 1, process 1) | 21 — identical but for `env 1` (`os::environ`, an ambient read call-only cannot see) |
+| `Unknown` ("cannot certify") findings | 86 | 41 |
+
+The **20 forbidden-effect violations match exactly**, with identical evidence
+paths such as `policy_conflicts -> member_config -> _file_text ->
+RepoContext.try_api -> RepoContext.api -> run -> subprocess::run` — because the
+process/fs leaks flow through resolved calls, which call hierarchy captures well
+(ty resolves the `self.api()` method chain robustly). The `Unknown` count drops
+(86 → 41): the AST adapter emitted an `Unknown` for every one of its ~257
+unresolved call sites, which the call-only driver structurally does not enumerate;
+it flags an `Unknown` only for a *resolved* call into an unvouched package. The
+whole run stays around five seconds. See [`python-catalog.md`](./python-catalog.md).
