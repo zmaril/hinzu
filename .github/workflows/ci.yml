@@ -175,12 +175,16 @@ jobs:
       # a `subprocess.run` definition probe) rather than a bare test failure.
       - name: ty resolution diagnostics on this runner
         working-directory: adapters/python
+        env:
+          RUST_LOG: "ty_server=debug,ty_ide=debug,ty_module_resolver=debug,ty_python_semantic=debug"
         run: |
           ty --version
           echo "--- ty check -vvv (environment + module resolution) ---"
           ty check --project tests/fixture --python-version 3.11 \
             --python-platform linux --exit-zero -vvv 2>&1 | \
             grep -iE "python version|platform|stdlib|search path|vendored|requires-python|not found|subprocess" || true
+          echo "--- ty LSP definition probe (subprocess.run vs open, with server logs) ---"
+          python3 tests/ty_lsp_probe.py
           echo "--- adapter dry run (ty backend, stderr diagnostics) ---"
           python3 analyze.py tests/fixture >/dev/null
       # The live adapter path, on ty: the ignored py_check test builds the CLI
