@@ -41,3 +41,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`facts.rs`), a fixed-point propagation engine over the reverse call graph
   (`effects.rs`), and a region-based policy check (`policy.rs`), exercised on
   a synthetic functional-core violation with an evidence path.
+- SQLite fact store (`store.rs`, bundled `rusqlite`): the durable source of
+  truth for definitions, edges, effect roots, and derived effect summaries.
+  Edges now carry a `resolution` provenance field (`call`, `reference`,
+  `value-flow`, or `unresolved`) for the precision ladder. The fact types
+  serialize to and from a JSON schema.
+- Engine seam: an `EffectEngine` trait with the breadth-first `NaiveEngine` as
+  its first implementation, so the incremental DBSP engine can plug in behind
+  the same interface in a later phase.
+- Policy parser: `hinzu.toml` is read into the region model with real glob
+  matching for paths, an `ignore` list, and `allow`/`forbid` region rules. A
+  file is governed by its most-specific matching region, so a nested adapters
+  carve-out overrides the broader core. A worked `hinzu.toml` at the repo root
+  states hinzu's own functional-core policy.
+- `hinzu check <path>` command: ingests pre-extracted facts (`--facts <json>`)
+  into the store, propagates effects, persists the summaries, checks them
+  against a policy (`--policy`, default `hinzu.toml`), and reports every
+  violation with its callable, forbidden effect, region, and evidence path,
+  exiting non-zero when any are found. Without facts on a Rust project it
+  reports that the StableMIR driver is not wired yet and exits non-zero rather
+  than faking an analysis.

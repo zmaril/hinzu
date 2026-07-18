@@ -1,0 +1,13 @@
+# Fixture policy for the `hinzu check` integration test: a functional core that
+# forbids effects, and an adapters carve-out where they are allowed.
+
+[analysis]
+ignore = ["**/tests/**"]
+
+[region.core]
+paths  = ["crates/*/src/**"]
+forbid = ["fs", "net", "db", "process"]
+
+[region.adapters]
+paths = ["crates/*/src/adapters/**"]
+allow = ["fs", "net", "db", "process", "env"]

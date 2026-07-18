@@ -13,12 +13,35 @@ pub struct EffectSummary {
     pub evidence: BTreeMap<Effect, Vec<SymbolId>>,
 }
 
+/// The seam every propagation engine plugs into: facts in, per-symbol effect
+/// summaries out. `NaiveEngine` below is the breadth-first reference
+/// implementation; phase 2 adds a DBSP (Feldera) engine behind this same trait
+/// so the CLI and the fact store never learn which engine ran.
+pub trait EffectEngine {
+    /// Propagate effects to a fixed point and return each callable's summary.
+    fn propagate(&self, facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary>;
+}
+
+/// The reference engine: a multi-source breadth-first search over the reverse
+/// call/use graph. Batch-only and dependency-free — the honest baseline the
+/// incremental DBSP engine is validated against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NaiveEngine;
+
+impl EffectEngine for NaiveEngine {
+    fn propagate(&self, facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary> {
+        propagate(facts)
+    }
+}
+
 /// Propagate effects backward from the roots to a fixed point.
 ///
 /// Multi-source breadth-first search over the reverse graph (callee -> callers)
 /// with a monotone set-union lattice per effect category. Because inserts only
 /// ever add to a `BTreeSet`, the worklist drains even through cycles and
-/// recursion; breadth-first order yields short evidence paths.
+/// recursion; breadth-first order yields short evidence paths. This free
+/// function is the body of [`NaiveEngine::propagate`]; callers that want the
+/// engine seam should depend on the [`EffectEngine`] trait instead.
 pub fn propagate(facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary> {
     // Reverse adjacency: callee -> the symbols that use it.
     let mut callers_of: BTreeMap<SymbolId, Vec<SymbolId>> = BTreeMap::new();

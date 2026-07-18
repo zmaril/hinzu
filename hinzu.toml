@@ -1,0 +1,27 @@
+# hinzu's own functional-core policy, and a worked example of the format.
+#
+# Effects — filesystem, network, database, subprocess, ambient environment — are
+# allowed only where they belong: the CLI and the adapter layer. The engine core
+# stays pure, however deep the call chain. `hinzu check` reports any core
+# callable that can reach a forbidden effect, with the evidence path to the root.
+
+[analysis]
+# Ignore weaker-than-this findings once confidence grading lands (parsed now,
+# enforced in a later phase).
+confidence_threshold = "inferred"
+ignore = ["**/tests/**"]
+
+# The functional core: no effects, however deep the call chain.
+[region.core]
+paths  = ["crates/*/src/**"]
+forbid = ["fs", "net", "db", "process"]
+
+# The adapter layer — where extraction touches the outside world.
+[region.adapters]
+paths = ["crates/*/src/adapters/**"]
+allow = ["fs", "net", "db", "process", "env"]
+
+# The CLI shell — argv in, effects out.
+[region.cli]
+paths = ["crates/*-cli/src/**"]
+allow = ["fs", "net", "db", "process", "env"]
