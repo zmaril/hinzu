@@ -30,3 +30,15 @@ ts-morph
 cpd-finder
 tokio
 monomorphization
+[Mm]onomorphize
+[Mm]onomorphized
+StableMIR
+rustc_public
+charon
+AeneasVerif
+Datalog
+Doop
+execSync
+buildSystemPrompt
+pi.dev
+earendil

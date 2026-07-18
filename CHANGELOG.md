@@ -22,6 +22,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataflow options across languages (stack-graphs, Semgrep, CodeQL, Glean,
   SCIP, Joern, tree-sitter), ported from the closed straitjacket exploration
   and reframed as provenance for hinzu's adapter layer.
+- Getting-started plan update: decisions taken on the adapter forks — native
+  compiler-API adapters for both languages (a StableMIR/`rustc_public` driver
+  for Rust, the TypeScript compiler API for TypeScript, not SCIP), a SQLite
+  fact database from day one, and reference + call edge granularity with a
+  documented value-flow / effect-polymorphic precision ladder. Adds an
+  empirical-validation section from a real run of the native TypeScript
+  extractor against pi.dev (earendil-works/pi).
 - Effect-propagation prototype behind `hinzu run`: a fact schema
   (`facts.rs`), a fixed-point propagation engine over the reverse call graph
   (`effects.rs`), and a region-based policy check (`policy.rs`), exercised on
