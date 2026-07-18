@@ -26,6 +26,7 @@ tree-sitter-stack-graphs
 stack-graphs
 nvim-treesitter
 rust-analyzer
+rusqlite
 ts-morph
 cpd-finder
 tokio

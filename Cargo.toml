@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/hinzu-core", "crates/hinzu-cli"]
+members = ["crates/hinzu-core", "crates/hinzu-dbsp", "crates/hinzu-cli"]
+# The StableMIR driver needs a pinned nightly + `rustc_private`; excluding it
+# keeps the stable `cargo build`/`clippy`/`test` (and CI's `rust` job) from ever
+# trying to compile it. It builds standalone under its own `rust-toolchain.toml`.
+exclude = ["crates/hinzu-rustc-driver"]
+default-members = ["crates/hinzu-core", "crates/hinzu-dbsp", "crates/hinzu-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,3 +16,8 @@ repository = "https://github.com/zmaril/hinzu"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+glob = "0.3"

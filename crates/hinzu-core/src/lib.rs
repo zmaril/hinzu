@@ -9,34 +9,30 @@
 //! `notes/getting-started.md`.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::Result;
 
 pub mod effects;
 pub mod facts;
 pub mod policy;
+pub mod store;
 
 /// Shared builders for the unit tests across the engine's modules, kept in one
 /// place so the `Edge` construction isn't copy-pasted per test module.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::facts::{Edge, EdgeKind};
+    use crate::facts::Edge;
 
     /// A `Call` edge from `caller` to `callee` with placeholder provenance.
     pub(crate) fn edge(caller: &str, callee: &str) -> Edge {
-        Edge {
-            caller: caller.to_string(),
-            callee: callee.to_string(),
-            kind: EdgeKind::Call,
-            evidence_file: "x.rs".to_string(),
-            evidence_line: 1,
-        }
+        Edge::call(caller, callee, "x.rs", 1)
     }
 }
 
-use effects::propagate;
-use facts::{Definition, Edge, EdgeKind, Effect, EffectRoot, FactSet, Language};
-use policy::{check, Policy, Region};
+use effects::{EffectEngine, NaiveEngine};
+use facts::{Definition, Edge, Effect, EffectRoot, FactSet, Language};
+use policy::{check, Policy};
 
 /// Engine entry point. Builds a synthetic demo fact set that mirrors a
 /// functional-core violation — an in-core function that reaches the filesystem
@@ -44,12 +40,66 @@ use policy::{check, Policy, Region};
 /// it, and returns a human-readable report.
 pub fn run() -> Result<String> {
     let facts = demo_facts();
-    let summaries = propagate(&facts);
-    let policy = demo_policy();
+    let summaries = NaiveEngine.propagate(&facts);
+    let policy = demo_policy()?;
     let violations = check(&facts, &summaries, &policy);
+    format_report(
+        "hinzu effect analysis (demo)",
+        &facts,
+        &summaries,
+        &violations,
+    )
+}
 
+/// The outcome of a `hinzu check`: the human-readable report and the number of
+/// policy violations found, so a caller can set a non-zero exit code.
+pub struct CheckOutcome {
+    pub report: String,
+    pub violations: usize,
+}
+
+/// Run the full check pipeline over a fact set: persist the facts to the store,
+/// propagate effects with `engine`, persist the derived summaries, check them
+/// against the policy, and format the report. When `db` is `None` the store is
+/// in-memory (the facts and summaries are not kept after the run). The engine
+/// is caller-chosen (`NaiveEngine` reference, or the DBSP engine) so the store
+/// and report never learn which one ran.
+pub fn check_facts(
+    facts: FactSet,
+    db: Option<&Path>,
+    policy: &Policy,
+    engine: &dyn EffectEngine,
+) -> Result<CheckOutcome> {
+    let mut store = match db {
+        Some(path) => store::Store::open(path)?,
+        None => store::Store::open_in_memory()?,
+    };
+    store.insert_facts(&facts)?;
+
+    // Load the facts back from the store so the analysis runs on exactly what
+    // was persisted — the same path a re-run over an existing `--db` takes.
+    let facts = store.load_facts()?;
+    let summaries = engine.propagate(&facts);
+    store.write_summaries(&summaries)?;
+
+    let violations = check(&facts, &summaries, policy);
+    let report = format_report("hinzu effect analysis", &facts, &summaries, &violations)?;
+    Ok(CheckOutcome {
+        report,
+        violations: violations.len(),
+    })
+}
+
+/// Format the effect summaries and any policy violations into the report both
+/// `run` and `check_facts` print — one place so the layout stays consistent.
+fn format_report(
+    title: &str,
+    facts: &FactSet,
+    summaries: &std::collections::BTreeMap<facts::SymbolId, effects::EffectSummary>,
+    violations: &[policy::Violation],
+) -> Result<String> {
     let mut out = String::new();
-    writeln!(out, "hinzu effect analysis (demo)")?;
+    writeln!(out, "{title}")?;
     writeln!(out)?;
     writeln!(out, "effect summaries:")?;
     for def in facts.defs.values() {
@@ -70,7 +120,7 @@ pub fn run() -> Result<String> {
         writeln!(out, "policy: no violations")?;
     } else {
         writeln!(out, "policy violations ({}):", violations.len())?;
-        for v in &violations {
+        for v in violations {
             writeln!(
                 out,
                 "  {} forbids {} in region '{}': {}",
@@ -121,20 +171,18 @@ fn demo_facts() -> FactSet {
         line_end: 6,
     });
 
-    facts.add_edge(Edge {
-        caller: "crate::core::handle_request".to_string(),
-        callee: "crate::io::load_file".to_string(),
-        kind: EdgeKind::Call,
-        evidence_file: core_file.to_string(),
-        evidence_line: 14,
-    });
-    facts.add_edge(Edge {
-        caller: "crate::io::load_file".to_string(),
-        callee: "std::fs::read_to_string".to_string(),
-        kind: EdgeKind::Call,
-        evidence_file: adapter_file.to_string(),
-        evidence_line: 3,
-    });
+    facts.add_edge(Edge::call(
+        "crate::core::handle_request",
+        "crate::io::load_file",
+        core_file,
+        14,
+    ));
+    facts.add_edge(Edge::call(
+        "crate::io::load_file",
+        "std::fs::read_to_string",
+        adapter_file,
+        3,
+    ));
     // parse_config has no outgoing edges — it stays pure.
 
     facts.add_root(EffectRoot {
@@ -145,15 +193,20 @@ fn demo_facts() -> FactSet {
     facts
 }
 
-/// One region: the core file forbids fs/net/process, however deep the chain.
-fn demo_policy() -> Policy {
-    Policy {
-        regions: vec![Region {
-            name: "core".to_string(),
-            path_prefixes: vec!["crates/hinzu-core/src/core.rs".to_string()],
-            forbid: vec![Effect::Fs, Effect::Net, Effect::Process],
-        }],
-    }
+/// The demo policy: the core tree forbids fs/net/process, the adapters
+/// carve-out allows them. Parsed from the same `hinzu.toml` shape the CLI reads.
+fn demo_policy() -> Result<Policy> {
+    Policy::from_toml(
+        r#"
+[region.core]
+paths  = ["crates/*/src/**"]
+forbid = ["fs", "net", "process"]
+
+[region.adapters]
+paths = ["crates/*/src/adapters/**"]
+allow = ["fs", "net", "process", "env"]
+"#,
+    )
 }
 
 #[cfg(test)]
@@ -172,8 +225,8 @@ mod tests {
     #[test]
     fn demo_flags_handle_request_but_not_load_file_or_parse_config() {
         let facts = demo_facts();
-        let summaries = propagate(&facts);
-        let violations = check(&facts, &summaries, &demo_policy());
+        let summaries = NaiveEngine.propagate(&facts);
+        let violations = check(&facts, &summaries, &demo_policy().unwrap());
 
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].display, "handle_request");

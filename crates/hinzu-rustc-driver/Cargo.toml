@@ -1,0 +1,20 @@
+# Excluded from the workspace default members (see the root Cargo.toml): this
+# crate needs a pinned nightly plus `rustc_private`, so the stable `cargo build`
+# / `clippy` / `test` that CI runs never touch it. Build it explicitly with the
+# nightly pinned in `rust-toolchain.toml`.
+[package]
+name = "hinzu-rustc-driver"
+description = "A rustc_public (StableMIR) driver that extracts hinzu effect facts from a Rust crate."
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/zmaril/hinzu"
+publish = false
+
+[[bin]]
+name = "hinzu-rustc-driver"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

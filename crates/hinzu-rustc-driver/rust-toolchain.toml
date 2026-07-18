@@ -1,0 +1,7 @@
+# The driver links against librustc_driver and uses `rustc_private`, so it is
+# pinned to one exact nightly. A different nightly needs a rebuild (and possibly
+# API edits — the rustc_public surface is unstable). CI never builds this crate;
+# only `hinzu check` on a real Rust project does, via the adapter harness.
+[toolchain]
+channel = "nightly-2026-07-18"
+components = ["rustc-dev", "llvm-tools", "rust-src"]

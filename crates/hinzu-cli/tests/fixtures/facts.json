@@ -1,0 +1,52 @@
+{
+  "definitions": [
+    {
+      "id": "crate::core::handle_request",
+      "display": "handle_request",
+      "language": "rust",
+      "file": "crates/demo-core/src/core.rs",
+      "line_start": 10,
+      "line_end": 20
+    },
+    {
+      "id": "crate::core::parse_config",
+      "display": "parse_config",
+      "language": "rust",
+      "file": "crates/demo-core/src/core.rs",
+      "line_start": 1,
+      "line_end": 8
+    },
+    {
+      "id": "crate::io::load_file",
+      "display": "load_file",
+      "language": "rust",
+      "file": "crates/demo-core/src/adapters/io.rs",
+      "line_start": 1,
+      "line_end": 6
+    }
+  ],
+  "edges": [
+    {
+      "caller": "crate::core::handle_request",
+      "callee": "crate::io::load_file",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "crates/demo-core/src/core.rs",
+      "evidence_line": 14
+    },
+    {
+      "caller": "crate::io::load_file",
+      "callee": "std::fs::read_to_string",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "crates/demo-core/src/adapters/io.rs",
+      "evidence_line": 3
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "std::fs::read_to_string",
+      "effect": "fs"
+    }
+  ]
+}

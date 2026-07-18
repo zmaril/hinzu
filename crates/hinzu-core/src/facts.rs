@@ -1,24 +1,52 @@
 //! The fact schema v0: the language-independent vocabulary the propagation
-//! engine reasons over. Adapters (Rust via SCIP, TypeScript via the compiler
-//! API) normalize their language into these types; nothing below this line
-//! knows what language produced the facts.
+//! engine reasons over. Adapters (Rust via a StableMIR driver, TypeScript via
+//! the compiler API) normalize their language into these types; nothing below
+//! this line knows what language produced the facts.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
 
 /// A stable, structured identity for a callable — the SCIP symbol style
 /// (package/crate + version + descriptor path). Survives repeated analysis.
 pub type SymbolId = String;
 
 /// The languages hinzu adapters target first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Language {
     Rust,
     TypeScript,
 }
 
+impl Language {
+    /// The lowercase spelling used in the fact store and JSON.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Language::Rust => "rust",
+            Language::TypeScript => "typescript",
+        }
+    }
+}
+
+impl FromStr for Language {
+    type Err = anyhow::Error;
+
+    /// Parse the store/JSON spelling back into a language.
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "rust" => Ok(Language::Rust),
+            "typescript" => Ok(Language::TypeScript),
+            other => anyhow::bail!("unknown language: {other}"),
+        }
+    }
+}
+
 /// The closed set of effect categories. An operation either belongs to one of
 /// these or is pure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Effect {
     Fs,
     Net,
@@ -44,8 +72,26 @@ impl Effect {
     }
 }
 
+impl FromStr for Effect {
+    type Err = anyhow::Error;
+
+    /// Parse the policy-file / store spelling back into an effect category.
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "fs" => Ok(Effect::Fs),
+            "net" => Ok(Effect::Net),
+            "db" => Ok(Effect::Db),
+            "clock" => Ok(Effect::Clock),
+            "random" => Ok(Effect::Random),
+            "process" => Ok(Effect::Process),
+            "env" => Ok(Effect::Env),
+            other => anyhow::bail!("unknown effect: {other}"),
+        }
+    }
+}
+
 /// A callable, with the source provenance a policy region matches on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
     pub id: SymbolId,
     pub display: String,
@@ -57,34 +103,145 @@ pub struct Definition {
 
 /// Whether an edge is a resolved call or a bare reference to a symbol (for
 /// example, passing a function as a callback). Both carry effects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EdgeKind {
     Call,
     Reference,
 }
 
+impl EdgeKind {
+    /// The lowercase store/JSON spelling of this edge kind.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeKind::Call => "call",
+            EdgeKind::Reference => "reference",
+        }
+    }
+}
+
+impl FromStr for EdgeKind {
+    type Err = anyhow::Error;
+
+    /// Parse the store/JSON spelling back into an edge kind.
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "call" => Ok(EdgeKind::Call),
+            "reference" => Ok(EdgeKind::Reference),
+            other => anyhow::bail!("unknown edge kind: {other}"),
+        }
+    }
+}
+
+/// How the adapter resolved an edge — the provenance the precision ladder in
+/// `notes/getting-started.md` depends on. `Call` and `Reference` are the two
+/// kinds v0 emits; `ValueFlow` and `Unresolved` are reserved for later rungs
+/// (points-to resolution and the conservative fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EdgeResolution {
+    Call,
+    Reference,
+    ValueFlow,
+    Unresolved,
+}
+
+impl EdgeResolution {
+    /// The store/JSON spelling of this resolution.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeResolution::Call => "call",
+            EdgeResolution::Reference => "reference",
+            EdgeResolution::ValueFlow => "value-flow",
+            EdgeResolution::Unresolved => "unresolved",
+        }
+    }
+
+    /// The resolution that mirrors an edge kind when the adapter records no
+    /// finer provenance: a call resolves as `Call`, a reference as `Reference`.
+    pub fn for_kind(kind: EdgeKind) -> Self {
+        match kind {
+            EdgeKind::Call => EdgeResolution::Call,
+            EdgeKind::Reference => EdgeResolution::Reference,
+        }
+    }
+}
+
+impl FromStr for EdgeResolution {
+    type Err = anyhow::Error;
+
+    /// Parse the store/JSON spelling back into a resolution.
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "call" => Ok(EdgeResolution::Call),
+            "reference" => Ok(EdgeResolution::Reference),
+            "value-flow" => Ok(EdgeResolution::ValueFlow),
+            "unresolved" => Ok(EdgeResolution::Unresolved),
+            other => anyhow::bail!("unknown edge resolution: {other}"),
+        }
+    }
+}
+
 /// "caller uses callee" — the unit of the call/use graph.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub caller: SymbolId,
     pub callee: SymbolId,
     pub kind: EdgeKind,
+    /// How the adapter resolved this edge. Defaults from `kind` when a fact
+    /// source records no finer provenance (see [`Edge::call`] / [`Edge::reference`]).
+    #[serde(default = "default_resolution")]
+    pub resolution: EdgeResolution,
     pub evidence_file: String,
     pub evidence_line: u32,
 }
 
+/// Serde default for an edge whose JSON omits `resolution`: a plain call.
+fn default_resolution() -> EdgeResolution {
+    EdgeResolution::Call
+}
+
+impl Edge {
+    /// A `Call` edge whose resolution mirrors the kind.
+    pub fn call(caller: &str, callee: &str, evidence_file: &str, evidence_line: u32) -> Self {
+        Edge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            kind: EdgeKind::Call,
+            resolution: EdgeResolution::Call,
+            evidence_file: evidence_file.to_string(),
+            evidence_line,
+        }
+    }
+
+    /// A `Reference` edge whose resolution mirrors the kind.
+    pub fn reference(caller: &str, callee: &str, evidence_file: &str, evidence_line: u32) -> Self {
+        Edge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            kind: EdgeKind::Reference,
+            resolution: EdgeResolution::Reference,
+            evidence_file: evidence_file.to_string(),
+            evidence_line,
+        }
+    }
+}
+
 /// A seed: an operation that *is* an effect, tagged with its category.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectRoot {
     pub symbol: SymbolId,
     pub effect: Effect,
 }
 
 /// The normalized fact tables an adapter produces and the engine consumes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FactSet {
+    #[serde(default, with = "def_map")]
     pub defs: BTreeMap<SymbolId, Definition>,
+    #[serde(default)]
     pub edges: Vec<Edge>,
+    #[serde(default)]
     pub roots: Vec<EffectRoot>,
 }
 
@@ -102,5 +259,58 @@ impl FactSet {
     /// Seed an effectful root.
     pub fn add_root(&mut self, root: EffectRoot) {
         self.roots.push(root);
+    }
+
+    /// Parse a fact set from the JSON schema `hinzu check --facts` reads: a
+    /// `definitions` array plus `edges` and `effect_roots`.
+    pub fn from_json(json: &str) -> anyhow::Result<Self> {
+        let wire: WireFacts = serde_json::from_str(json)?;
+        Ok(wire.into())
+    }
+}
+
+/// The on-the-wire JSON shape: `definitions` as a flat array (adapters emit a
+/// list, not a keyed map), mirroring the store's tables.
+#[derive(Serialize, Deserialize)]
+struct WireFacts {
+    #[serde(default)]
+    definitions: Vec<Definition>,
+    #[serde(default)]
+    edges: Vec<Edge>,
+    #[serde(default)]
+    effect_roots: Vec<EffectRoot>,
+}
+
+impl From<WireFacts> for FactSet {
+    fn from(wire: WireFacts) -> Self {
+        let mut facts = FactSet::default();
+        for def in wire.definitions {
+            facts.add_def(def);
+        }
+        facts.edges = wire.edges;
+        facts.roots = wire.effect_roots;
+        facts
+    }
+}
+
+/// Serialize `defs` as a flat array keyed by each definition's id, so the
+/// derived `FactSet` serialization matches the JSON schema.
+mod def_map {
+    use super::{Definition, SymbolId};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<SymbolId, Definition>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        map.values().collect::<Vec<_>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<SymbolId, Definition>, D::Error> {
+        let defs = Vec::<Definition>::deserialize(d)?;
+        Ok(defs.into_iter().map(|d| (d.id.clone(), d)).collect())
     }
 }

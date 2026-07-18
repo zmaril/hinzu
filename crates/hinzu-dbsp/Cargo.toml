@@ -1,0 +1,12 @@
+[package]
+name = "hinzu-dbsp"
+description = "The DBSP (Feldera) effect-propagation engine for hinzu."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hinzu-core = { path = "../hinzu-core" }
+anyhow = { workspace = true }
+dbsp = "0.322"

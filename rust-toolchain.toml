@@ -1,0 +1,10 @@
+# Pin the workspace to a known-good stable. rustc 1.97.x hits an internal
+# compiler error (a `dyn_clone` vtable-slot panic in the new trait solver) while
+# building the `dbsp` dependency; 1.96.0 compiles it cleanly. This pin keeps
+# `cargo build`/`clippy`/`test` green locally and in CI until the upstream rustc
+# regression is fixed, at which point the pin can be lifted. The StableMIR driver
+# under crates/hinzu-rustc-driver has its own (nightly) toolchain file, which
+# takes precedence inside that crate's directory.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
