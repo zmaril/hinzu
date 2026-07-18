@@ -8,3 +8,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  - package-ecosystem: "cargo"
+    directory: "/crates/hinzu-rustc-driver"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/adapters/typescript"
+    schedule:
+      interval: "weekly"
