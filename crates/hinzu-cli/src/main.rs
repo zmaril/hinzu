@@ -1,12 +1,16 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
+mod rust_adapter;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use hinzu_core::effects::{EffectEngine, NaiveEngine};
 use hinzu_core::facts::FactSet;
 use hinzu_core::policy::Policy;
+use hinzu_dbsp::DbspEngine;
 
 #[derive(Parser)]
 #[command(name = "hinzu", version, about = "hinzu")]
@@ -36,6 +40,33 @@ struct CheckArgs {
     /// The SQLite fact store to write. Defaults to an in-memory store.
     #[arg(long)]
     db: Option<PathBuf>,
+    /// The propagation engine: `dbsp` (default) or the reference `naive` BFS.
+    #[arg(long, value_enum, default_value_t = Engine::Dbsp)]
+    engine: Engine,
+}
+
+/// Which propagation engine `hinzu check` runs. Both produce the same effect
+/// sets; `dbsp` is the incremental-capable engine, `naive` the reference BFS.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Engine {
+    Dbsp,
+    Naive,
+}
+
+impl Engine {
+    /// Dispatch to the chosen engine behind the shared `EffectEngine` seam.
+    fn run(
+        self,
+        facts: FactSet,
+        db: Option<&Path>,
+        policy: &Policy,
+    ) -> Result<hinzu_core::CheckOutcome> {
+        let engine: &dyn EffectEngine = match self {
+            Engine::Dbsp => &DbspEngine,
+            Engine::Naive => &NaiveEngine,
+        };
+        hinzu_core::check_facts(facts, db, policy, engine)
+    }
 }
 
 fn main() -> ExitCode {
@@ -68,7 +99,7 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
     let facts = load_facts(&args)?;
     let policy = load_policy(&args)?;
 
-    let outcome = hinzu_core::check_facts(facts, args.db.as_deref(), &policy)?;
+    let outcome = args.engine.run(facts, args.db.as_deref(), &policy)?;
     print!("{}", outcome.report);
 
     if outcome.violations == 0 {
@@ -78,23 +109,25 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
     }
 }
 
-/// Load facts from the `--facts` JSON, or fail with an honest message when no
-/// facts are given: the Rust adapter that would extract them live is a later
-/// phase, so this phase never fakes an analysis.
+/// Load facts from the `--facts` JSON (the offline path), or extract them live
+/// by running the StableMIR driver over the target cargo project. When the path
+/// is not a cargo project and no facts are given, fail honestly rather than
+/// faking an analysis.
 fn load_facts(args: &CheckArgs) -> Result<FactSet> {
-    match &args.facts {
-        Some(path) => {
-            let json = std::fs::read_to_string(path)
-                .with_context(|| format!("reading facts from {}", path.display()))?;
-            FactSet::from_json(&json)
-                .with_context(|| format!("parsing facts from {}", path.display()))
-        }
-        None => anyhow::bail!(
-            "no Rust adapter wired yet — run phase 2 (the StableMIR driver) to extract facts \
-             from {}, or pass --facts <json> to analyze pre-extracted facts",
-            args.path.display()
-        ),
+    if let Some(path) = &args.facts {
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("reading facts from {}", path.display()))?;
+        return FactSet::from_json(&json)
+            .with_context(|| format!("parsing facts from {}", path.display()));
     }
+    if rust_adapter::is_cargo_project(&args.path) {
+        return rust_adapter::extract_facts(&args.path)
+            .with_context(|| format!("extracting Rust facts from {}", args.path.display()));
+    }
+    anyhow::bail!(
+        "{} is not a cargo project — pass --facts <json> to analyze pre-extracted facts",
+        args.path.display()
+    )
 }
 
 /// Load the policy from `--policy`, else `hinzu.toml` in the target project,

@@ -59,10 +59,17 @@ pub struct CheckOutcome {
 }
 
 /// Run the full check pipeline over a fact set: persist the facts to the store,
-/// propagate effects with the [`NaiveEngine`], persist the derived summaries,
-/// check them against the policy, and format the report. When `db` is `None`
-/// the store is in-memory (the facts and summaries are not kept after the run).
-pub fn check_facts(facts: FactSet, db: Option<&Path>, policy: &Policy) -> Result<CheckOutcome> {
+/// propagate effects with `engine`, persist the derived summaries, check them
+/// against the policy, and format the report. When `db` is `None` the store is
+/// in-memory (the facts and summaries are not kept after the run). The engine
+/// is caller-chosen (`NaiveEngine` reference, or the DBSP engine) so the store
+/// and report never learn which one ran.
+pub fn check_facts(
+    facts: FactSet,
+    db: Option<&Path>,
+    policy: &Policy,
+    engine: &dyn EffectEngine,
+) -> Result<CheckOutcome> {
     let mut store = match db {
         Some(path) => store::Store::open(path)?,
         None => store::Store::open_in_memory()?,
@@ -72,7 +79,7 @@ pub fn check_facts(facts: FactSet, db: Option<&Path>, policy: &Policy) -> Result
     // Load the facts back from the store so the analysis runs on exactly what
     // was persisted — the same path a re-run over an existing `--db` takes.
     let facts = store.load_facts()?;
-    let summaries = NaiveEngine.propagate(&facts);
+    let summaries = engine.propagate(&facts);
     store.write_summaries(&summaries)?;
 
     let violations = check(&facts, &summaries, policy);

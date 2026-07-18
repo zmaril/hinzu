@@ -22,6 +22,79 @@ pub trait EffectEngine {
     fn propagate(&self, facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary>;
 }
 
+/// Forward adjacency: caller -> the symbols it uses. The transpose of the
+/// reverse map [`propagate`] builds. The evidence walk in
+/// [`shortest_path_to_roots`] follows it downward, from a function toward an
+/// effect root.
+pub fn forward_adjacency(facts: &FactSet) -> BTreeMap<SymbolId, Vec<SymbolId>> {
+    let mut uses_of: BTreeMap<SymbolId, Vec<SymbolId>> = BTreeMap::new();
+    for edge in &facts.edges {
+        uses_of
+            .entry(edge.caller.clone())
+            .or_default()
+            .push(edge.callee.clone());
+    }
+    uses_of
+}
+
+/// A shortest path from `start` down the call/use graph to any symbol in
+/// `roots`, both ends inclusive, or `None` when no root is reachable. The walk
+/// is breadth-first, so the path is the fewest hops — the short explanation the
+/// report prints. An engine that computes only the effect *set* (like the DBSP
+/// circuit) reconstructs each evidence path with this, restricting `roots` to
+/// the roots that carry the effect in question.
+pub fn shortest_path_to_roots(
+    forward: &BTreeMap<SymbolId, Vec<SymbolId>>,
+    start: &SymbolId,
+    roots: &BTreeSet<SymbolId>,
+) -> Option<Vec<SymbolId>> {
+    if roots.contains(start) {
+        return Some(vec![start.clone()]);
+    }
+    // Breadth-first over forward edges, recording each node's predecessor so the
+    // path can be walked back once a root is reached.
+    let mut prev: BTreeMap<SymbolId, SymbolId> = BTreeMap::new();
+    let mut seen: BTreeSet<SymbolId> = BTreeSet::new();
+    let mut queue: VecDeque<SymbolId> = VecDeque::new();
+    seen.insert(start.clone());
+    queue.push_back(start.clone());
+
+    while let Some(node) = queue.pop_front() {
+        let Some(callees) = forward.get(&node) else {
+            continue;
+        };
+        for callee in callees {
+            if !seen.insert(callee.clone()) {
+                continue;
+            }
+            prev.insert(callee.clone(), node.clone());
+            if roots.contains(callee) {
+                return Some(reconstruct_path(&prev, start, callee));
+            }
+            queue.push_back(callee.clone());
+        }
+    }
+    None
+}
+
+/// Walk the predecessor chain from `end` back to `start`, then reverse it into a
+/// forward path `[start, …, end]`.
+fn reconstruct_path(
+    prev: &BTreeMap<SymbolId, SymbolId>,
+    start: &SymbolId,
+    end: &SymbolId,
+) -> Vec<SymbolId> {
+    let mut path = vec![end.clone()];
+    let mut cur = end;
+    while cur != start {
+        let p = &prev[cur];
+        path.push(p.clone());
+        cur = p;
+    }
+    path.reverse();
+    path
+}
+
 /// The reference engine: a multi-source breadth-first search over the reverse
 /// call/use graph. Batch-only and dependency-free — the honest baseline the
 /// incremental DBSP engine is validated against.
