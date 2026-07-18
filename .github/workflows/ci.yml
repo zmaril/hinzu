@@ -1,0 +1,49 @@
+# straitjacket-allow-file[:duplication] — per-job `needs:`/`if:` gating and the
+# shared checkout/toolchain/cache setup necessarily repeat across jobs in Actions YAML
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 7 * * 2"  # weekly: catch toolchain/dep drift even without a push
+
+jobs:
+  # Fan-out: decide whether a PR actually touches anything the build depends
+  # on. A docs-only PR skips the heavy compile/test job below — and a skipped
+  # required check still reports green, so branch protection stays happy.
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+
+  rust:
+    name: rust
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
