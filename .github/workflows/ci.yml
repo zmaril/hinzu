@@ -71,9 +71,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: install toolchains
         run: |
-          rustup toolchain install 1.96.0 --profile minimal --component rustfmt clippy
+          # Stable builds the CLI (no fmt/clippy needed here — the `rust` job
+          # owns those). The nightly builds the driver and compiles hinzu-core
+          # under it, so it needs the compiler-internal components. Each
+          # component takes its own `-c`: rustup reads a bare word after
+          # `--component` as another toolchain name, not a second component.
+          rustup toolchain install 1.96.0 --profile minimal
           rustup toolchain install nightly-2026-07-18 --profile minimal \
-            --component rustc-dev llvm-tools rust-src
+            -c rustc-dev -c llvm-tools -c rust-src
           rustup default 1.96.0
       - uses: Swatinem/rust-cache@v2
       # Build the CLI on stable (the workspace pin, via rust-toolchain.toml).
