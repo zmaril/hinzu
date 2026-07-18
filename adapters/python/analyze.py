@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
-# The hinzu Python adapter: a name-resolution-grade extractor that turns a Python
+# The hinzu Python adapter: a call-resolution extractor that turns a Python
 # project into hinzu's language-independent FactSet JSON.
 #
 # It is *extraction, not interpretation*. Walk every owned source file with the
-# `ast` module keeping a stack of enclosing functions (the caller), and at each
-# call site resolve the callee with Jedi's `goto(follow_imports=True)` — the
-# closest maintained analogue to the TypeScript checker's getResolvedSignature.
-# Effect roots are seeded by *declaration provenance*: Jedi tells us a callee's
-# `full_name` and the module file it lives in, so `subprocess.run` resolves to
-# the `subprocess` stdlib module and seeds a `process` root. Every effect name is
-# a member of hinzu's ONE flat, shared vocabulary; Python seeds a subset (fs,
-# net, process, env, clock, random) and never invents a Python-specific category.
-# There is deliberately no `alloc` effect for Python.
+# standard-library `ast` module keeping a stack of enclosing functions (the
+# caller) and record every call, function-value reference, and ambient-env read
+# as a *site*. A resolution BACKEND then resolves each site's callee to a
+# declaration, supplying the module + name provenance the effect roots key on.
+# Effect roots are seeded by that declaration provenance: a callee resolving to
+# `subprocess.run` seeds a `process` root, `pathlib.Path.mkdir` an `fs` root.
+# Every effect name is a member of hinzu's ONE flat, shared vocabulary; Python
+# seeds a subset (fs, net, process, env, clock, random) and never invents a
+# Python-specific category. There is deliberately no `alloc` for a GC'd runtime.
 #
-# CRITICAL soundness rule (sound-by-default via Unknown): Python resolves only
-# ~78% of call sites — duck-typed receivers, un-typed `pathlib` like
-# `target.parent.mkdir`, `getattr`, decorators, dynamic import. An UNRESOLVED
-# call site is emitted as an edge with `resolution: "unresolved"`, so hinzu-core
-# turns it into an `Unknown` that FAILS CLOSED under the default `on_unknown =
-# fail`. It is never silently dropped as pure — that is what keeps a
-# weak-resolution language sound.
+# TWO BACKENDS, one classification. The AST walk, the caller attribution, the
+# reference edges, and the whole owned/effect/stdlib/third-party classification
+# are backend-independent — they run identically no matter what resolved a site.
+# The only swappable part is how a call-site position becomes a resolution:
 #
-# The fact source is deliberately swappable behind this seam: Jedi today; a
-# native-Rust type checker (pyrefly, then ty) is the planned future backend once
-# one ships a stable library API, at higher fidelity through the same FactSet
-# contract.
+#   * ty (DEFAULT when the `ty` binary is present) — Astral's Rust type checker,
+#     driven over its LSP (`ty server`): `textDocument/definition` at each
+#     callee token resolves the definition, whose target file (ty's vendored
+#     typeshed, or an owned/third-party module) + enclosing qualname give the
+#     provenance. A real type system resolves the un-typed `pathlib` receivers
+#     and much of the duck-typed surface Jedi cannot, so many of Jedi's Unknowns
+#     become precise `fs`/`clock`/… edges. It is an LSP/subprocess upgrade today;
+#     the intent is a native in-process ty backend behind this same seam once ty
+#     ships a stable Rust library API.
+#   * Jedi (FALLBACK, zero extra binary) — `script.goto(follow_imports=True)`,
+#     name-resolution-grade. Used when `ty` is absent, so the adapter always
+#     runs. Select explicitly with `HINZU_PY_BACKEND=jedi` (or `=ty`).
+#
+# CRITICAL soundness rule (sound-by-default via Unknown): no backend resolves
+# every call site — duck-typed receivers, `getattr`, decorators, dynamic import.
+# An UNRESOLVED call site is emitted as an edge with `resolution: "unresolved"`,
+# so hinzu-core turns it into an `Unknown` that FAILS CLOSED under the default
+# `on_unknown = fail`. It is never silently dropped as pure — that is what keeps
+# a weak-resolution language sound, whichever backend ran.
 #
 # Output (stdout) is exactly the schema `hinzu_core::FactSet::from_json` ingests:
 #   { definitions: [...], edges: [...], effect_roots: [...] }
@@ -35,17 +47,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import re
+import shutil
 import sys
 from pathlib import Path
-
-try:
-    import jedi
-except ImportError:  # honest capability edge: no faked analysis without Jedi
-    sys.stderr.write(
-        "hinzu-py: the `jedi` package is required — run `pip install jedi` "
-        "(see adapters/python/requirements.txt)\n"
-    )
-    sys.exit(3)
+from urllib.parse import unquote, urlparse
 
 # --- shared, flat effect vocabulary (a subset of hinzu's categories) ----------
 # The same names Rust and TypeScript use. A category that does not apply to
@@ -96,8 +103,9 @@ EFFECT_DOTTED = {
     "datetime.datetime.utcnow": CLOCK, "datetime.date.today": CLOCK,
 }
 
-# os.path predicates that stat the filesystem. Jedi resolves `os.path` to the
-# platform implementation module, so those spellings are covered too.
+# os.path predicates that stat the filesystem. Both Jedi and ty resolve `os.path`
+# to the platform implementation module (posixpath / ntpath / genericpath), so
+# those spellings are covered too.
 OS_PATH_FS = {
     "exists", "isfile", "isdir", "islink", "getsize", "getmtime", "getctime",
     "getatime", "realpath", "samefile",
@@ -124,7 +132,8 @@ IGNORE_DIRS = {
 
 def effect_for(full_name: str) -> str | None:
     """The effect a resolved external callee seeds, or None if it is pure. Keyed
-    on Jedi's full_name; the resolution order mirrors python.toml."""
+    on the callee's `full_name`; the resolution order mirrors python.toml. The
+    same function for both backends — ty and Jedi hand it the same dotted name."""
     if full_name in EFFECT_DOTTED:
         return EFFECT_DOTTED[full_name]
     # os.path / posixpath predicates that stat the filesystem.
@@ -151,6 +160,42 @@ def canonical_symbol(full_name: str) -> str:
     return f"{top}::{rest}" if rest else top
 
 
+class Resolution:
+    """A backend-independent, normalized resolution of one call/reference site:
+    the callee's dotted `full_name`, the filesystem `module_path` of the module
+    that declares it (or None for a C builtin), and its `kind`
+    (`function`/`method`/`class`/…). Both the Jedi and ty backends produce this
+    same shape, so the classification downstream is one shared code path."""
+
+    __slots__ = ("full_name", "module_path", "kind")
+
+    def __init__(self, full_name, module_path, kind):
+        self.full_name = full_name
+        self.module_path = module_path
+        self.kind = kind
+
+
+class Site:
+    """One place the AST walk found a callee/reference to resolve, attributed to
+    its enclosing function. The walk records sites; a backend resolves them in a
+    batch (ty pipelines them over LSP); then the shared classifier emits edges."""
+
+    __slots__ = ("kind", "file", "relpath", "caller", "node", "line", "col")
+
+    def __init__(self, kind, file, relpath, caller, node):
+        self.kind = kind
+        self.file = file
+        self.relpath = relpath
+        self.caller = caller
+        self.node = node
+        self.line = node.lineno
+        self.col = node.end_col_offset - 1
+
+
+def _uri_to_path(u: str) -> str:
+    return unquote(urlparse(u).path)
+
+
 class Adapter:
     def __init__(self, project: Path):
         self.project = project.resolve()
@@ -162,15 +207,13 @@ class Adapter:
         if src.is_dir():
             self.source_roots.append(src)
         self.source_roots.append(self.project)
-        self.project_obj = jedi.Project(
-            str(self.project), added_sys_path=[str(r) for r in self.source_roots]
-        )
         self.definitions: dict[str, dict] = {}
         self.edges: list[dict] = []
         self.roots: dict[str, str] = {}
         self.owned_ids: set[str] = set()
+        self.sites: list[Site] = []
         self._sources: dict[str, str] = {}
-        self._scripts: dict[str, jedi.Script] = {}
+        self._qual_cache: dict[str, dict] = {}
         # counters (stderr diagnostics)
         self.n_call = self.n_resolved = self.n_unresolved = self.n_ref = 0
 
@@ -225,12 +268,96 @@ class Adapter:
             return None
         return f"{self.rel(module_path)}#{qual}"
 
-    def script(self, path: str) -> jedi.Script:
-        if path not in self._scripts:
-            self._scripts[path] = jedi.Script(
-                self._sources[path], path=path, project=self.project_obj
-            )
-        return self._scripts[path]
+    def is_stdlib(self, module_path, full_name: str) -> bool:
+        top = (full_name or "").split(".", 1)[0]
+        if top == "builtins" or top in sys.stdlib_module_names:
+            return True
+        if top in ("posixpath", "ntpath", "genericpath", "pathlib"):
+            return True
+        if module_path is None:
+            # A builtin / C-implemented callee named but not located.
+            return bool(full_name)
+        p = str(module_path).replace("\\", "/")
+        if "/site-packages/" in p or "/dist-packages/" in p:
+            return False
+        return "/python3." in p or "/lib/python" in p or "/typeshed/" in p
+
+    # ---- ty target-file provenance ------------------------------------------
+    # These map a `textDocument/definition` target (a file path + line) to the
+    # dotted module + qualname the classifier keys on. They must NOT hardcode
+    # ty's vendored-typeshed hash directory — they detect the `/typeshed/…/
+    # stdlib/` marker instead, so a ty version bump that changes the hash still
+    # resolves. Detected at runtime from the actual target path ty returns.
+    def module_of_target(self, path: str) -> tuple[str, str | None]:
+        """Classify a definition target's file into (kind, dotted-module).
+        kind is OWNED / STDLIB / THIRD_PARTY / OTHER."""
+        try:
+            rel = Path(path).resolve().relative_to(self.project)
+            if not any(part in IGNORE_DIRS for part in rel.parts):
+                return ("OWNED", self.module_dotted(path))
+        except ValueError:
+            pass
+        p = path.replace("\\", "/")
+        # ty's vendored typeshed: .../typeshed/<hash>/stdlib/<module>.pyi
+        m = re.search(r"/typeshed/[^/]+/stdlib/(.+)\.pyi$", p)
+        if m:
+            return ("STDLIB", m.group(1).replace("/__init__", "").replace("/", "."))
+        # ty's vendored typeshed third-party stubs: .../stubs/<dist>/<module>.pyi
+        m = re.search(r"/typeshed/[^/]+/stubs/[^/]+/(.+)\.pyi$", p)
+        if m:
+            return ("THIRD_PARTY", m.group(1).replace("/__init__", "").replace("/", "."))
+        # an installed third-party package (site-packages or dist-packages)
+        m = re.search(r"/(?:site|dist)-packages/(.+)\.pyi?$", p)
+        if m:
+            return ("THIRD_PARTY", m.group(1).replace("/__init__", "").replace("/", "."))
+        return ("OTHER", None)
+
+    def qualname_at(self, path: str, line0: int) -> tuple[str | None, str | None]:
+        """The dotted qualname and node kind of the def/class/assignment whose
+        name sits on `line0` (0-based, as LSP reports it) in `path` — e.g.
+        (`Path.mkdir`, `function`) or (`environ`, `statement`). Class-qualified
+        so `datetime.datetime.now` and `datetime.date.today` stay distinct
+        instead of collapsing to a bare `now` / `today`."""
+        table = self._qual_cache.get(path)
+        if table is None:
+            table = {}
+            src = self._sources.get(path)
+            if src is None:
+                try:
+                    src = Path(path).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    src = ""
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                self._index_quals(tree, [], table)
+            self._qual_cache[path] = table
+        return table.get(line0 + 1, (None, None))
+
+    def _index_quals(self, node, stack, table):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                table[ch.lineno] = (".".join(stack + [ch.name]), "function")
+                self._index_quals(ch, stack + [ch.name], table)
+            elif isinstance(ch, ast.ClassDef):
+                table[ch.lineno] = (".".join(stack + [ch.name]), "class")
+                self._index_quals(ch, stack + [ch.name], table)
+            else:
+                # Module- and class-level bindings (e.g. `os.environ`) are the
+                # provenance target for ambient values, not just callables.
+                for name in self._assigned_names(ch):
+                    table.setdefault(ch.lineno, (".".join(stack + [name]), "statement"))
+                self._index_quals(ch, stack, table)
+
+    @staticmethod
+    def _assigned_names(node):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            return [node.target.id]
+        if isinstance(node, ast.Assign):
+            return [t.id for t in node.targets if isinstance(t, ast.Name)]
+        return []
 
     # ---- pass 1: definitions only -------------------------------------------
     def collect(self):
@@ -243,54 +370,64 @@ class Adapter:
                 sys.stderr.write(f"hinzu-py: skipping {self.rel(f)}: {e}\n")
                 self._sources.pop(str(f), None)
                 continue
-            Collector(self, str(f), self.rel(f), resolve=False).visit(tree)
+            Collector(self, str(f), self.rel(f), record=False).visit(tree)
         self.owned_ids = set(self.definitions)
 
-    # ---- pass 2: resolve every call/reference site now that all owned ids
-    # exist, so a forward reference between files still resolves to a local edge.
-    def resolve(self):
+    # ---- pass 2: record every call/reference/env SITE (no resolution yet), so
+    # a backend can resolve them all in one batch. Forward references between
+    # files still resolve to a local edge because all owned ids already exist.
+    def enumerate_sites(self):
         for f in self.owned_files():
             path = str(f)
             if path not in self._sources:
                 continue
             tree = ast.parse(self._sources[path], filename=path)
-            Collector(self, path, self.rel(f), resolve=True).visit(tree)
+            Collector(self, path, self.rel(f), record=True).visit(tree)
 
-    # ---- pass 2: resolve callees + references with Jedi ---------------------
-    def resolve_call(self, file: str, relpath: str, caller: str, func: ast.AST):
+    def record(self, kind, file, relpath, caller, node):
+        self.sites.append(Site(kind, file, relpath, caller, node))
+
+    # ---- pass 3: resolve every site with the chosen backend, then emit edges
+    # through the SHARED classifier — the same body no matter which backend ran.
+    def resolve_and_emit(self, backend):
+        queries = {(s.file, s.line, s.col) for s in self.sites}
+        results = backend.resolve_batch(self._sources, queries)
+        emit = {
+            "call": self._emit_call,
+            "reference": self._emit_reference,
+            "env": self._emit_env,
+        }
+        for site in self.sites:
+            emit[site.kind](site, results.get((site.file, site.line, site.col)))
+
+    def _emit_call(self, site: Site, res: Resolution | None):
         self.n_call += 1
-        line = func.lineno
-        col = func.end_col_offset - 1
-        try:
-            defs = self.script(file).goto(
-                line, col, follow_imports=True, follow_builtin_imports=True
-            )
-        except Exception:
-            defs = []
-        if not defs:
-            # UNRESOLVED call site — fail closed. Emit an unknown-target edge so
-            # hinzu-core turns it into an Unknown, never a silent pure.
+        caller, relpath, line = site.caller, site.relpath, site.line
+        full_name = res.full_name if res else None
+        if full_name is None:
+            # UNRESOLVED (or resolved-but-unnamed) call site — fail closed. Emit
+            # an unknown-target edge so hinzu-core turns it into an Unknown,
+            # never a silent pure.
             self.n_unresolved += 1
-            try:
-                text = ast.unparse(func)
-            except Exception:
-                text = "<call>"
+            if res is None:
+                try:
+                    text = ast.unparse(site.node)
+                except Exception:  # noqa: BLE001 — any unparse failure is a <call>
+                    text = "<call>"
+                callee = f"unresolved::{text}"
+            else:
+                callee = "unresolved::<unnamed>"
             self.edges.append({
-                "caller": caller,
-                "callee": f"unresolved::{text}",
-                "kind": "call",
-                "resolution": "unresolved",
-                "evidence_file": relpath,
+                "caller": caller, "callee": callee, "kind": "call",
+                "resolution": "unresolved", "evidence_file": relpath,
                 "evidence_line": line,
             })
             return
 
-        d = defs[0]
-        full_name = d.full_name
-        mp = d.module_path
+        mp = res.module_path
         # A call into a function we own: a plain call edge; its effects propagate
         # through its own body's edges.
-        if self.is_owned(mp) and full_name:
+        if self.is_owned(mp):
             callee_id = self.local_id(mp, full_name)
             if callee_id and callee_id in self.owned_ids:
                 self.n_resolved += 1
@@ -298,27 +435,15 @@ class Adapter:
                 return
             # Constructing an owned class: thread to its `__init__` so the
             # constructor's own effects (if any) propagate. A dataclass with no
-            # explicit `__init__` has no tracked def, so construction is pure — no
-            # edge, and never a false Unknown.
-            if callee_id and d.type == "class":
-                init_id = f"{callee_id}.__init__"
+            # explicit `__init__` has no tracked def, so construction is pure.
+            if callee_id and res.kind == "class":
                 self.n_resolved += 1
+                init_id = f"{callee_id}.__init__"
                 if init_id in self.owned_ids:
                     self._edge(caller, init_id, "call", relpath, line)
                 return
             # Resolved into an owned module but not a tracked function (a module
             # attribute / cached_property): fall through to external handling.
-
-        if not full_name:
-            # Resolved to something with no name (a parameter, a comprehension):
-            # treat as unresolved so it fails closed rather than reading pure.
-            self.n_unresolved += 1
-            self.edges.append({
-                "caller": caller, "callee": "unresolved::<unnamed>",
-                "kind": "call", "resolution": "unresolved",
-                "evidence_file": relpath, "evidence_line": line,
-            })
-            return
 
         self.n_resolved += 1
         effect = effect_for(full_name)
@@ -339,26 +464,14 @@ class Adapter:
         # `[trust]` line vouches for the package.
         self._edge(caller, canonical_symbol(full_name), "call", relpath, line)
 
-    def resolve_reference(self, file: str, relpath: str, caller: str, node: ast.AST):
+    def _emit_reference(self, site: Site, res: Resolution | None):
         """A function value used without being called (a callback, a decorator, a
         default argument). Draw a reference edge ONLY to an owned definition or a
         known effect — a bare reference never manufactures an Unknown."""
-        line = node.lineno
-        col = node.end_col_offset - 1
-        try:
-            defs = self.script(file).goto(line, col, follow_imports=True)
-        except Exception:
+        if res is None or res.kind not in ("function", "method", "class"):
             return
-        if not defs:
-            return
-        d = defs[0]
-        # Reference edges track function *values* (callbacks, decorators), not
-        # data attributes: a read of `proc.stderr` is not a subprocess effect just
-        # because Jedi names its provenance in `subprocess`. Only a callable
-        # resolution taints by reference.
-        if d.type not in ("function", "method", "class"):
-            return
-        full_name, mp = d.full_name, d.module_path
+        caller, relpath, line = site.caller, site.relpath, site.line
+        full_name, mp = res.full_name, res.module_path
         if self.is_owned(mp) and full_name:
             callee_id = self.local_id(mp, full_name)
             if callee_id and callee_id in self.owned_ids and callee_id != caller:
@@ -373,20 +486,17 @@ class Adapter:
                 self.roots[symbol] = effect
                 self.n_ref += 1
 
-    def seed_env(self, relpath: str, caller: str, env_node: ast.Attribute, file: str):
+    def _emit_env(self, site: Site, res: Resolution | None):
         """`os.environ` / `os.environb` read as an ambient value (the common
         `os.environ.get(...)` / `os.environ[...]` idiom). The `.get` itself
         resolves to a pure dict method, so the env effect is on the receiver —
-        seed it here, confirmed against Jedi so a shadowed `os` never misfires."""
-        try:
-            defs = self.script(file).goto(env_node.lineno, env_node.end_col_offset - 1)
-        except Exception:
-            return
-        full = defs[0].full_name if defs else None
+        seed it here, confirmed against the backend so a shadowed `os` never
+        misfires."""
+        full = res.full_name if res else None
         if not full or not full.startswith(("os.environ", "posix.environ")):
             return
         symbol = "os::environ"
-        self._edge(caller, symbol, "reference", relpath, env_node.lineno)
+        self._edge(site.caller, symbol, "reference", site.relpath, site.line)
         self.roots[symbol] = ENV
         self.n_ref += 1
 
@@ -398,32 +508,19 @@ class Adapter:
             "resolution": kind, "evidence_file": evfile, "evidence_line": evline,
         })
 
-    def is_stdlib(self, module_path, full_name: str) -> bool:
-        top = (full_name or "").split(".", 1)[0]
-        if top == "builtins" or top in sys.stdlib_module_names:
-            return True
-        if top in ("posixpath", "ntpath", "genericpath", "pathlib"):
-            return True
-        if module_path is None:
-            # A builtin / C-implemented callee Jedi could name but not locate.
-            return bool(full_name)
-        p = str(module_path).replace("\\", "/")
-        return "/site-packages/" not in p and "/dist-packages/" not in p and (
-            "/python3." in p or "/lib/python" in p
-        )
-
 
 class Collector(ast.NodeVisitor):
     """Walks a module keeping a stack of enclosing functions (the caller). With
-    `resolve=False` (pass 1) it only registers function definitions; with
-    `resolve=True` (pass 2) the definitions already exist and it emits the call
-    and reference edges, attributed to the enclosing function."""
+    `record=False` (pass 1) it only registers function definitions; with
+    `record=True` (pass 2) the definitions already exist and it RECORDS the call,
+    reference, and ambient-env sites, attributed to the enclosing function, for a
+    backend to resolve. The walk itself is backend-independent."""
 
-    def __init__(self, adapter: Adapter, file: str, relpath: str, resolve: bool):
+    def __init__(self, adapter: Adapter, file: str, relpath: str, record: bool):
         self.a = adapter
         self.file = file
         self.relpath = relpath
-        self.resolve = resolve
+        self.record = record
         self.qual_stack: list[str] = []
         self.func_stack: list[str] = []
 
@@ -439,7 +536,7 @@ class Collector(ast.NodeVisitor):
     def _function(self, node):
         qual = ".".join(self.qual_stack + [node.name])
         cid = f"{self.relpath}#{qual}"
-        if not self.resolve:
+        if not self.record:
             self.a.definitions[cid] = {
                 "id": cid, "display": qual, "language": "python",
                 "file": self.relpath, "line_start": node.lineno,
@@ -447,7 +544,7 @@ class Collector(ast.NodeVisitor):
             }
         self.qual_stack.append(node.name)
         self.func_stack.append(cid)
-        if self.resolve:
+        if self.record:
             # A decorator is a reference to (or call of) a function value from the
             # enclosing scope — attribute it to this function.
             for dec in node.decorator_list:
@@ -466,7 +563,7 @@ class Collector(ast.NodeVisitor):
     def _decorator(self, caller: str, dec: ast.AST):
         target = dec.func if isinstance(dec, ast.Call) else dec
         if isinstance(target, (ast.Name, ast.Attribute)):
-            self.a.resolve_reference(self.file, self.relpath, caller, target)
+            self.a.record("reference", self.file, self.relpath, caller, target)
         if isinstance(dec, ast.Call):
             self.visit(dec)
 
@@ -484,14 +581,14 @@ class Collector(ast.NodeVisitor):
 
     def visit_Subscript(self, node):
         # `os.environ["KEY"]` — an ambient env read (the receiver, not a call).
-        if self.resolve:
+        if self.record:
             env = self._os_environ(node.value)
             if env is not None:
-                self.a.seed_env(self.relpath, self._caller(), env, self.file)
+                self.a.record("env", self.file, self.relpath, self._caller(), env)
         self.generic_visit(node)
 
     def visit_Call(self, node):
-        if not self.resolve:
+        if not self.record:
             self.generic_visit(node)
             return
         caller = self._caller()
@@ -501,18 +598,240 @@ class Collector(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             env = self._os_environ(node.func.value)
             if env is not None:
-                self.a.seed_env(self.relpath, caller, env, self.file)
-        self.a.resolve_call(self.file, self.relpath, caller, node.func)
+                self.a.record("env", self.file, self.relpath, caller, env)
+        self.a.record("call", self.file, self.relpath, caller, node.func)
         # A function value passed as an argument (a callback) is a reference.
         for arg in list(node.args) + [kw.value for kw in node.keywords]:
             if isinstance(arg, (ast.Name, ast.Attribute)):
-                self.a.resolve_reference(self.file, self.relpath, caller, arg)
+                self.a.record("reference", self.file, self.relpath, caller, arg)
         # Descend into arguments (nested calls, lambdas) but not into `node.func`
-        # again (already resolved as the call).
+        # again (already recorded as the call).
         for arg in node.args:
             self.visit(arg)
         for kw in node.keywords:
             self.visit(kw.value)
+
+
+# ============================ resolution backends ============================
+# Each backend turns a set of (file, line, col) query points into a dict of
+# Resolution (or None for unresolved). Everything else — the walk, the edges,
+# the effect classification — is shared and lives above.
+
+
+class JediResolver:
+    """The zero-extra-binary fallback: name-resolution-grade goto. Used when the
+    `ty` binary is absent, or forced with `HINZU_PY_BACKEND=jedi`."""
+
+    name = "jedi"
+
+    def __init__(self, adapter: Adapter):
+        self.a = adapter
+        import jedi  # noqa: PLC0415 — imported only when this backend is chosen
+
+        self.jedi = jedi
+        self.project_obj = jedi.Project(
+            str(adapter.project),
+            added_sys_path=[str(r) for r in adapter.source_roots],
+        )
+        self._scripts: dict[str, object] = {}
+
+    def describe(self) -> str:
+        return f"jedi {self.jedi.__version__}"
+
+    def _script(self, path: str, source: str):
+        if path not in self._scripts:
+            self._scripts[path] = self.jedi.Script(
+                source, path=path, project=self.project_obj
+            )
+        return self._scripts[path]
+
+    def resolve_batch(self, sources, queries):
+        results = {}
+        for key in queries:
+            file, line, col = key
+            try:
+                defs = self._script(file, sources[file]).goto(
+                    line, col, follow_imports=True, follow_builtin_imports=True
+                )
+            except Exception:  # noqa: BLE001 — Jedi raises broadly; treat as null
+                defs = []
+            if not defs:
+                results[key] = None
+                continue
+            d = defs[0]
+            mp = str(d.module_path) if d.module_path else None
+            results[key] = Resolution(d.full_name, mp, d.type)
+        return results
+
+
+class TyResolver:
+    """The default backend: Astral's ty type checker over its LSP. Opens every
+    source file, waits for the first check pass to settle, then PIPELINES a
+    `textDocument/definition` at each query point and maps the target
+    (ty's vendored typeshed, or an owned/third-party module) to a Resolution."""
+
+    name = "ty"
+    BATCH = 64
+
+    def __init__(self, adapter: Adapter, ty_bin: str):
+        self.a = adapter
+        self.ty_bin = ty_bin
+        self._version = "unknown"
+        self._detect_version()
+
+    def describe(self) -> str:
+        return f"ty {self._version} (LSP)"
+
+    @staticmethod
+    def _to_utf16(source: str, line1: int, bytecol: int) -> int:
+        """LSP positions are utf-16 code units; ast columns are utf-8 byte
+        offsets. Convert one column on one line."""
+        try:
+            line = source.splitlines()[line1 - 1]
+        except IndexError:
+            return bytecol
+        prefix = line.encode("utf-8")[:bytecol].decode("utf-8", "replace")
+        return len(prefix.encode("utf-16-le")) // 2
+
+    def _detect_version(self):
+        import subprocess  # noqa: PLC0415 — only when the ty backend runs
+
+        try:
+            out = subprocess.run(
+                [self.ty_bin, "--version"], capture_output=True, text=True, timeout=10
+            )
+            self._version = (out.stdout or out.stderr).strip().split()[-1]
+        except (OSError, subprocess.SubprocessError, IndexError):
+            pass
+
+    def resolve_batch(self, sources, queries):
+        from lspclient import LSP, uri  # noqa: PLC0415 — only when ty is chosen
+
+        root = str(self.a.project)
+        client = LSP([self.ty_bin, "server"], cwd=root)
+        try:
+            client.request("initialize", {
+                "processId": os.getpid(),
+                "rootUri": uri(root),
+                "capabilities": {"textDocument": {
+                    "definition": {"linkSupport": True},
+                    "hover": {"contentFormat": ["plaintext", "markdown"]},
+                }},
+                "workspaceFolders": [{"uri": uri(root), "name": "hinzu"}],
+            }, timeout=30)
+            client.notify("initialized", {})
+            # Open every owned source file so cross-file definitions resolve.
+            for path, src in sources.items():
+                client.notify("textDocument/didOpen", {"textDocument": {
+                    "uri": uri(path), "languageId": "python", "version": 1,
+                    "text": src}})
+            # Settle: wait for the first check pass (diagnostics) before asking.
+            client.wait_for_diagnostics(timeout=8.0)
+
+            qlist = list(queries)
+            raw = self._pipeline(client, uri, sources, qlist)
+            # Retry-on-null once: a null early in the first pass may just mean the
+            # workspace had not finished checking that file. Genuine unresolvables
+            # stay null, so this is a bounded second pass, not per-site polling.
+            nulls = [q for q in qlist if raw.get(q) is None]
+            if nulls:
+                retry = self._pipeline(client, uri, sources, nulls)
+                for q, v in retry.items():
+                    if v is not None:
+                        raw[q] = v
+            return {q: self._resolution(raw.get(q)) for q in qlist}
+        finally:
+            client.shutdown()
+
+    def _pipeline(self, client, uri, sources, qlist):
+        """Fire definition requests in windows of BATCH, then collect — the
+        request pipelining that keeps the whole project under ~2s."""
+        raw = {}
+        i = 0
+        while i < len(qlist):
+            window = qlist[i:i + self.BATCH]
+            pending = []
+            for key in window:
+                file, line, col = key
+                char = self._to_utf16(sources[file], line, col)
+                rid = client.request_async("textDocument/definition", {
+                    "textDocument": {"uri": uri(file)},
+                    "position": {"line": line - 1, "character": char}})
+                pending.append((key, rid))
+            for key, rid in pending:
+                try:
+                    raw[key] = client.wait(rid, timeout=30).get("result")
+                except (RuntimeError, TimeoutError):
+                    raw[key] = None
+            i += self.BATCH
+        return raw
+
+    def _resolution(self, result) -> Resolution | None:
+        # `result` is a list of LocationLink / Location, or null/empty.
+        if not result:
+            return None
+        first = result[0]
+        turi = first.get("targetUri") or first.get("uri")
+        trange = first.get("targetSelectionRange") or first.get("range")
+        if not turi or not trange:
+            return None
+        tpath = _uri_to_path(turi)
+        line0 = trange["start"]["line"]
+        kind, mod = self.a.module_of_target(tpath)
+        qual, ntype = self.a.qualname_at(tpath, line0)
+        if kind == "OWNED":
+            if qual is None:
+                # Owned target we cannot pin to a tracked def (a variable holding
+                # a callable): unresolved, fail closed, never a fake symbol.
+                return None
+            return Resolution(f"{self.a.module_dotted(tpath)}.{qual}", tpath, ntype)
+        if kind in ("STDLIB", "THIRD_PARTY"):
+            full_name = f"{mod}.{qual}" if qual else mod
+            return Resolution(full_name, tpath, ntype)
+        return None  # OTHER / unmappable target: fail closed
+
+
+def choose_backend(adapter: Adapter):
+    """Pick the resolution backend. `HINZU_PY_BACKEND` forces `ty` or `jedi`;
+    otherwise ty when its binary is present (`HINZU_TY` overrides the path),
+    else Jedi. An honest capability edge: if the requested/only backend is
+    unavailable, fail with a message saying what is missing — never fake it."""
+    ty_bin = os.environ.get("HINZU_TY") or shutil.which("ty")
+    forced = os.environ.get("HINZU_PY_BACKEND", "").strip().lower()
+
+    if forced == "ty":
+        if not ty_bin:
+            sys.stderr.write(
+                "hinzu-py: HINZU_PY_BACKEND=ty but the `ty` binary was not found "
+                "— install it (`uv tool install ty` or `pip install ty`) or set "
+                "HINZU_TY to its path\n"
+            )
+            sys.exit(3)
+        return TyResolver(adapter, ty_bin)
+    if forced == "jedi":
+        return _jedi_or_exit(adapter)
+    if forced:
+        sys.stderr.write(
+            f"hinzu-py: unknown HINZU_PY_BACKEND={forced!r} (use `ty` or `jedi`)\n"
+        )
+        sys.exit(2)
+
+    # Default: ty if present, else Jedi.
+    if ty_bin:
+        return TyResolver(adapter, ty_bin)
+    return _jedi_or_exit(adapter)
+
+
+def _jedi_or_exit(adapter: Adapter):
+    try:
+        return JediResolver(adapter)
+    except ImportError:
+        sys.stderr.write(
+            "hinzu-py: no resolution backend — install ty (`uv tool install ty` "
+            "or `pip install ty`, the default backend) or the `jedi` fallback "
+            "(`pip install jedi`, see adapters/python/requirements.txt)\n"
+        )
+        sys.exit(3)
 
 
 def main(argv: list[str]) -> int:
@@ -526,11 +845,13 @@ def main(argv: list[str]) -> int:
 
     adapter = Adapter(project)
     adapter.collect()
+    backend = choose_backend(adapter)
     sys.stderr.write(
-        f"hinzu-py: jedi {jedi.__version__} | files {len(adapter.owned_files())} | "
-        f"definitions {len(adapter.definitions)}\n"
+        f"hinzu-py: backend {backend.describe()} | files "
+        f"{len(adapter.owned_files())} | definitions {len(adapter.definitions)}\n"
     )
-    adapter.resolve()
+    adapter.enumerate_sites()
+    adapter.resolve_and_emit(backend)
 
     resolved_pct = 100 * adapter.n_resolved / max(1, adapter.n_call)
     sys.stderr.write(

@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Python adapter — ty resolution backend. The adapter now resolves call sites
+  with **ty** (Astral's Rust type checker), driven over its **LSP** (`ty server`,
+  stdio JSON-RPC): it opens every source file, waits for the first check pass to
+  settle, then pipelines a `textDocument/definition` at each callee token and maps
+  the definition target (ty's vendored typeshed, or an owned/third-party module)
+  plus the enclosing qualname to a symbol and effect. ty is the default when the
+  `ty` binary is present; **Jedi stays as the zero-dependency fallback** and runs
+  automatically when ty is absent. `HINZU_PY_BACKEND` forces `ty` or `jedi`;
+  `HINZU_TY` overrides the ty binary path. The AST walk, caller attribution,
+  reference edges, and the whole owned/effect/stdlib/third-party classification
+  are shared across both backends. On `housekeeping`, ty lifts call resolution
+  from 83.0% (Jedi) to 89.5%, roughly quadruples `fs`-effect coverage (28 → 117
+  edges) by resolving the un-typed `pathlib` chains Jedi missed, and shrinks the
+  `Unknown` finding pile from 136 to 86 — un-typed `.is_dir()` / `.mkdir()` gaps
+  become precise `forbids fs` findings instead of "cannot certify." Unresolved
+  sites still fail closed as `Unknown` under `on_unknown = fail`, so the change
+  raises precision without weakening soundness. The intent is a native in-process
+  ty backend behind the same `FactSet` seam once ty ships a stable Rust library
+  API; pyrefly was evaluated and near-tied but ty was chosen (Astral trajectory +
+  native-later intent), and zuban is excluded (AGPL). ty is installed only in the
+  isolated `py-check` CI job; the stable jobs stay ty-free (their Python coverage
+  is the committed sample-facts test, which runs from JSON with no backend). See
+  [`notes/python-catalog.md`](./notes/python-catalog.md).
 - Python adapter (slice 3) — `hinzu check <python-project>` now works, through
   the same pipeline as Rust and TypeScript: adapter, SQLite fact store, DBSP
   propagation, `hinzu.toml` policy, violations. The adapter

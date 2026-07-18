@@ -1,8 +1,11 @@
-//! The Python extraction harness: locate the Jedi adapter and its interpreter,
-//! then drive it over a target Python project through the shared script-adapter
-//! runner ([`crate::adapter_harness`]). When Python or Jedi is unavailable the
-//! run fails with an honest message rather than faking an analysis — the same
-//! honest-capability-edge discipline as the Rust and TypeScript harnesses.
+//! The Python extraction harness: locate the adapter and its interpreter, then
+//! drive it over a target Python project through the shared script-adapter
+//! runner ([`crate::adapter_harness`]). The adapter resolves call sites with ty
+//! (Astral's type checker, over its LSP) when the `ty` binary is present, and
+//! falls back to Jedi otherwise; `HINZU_PY_BACKEND` forces `ty` or `jedi`. When
+//! Python and every backend are unavailable the run fails with an honest message
+//! rather than faking an analysis — the same honest-capability-edge discipline
+//! as the Rust and TypeScript harnesses.
 
 use std::path::Path;
 
@@ -19,17 +22,18 @@ pub fn is_python_project(path: &Path) -> bool {
         || path.join("setup.cfg").is_file()
 }
 
-/// Extract effect facts from a Python project by running the Jedi adapter over
-/// it. Returns the parsed `FactSet`, or an honest error when Python or the
-/// adapter (or its `jedi` dependency) is missing. `HINZU_PYTHON` overrides the
-/// interpreter (default `python3`); `HINZU_PY_ADAPTER` overrides the script.
+/// Extract effect facts from a Python project by running the adapter over it (ty
+/// backend when the `ty` binary is present, else the Jedi fallback). Returns the
+/// parsed `FactSet`, or an honest error when Python or every backend is missing.
+/// `HINZU_PYTHON` overrides the interpreter (default `python3`);
+/// `HINZU_PY_ADAPTER` overrides the script; `HINZU_PY_BACKEND` forces `ty`/`jedi`.
 pub fn extract_facts(project: &Path) -> Result<FactSet> {
     let script = locate_script(
         "HINZU_PY_ADAPTER",
         "python",
         "analyze.py",
-        "set HINZU_PY_ADAPTER to analyze.py, and run `pip install jedi` so its dependency is \
-         present",
+        "set HINZU_PY_ADAPTER to analyze.py, and install a resolution backend — ty \
+         (`uv tool install ty`, the default) or the `jedi` fallback (`pip install jedi`)",
     )?;
     ScriptAdapter {
         language: "Python",

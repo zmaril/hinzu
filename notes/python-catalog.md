@@ -10,8 +10,8 @@ it.
 
 Python seeds this subset: `fs`, `net`, `process`, `env`, `clock`, `random`. The
 sections below list what each one is seeded from, keyed on the callee's
-declaration provenance — the module and name Jedi resolves a call to, which is
-what the adapter reads.
+declaration provenance — the module and name the resolution backend resolves a
+call to, which is what the adapter reads.
 
 ## What Python seeds
 
@@ -65,60 +65,92 @@ caller, governs it. So `alloc` is absent for Python, exactly as it is for
 TypeScript. It is absent, not renamed: there is no `py/alloc` and no substitute
 category. Python seeds the subset above and nothing more.
 
-## Fidelity: the weakest of the three adapters, and sound anyway
+## The resolution backend: ty over LSP, with Jedi as the fallback
 
-The adapter is name-resolution-grade: Jedi resolves a call site to a declaration
-by name and import following, not by a full type system. On a real codebase it
-resolves about 78% of call sites — the weakest of hinzu's three adapters, well
-below the TypeScript checker's 97% and the StableMIR driver's 99.95%. The gap is
-Python's dynamism: duck-typed receivers, decorators, `getattr`, dynamic import,
-and — the most common single gap — un-typed `pathlib` chains, where `p.parent`
-loses Jedi's type so `p.parent.mkdir()` cannot be resolved to the `pathlib`
-method.
+The adapter resolves each call site with one of two interchangeable backends
+behind the `FactSet` seam. The AST walk, the caller attribution, and the whole
+owned/effect/stdlib/third-party classification are identical whichever backend
+ran; the only swappable part is how a call-site position becomes a declaration.
 
-This is where Unknown-by-default earns its keep. Every unresolved call site is
-emitted as an unknown-target edge, so hinzu-core turns it into an `Unknown` that
-propagates up the call graph and fails closed under `on_unknown = fail`. A
-weak-resolution language would be unsound if unresolved calls read as pure; here
-they read as "cannot certify," with an evidence path down to the exact site that
-could not be resolved. The un-typed `pathlib.Path.mkdir` gap therefore shows up
-as an honest Unknown, never as a false-pure. Soundness does not depend on
-resolution strength — only precision does.
+- **ty** (Astral's Rust type checker) is the default, driven over its LSP. The
+  adapter spawns `ty server`, opens every source file, waits for the first check
+  pass to settle, then pipelines a `textDocument/definition` request at each
+  callee token. The definition's target — a file in ty's vendored typeshed, or an
+  owned or third-party module — plus the enclosing qualname at the target give the
+  provenance the effect roots key on. Because ty is a real type system it resolves
+  the un-typed `pathlib` receivers and much of the duck-typed surface Jedi cannot.
+- **Jedi** is the zero-extra-dependency fallback: name-resolution-grade
+  `script.goto(follow_imports=True)`, used automatically when the `ty` binary is
+  absent so the adapter always runs. `HINZU_PY_BACKEND` forces `ty` or `jedi`;
+  `HINZU_TY` overrides the ty binary path.
 
-## The planned native backends: pyrefly and ty
+### What ty buys, measured on housekeeping
 
-The fact source is deliberately swappable behind the `FactSet` seam. Jedi is
-today's backend because it is the mature, maintained name-resolution engine with
-a stable Python library API. Two native-Rust type checkers are the candidates to
-supersede it, because a real type system would resolve the `pathlib` receivers
-and much of the duck-typed surface Jedi cannot, turning many of today's Unknowns
-into precise effect edges:
+Running the full pipeline over `housekeeping` (a pure-Python fleet auditor, 82
+files, 486 definitions, 2,449 call sites) with an illustrative functional-core
+policy, ty against the Jedi baseline:
 
-- [**pyrefly**](https://github.com/facebook/pyrefly) (Meta; Rust; MIT-licensed;
-  production-stable — it is Instagram's default checker at roughly 20 million
-  lines, and its aggressive inference is what would close the un-typed `pathlib`
-  gap). It ranks ahead of ty on maturity.
-- [**ty**](https://github.com/astral-sh/ty) (Astral; Rust; Apache-2.0; preview).
+| | Jedi (fallback) | ty (default) |
+| --- | --- | --- |
+| call sites resolved | 83.0% (2,032) | **89.5% (2,192)** |
+| unresolved (Unknown) call sites | 417 | **257** |
+| `fs`-effect call edges | 28 | **117** (≈4×) |
+| effect roots | 19 | 22 |
+| forbidden-effect violations | 15 (1 fs, 14 process) | **20 (6 fs, 14 process)** |
+| `cannot certify` (Unknown) findings | 136 | **86** |
 
-The honest blocker is shared: neither exposes a stable Rust *library* API yet.
-pyrefly's crates.io entry is a `0.0.1` placeholder over internal-only crates, and
-both ship as an LSP server / subprocess today, not an embeddable library. So
-whichever ships a stable library API first becomes the in-process native backend
-behind this same `FactSet` seam; until then, either is an LSP-driven upgrade over
-Jedi (a subprocess that resolves better), not a native embed. **zuban is excluded
-outright: it is AGPL-licensed, so it cannot be embedded in MIT-licensed hinzu.**
+The `fs` coverage roughly quadruples and the Unknown pile shrinks by a third. The
+gain is almost entirely the un-typed `pathlib` gap ty closes: chains like
+`(ctx.workdir / "src-tauri").is_dir()` and `p.parent.mkdir()`, which Jedi emitted
+as unresolved Unknowns, ty resolves to real `pathlib::Path.is_dir` /
+`pathlib::Path.mkdir` `fs` roots — so they become precise `forbids fs` findings in
+the core rather than "cannot certify." The total finding count *drops* (151 → 106)
+precisely because honest gaps turn into precise edges (some pure, some real
+violations). The whole run stays well under two seconds with request pipelining.
 
-Either way, the swap changes only how a call site resolves, not the schema the
-adapter emits or the shared pipeline downstream — the same design that lets Rust
-and TypeScript feed one engine. Until a native library API exists, hinzu keeps
-building on Jedi.
+### Sound whichever backend runs
+
+No backend resolves everything — Python's dynamism (duck-typed receivers,
+`getattr`, decorators, dynamic import) leaves a residue, 10.5% even for ty. This
+is where Unknown-by-default earns its keep: every unresolved call site is emitted
+as an unknown-target edge, so hinzu-core turns it into an `Unknown` that
+propagates up the call graph and fails closed under `on_unknown = fail`, with an
+evidence path down to the exact site. A weak-resolution language would be unsound
+if unresolved calls read as pure; here they read as "cannot certify." Soundness
+does not depend on resolution strength — only precision does, and that is exactly
+what ty improves.
+
+### Why ty, and toward a native backend
+
+The fact source is deliberately swappable behind the `FactSet` seam. Today ty runs
+as an LSP server / subprocess, not an embeddable library — its crates are not a
+published stable Rust library API yet. **The intent is to move to a native,
+in-process ty backend behind this same seam once ty ships a stable Rust library
+API**, dropping the subprocess and the LSP round-trip while emitting the identical
+`FactSet`. That is the "ty only via LSP, with intent to go native later" call.
+
+[**pyrefly**](https://github.com/facebook/pyrefly) (Meta; Rust; MIT-licensed;
+production-stable — Instagram's default checker at roughly 20 million lines) was
+evaluated as the alternative and came out near-tied: comparable resolution and the
+same LSP-today / library-later constraint (its crates.io entry is a `0.0.1`
+placeholder over internal-only crates). ty was chosen for Astral's trajectory and
+the native-later intent — the same team and toolchain hinzu already leans on. Both
+would resolve the `pathlib` receivers a real type system sees;
+[**ty**](https://github.com/astral-sh/ty) (Astral; Rust; Apache-2.0) is the one
+hinzu builds on. **zuban is excluded outright: it is AGPL-licensed, so it cannot be
+embedded in MIT-licensed hinzu.**
+
+The swap changes only how a call site resolves, not the schema the adapter emits
+or the shared pipeline downstream — the same design that lets Rust and TypeScript
+feed one engine.
 
 ## How the adapter maps provenance to a category
 
-The adapter (`adapters/python/analyze.py`) resolves each call with Jedi and reads
-the callee's `full_name` and module path. A call into an owned source file
-becomes a normal call edge; its effects propagate through its own body. A call
-into one of the built-ins above becomes an effect root, seeded by that
+The adapter (`adapters/python/analyze.py`) resolves each call with the chosen
+backend and reads the callee's `full_name` and module path (for ty, reconstructed
+from the definition target file and its enclosing qualname). A call into an owned
+source file becomes a normal call edge; its effects propagate through its own body.
+A call into one of the built-ins above becomes an effect root, seeded by that
 declaration provenance and emitted with a canonical `::`-segmented symbol
 (`subprocess::run`, `builtins::open`, `pathlib::Path.mkdir`) — the same shape
 Rust and TypeScript use, so a project's `[roots]` / `[trust]` overrides work

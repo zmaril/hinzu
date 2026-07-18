@@ -1,4 +1,12 @@
-# The hinzu Python adapter's only runtime dependency: Jedi, the name-resolution
-# engine it uses to resolve each call site's callee. `ast` is in the standard
-# library. Install with: pip install -r requirements.txt
+# The hinzu Python adapter's resolution backends.
+#
+# The DEFAULT backend is ty (Astral's Rust type checker), driven over its LSP. It
+# is a separate binary, not a Python package dependency — install it however you
+# like: `uv tool install ty`, or `pip install ty`. When the `ty` binary is on
+# PATH the adapter uses it automatically (`HINZU_TY` overrides the path).
+#
+# Jedi is the zero-configuration FALLBACK, used when `ty` is absent so the adapter
+# always runs. `ast` is in the standard library. Install the fallback with:
+#   pip install -r requirements.txt
+# Force a backend with HINZU_PY_BACKEND=ty or HINZU_PY_BACKEND=jedi.
 jedi==0.20.0

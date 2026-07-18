@@ -74,3 +74,10 @@ Astral
 pyrefly
 zuban
 Instagram
+ty
+typeshed
+LSP
+JSON-RPC
+stdio
+monotonic
+utf
