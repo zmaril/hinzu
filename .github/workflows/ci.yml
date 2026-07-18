@@ -111,7 +111,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -119,12 +119,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: build the hinzu CLI (stable 1.96.0)
-        run: cargo build --release -p hinzu-cli
       - name: install the TypeScript adapter's dependencies
         working-directory: adapters/typescript
         run: npm install --no-audit --no-fund
-      # The live adapter path: extract facts from the fixture with the Node
-      # compiler API, propagate, and check. A missing violation fails the test.
+      # The live adapter path: the ignored ts_check test builds the CLI (debug)
+      # itself via assert_cmd and drives it over the fixture — the Node compiler
+      # API extracts facts, they propagate, and the functional-core leak must be
+      # flagged. One build (no separate release step) keeps the cold `dbsp`
+      # compile within budget.
       - name: hinzu check the TypeScript fixture (functional-core leak)
         run: cargo test -p hinzu-cli --test ts_check -- --ignored --exact check_typescript_project_end_to_end
