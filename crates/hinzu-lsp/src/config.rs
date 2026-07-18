@@ -197,12 +197,16 @@ struct ProvenanceDoc {
 }
 
 impl LanguageConfig {
-    /// Build a config from its TOML file and a shipped annotation table (the
-    /// `[roots]` map that becomes the effect map). `subst` fills `{placeholder}`
-    /// tokens in `init_options` (the pinned python-version / platform).
+    /// Build a config from its TOML file and one or more shipped annotation
+    /// tables (the `[roots]` maps that become the effect map). Passing several
+    /// tables merges their `[roots]` in order — Python loads the stdlib set
+    /// (`python.toml`) plus the third-party library pack (`python-libs.toml`), a
+    /// later table overriding an earlier row for the same key. `subst` fills
+    /// `{placeholder}` tokens in `init_options` (the pinned python-version /
+    /// platform).
     pub fn from_parts(
         config_toml: &str,
-        annotations_toml: &str,
+        annotations_tomls: &[&str],
         subst: &BTreeMap<String, String>,
     ) -> Result<Self> {
         let doc: ConfigDoc =
@@ -235,7 +239,7 @@ impl LanguageConfig {
         };
         let init_options = substitute(init_json, subst);
 
-        let (effect_specific, effect_package) = parse_effect_map(annotations_toml)?;
+        let (effect_specific, effect_package) = parse_effect_map(annotations_tomls)?;
 
         Ok(LanguageConfig {
             language_id: doc.language_id,
@@ -254,28 +258,36 @@ impl LanguageConfig {
     }
 }
 
-/// Parse an annotation table's `[roots]` into the effect map: a key that carries
-/// a `::` is a specific `<package>::<qualname>` row, a bare key is a whole
-/// `<package>` row. This is exactly the shipped `python.toml` — one source of
-/// truth shared with hinzu-core's own root seeding.
+/// Parse one or more annotation tables' `[roots]` into the effect map: a key
+/// that carries a `::` is a specific `<package>::<qualname>` row, a bare key is a
+/// whole `<package>` row. The tables are merged in order (a later one overrides
+/// an earlier row for the same key), so Python's stdlib set (`python.toml`) and
+/// its third-party library pack (`python-libs.toml`) become one map — the very
+/// same tables hinzu-core's root seeding merges, so there is no drift. A table's
+/// `[trust]` section (a pure vouch) is intentionally ignored here: the extractor
+/// only seeds effect roots, and a pure package is an edge with no root that
+/// hinzu-core clears.
 fn parse_effect_map(
-    annotations_toml: &str,
+    annotations_tomls: &[&str],
 ) -> Result<(BTreeMap<String, Effect>, BTreeMap<String, Effect>)> {
     #[derive(Deserialize)]
     struct Roots {
         #[serde(default)]
         roots: BTreeMap<String, String>,
     }
-    let doc: Roots = toml::from_str(annotations_toml).context("parsing the effect-map [roots]")?;
     let mut specific = BTreeMap::new();
     let mut package = BTreeMap::new();
-    for (key, name) in doc.roots {
-        let effect = Effect::from_str(&name)
-            .with_context(|| format!("effect-map rule `{key}` names an unknown effect"))?;
-        if key.contains("::") {
-            specific.insert(key, effect);
-        } else {
-            package.insert(key, effect);
+    for annotations_toml in annotations_tomls {
+        let doc: Roots =
+            toml::from_str(annotations_toml).context("parsing the effect-map [roots]")?;
+        for (key, name) in doc.roots {
+            let effect = Effect::from_str(&name)
+                .with_context(|| format!("effect-map rule `{key}` names an unknown effect"))?;
+            if key.contains("::") {
+                specific.insert(key, effect);
+            } else {
+                package.insert(key, effect);
+            }
         }
     }
     Ok((specific, package))
@@ -327,8 +339,12 @@ mod tests {
         let mut subst = BTreeMap::new();
         subst.insert("python_version".to_string(), "3.11".to_string());
         subst.insert("python_platform".to_string(), "linux".to_string());
-        LanguageConfig::from_parts(crate::PYTHON_CONFIG, crate::PYTHON_ANNOTATIONS, &subst)
-            .expect("shipped python config parses")
+        LanguageConfig::from_parts(
+            crate::PYTHON_CONFIG,
+            &[crate::PYTHON_ANNOTATIONS, crate::PYTHON_LIB_ANNOTATIONS],
+            &subst,
+        )
+        .expect("shipped python config parses")
     }
 
     #[test]
@@ -384,6 +400,29 @@ mod tests {
         // But inheritance never fabricates an effect for an unrelated submodule.
         assert_eq!(
             cfg.effect_of("importlib.util::find_spec", "importlib.util"),
+            None
+        );
+    }
+
+    #[test]
+    fn library_pack_merges_into_the_effect_map() {
+        // The third-party library pack (`python-libs.toml`) is merged onto the
+        // stdlib set, so the extractor's effect map seeds SQLAlchemy's execution
+        // surface directly by declaration provenance.
+        let cfg = python_test_config();
+        assert_eq!(
+            cfg.effect_of("sqlalchemy::Session.execute", "sqlalchemy"),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            cfg.effect_of("sqlalchemy::create_engine", "sqlalchemy"),
+            Some(Effect::Db)
+        );
+        // rich / PyYAML are pure — they carry no `[roots]` effect, so the
+        // extractor seeds no root; hinzu-core's pure vouch clears them instead.
+        assert_eq!(cfg.effect_of("yaml::safe_load", "yaml"), None);
+        assert_eq!(
+            cfg.effect_of("rich.console::Console.print", "rich.console"),
             None
         );
     }

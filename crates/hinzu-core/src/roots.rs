@@ -98,6 +98,14 @@ const NODE_ANNOTATIONS: &str = include_str!("../annotations/node.toml");
 /// `alloc` rules — there is no `alloc` effect for a garbage-collected runtime.
 const PYTHON_ANNOTATIONS: &str = include_str!("../annotations/python.toml");
 
+/// hinzu's shipped Python *library* pack: well-known third-party packages the
+/// fleet sweep surfaced as Unknown (rich → pure, PyYAML → pure, SQLAlchemy's
+/// execution surface → db), so a project need not re-vouch them in its own
+/// `hinzu.toml`. Loaded as a built-in Python default merged on top of
+/// `python.toml`; a project `[trust]` / `[roots]` rule still overrides it. Kept
+/// a separate file from the stdlib set so the two concerns stay auditable apart.
+const PYTHON_LIB_ANNOTATIONS: &str = include_str!("../annotations/python-libs.toml");
+
 /// hinzu's shipped Go effect-annotation defaults: the Go standard library's I/O
 /// surface, mapped to the same shared vocabulary. The counterpart to
 /// `std.toml` / `node.toml` / `python.toml` for the Go adapter's canonical
@@ -139,7 +147,16 @@ impl RootSeeds {
         match language {
             Language::Rust => Self::with_base(STD_ANNOTATIONS),
             Language::TypeScript => Self::with_base(NODE_ANNOTATIONS),
-            Language::Python => Self::with_base(PYTHON_ANNOTATIONS),
+            Language::Python => {
+                // The stdlib base plus the shipped third-party library pack,
+                // merged. Both are built-in Python defaults; a project's own
+                // `[trust]` / `[roots]` still overrides either (merged later).
+                let mut seeds = Self::with_base(PYTHON_ANNOTATIONS);
+                seeds
+                    .merge_toml(PYTHON_LIB_ANNOTATIONS)
+                    .expect("built-in python library pack is valid");
+                seeds
+            }
             Language::Go => Self::with_base(GO_ANNOTATIONS),
         }
     }
@@ -925,6 +942,54 @@ mod tests {
     }
 
     #[test]
+    fn python_library_pack_vouches_rich_and_yaml_pure() {
+        // The shipped third-party library pack (`python-libs.toml`) is merged
+        // onto the stdlib base for Python: rich and PyYAML are pure, so their
+        // calls resolve to `Pure` instead of failing closed on `Unknown`.
+        let seeds = RootSeeds::for_language(Language::Python);
+        assert_eq!(
+            seeds.classify_foreign("rich.console::Console.print"),
+            Resolution::Pure
+        );
+        assert_eq!(
+            seeds.classify_foreign("rich.table::Table.add_row"),
+            Resolution::Pure
+        );
+        assert_eq!(
+            seeds.classify_foreign("rich.markup::escape"),
+            Resolution::Pure
+        );
+        assert_eq!(seeds.classify_foreign("yaml::safe_load"), Resolution::Pure);
+        // rich/yaml carry no `[roots]` effect — they are pure, not effectful.
+        assert_eq!(seeds.effect_of("rich.console::Console.print"), None);
+        assert_eq!(seeds.effect_of("yaml::safe_load"), None);
+    }
+
+    #[test]
+    fn python_library_pack_marks_sqlalchemy_execution_surface_db() {
+        // SQLAlchemy's execution surface is a database effect; its declarative /
+        // expression construction surface is deliberately not vouched (left
+        // fail-closed) so a package-wide pure vouch can never clear these rows.
+        let seeds = RootSeeds::for_language(Language::Python);
+        assert_eq!(
+            seeds.effect_of("sqlalchemy::Session.execute"),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            seeds.effect_of("sqlalchemy::create_engine"),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            seeds.effect_of("sqlalchemy::Connection.execute"),
+            Some(Effect::Db)
+        );
+        // The construction surface is not an effect row here (fail-closed
+        // Unknown, never a fake pure that would hide a db reach).
+        assert_eq!(seeds.effect_of("sqlalchemy::declarative_base"), None);
+        assert_eq!(seeds.effect_of("sqlalchemy::Column"), None);
+    }
+
+    #[test]
     fn python_thirdparty_call_is_unknown_but_stdlib_root_is_not() {
         // A Python fact set as the adapter emits it: a local function calls a
         // stdlib effect (seeded as a process root by the adapter) and an unvouched
@@ -944,9 +1009,12 @@ mod tests {
             "src/ctx.py",
             2,
         ));
+        // An unvouched third-party package the shipped packs do not name — still
+        // fail-closed. (rich / yaml would now resolve to pure via the library
+        // pack, so this uses a package no pack vouches.)
         facts.add_edge(Edge::call(
             "src/ctx.py#run",
-            "yaml::safe_load",
+            "boto3.session::Session.client",
             "src/ctx.py",
             3,
         ));
@@ -966,7 +1034,7 @@ mod tests {
             .collect();
         // The third-party call is Unknown; the stdlib process root is accounted
         // for, not double-reported as an uncertainty.
-        assert_eq!(unknowns, BTreeSet::from(["yaml::safe_load"]));
+        assert_eq!(unknowns, BTreeSet::from(["boto3.session::Session.client"]));
         assert!(facts
             .roots
             .iter()

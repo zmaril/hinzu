@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Shipped Python library annotation pack — the highest-leverage third-party
+  packages a fleet sweep surfaced as Unknown, vouched as built-in Python
+  defaults.** A new file `crates/hinzu-core/annotations/python-libs.toml` sits
+  beside the stdlib set `python.toml` and is merged into the built-in Python
+  defaults by both hinzu-core's root seeding and the LSP extractor's effect map —
+  one source of truth, no drift — while a project's own `hinzu.toml` `[trust]` /
+  `[roots]` still overrides it. It vouches **rich** (terminal presentation) and
+  **PyYAML** (`yaml`) pure — an honest caveat records that rich's console output
+  is outside hinzu's tracked effect vocabulary (fs/net/db/process/env/clock/
+  random), not a claim it is side-effect-free in general — and maps
+  **SQLAlchemy**'s engine/session/connection execution surface to `db`, leaving
+  the pure declarative/expression construction surface fail-closed rather than
+  clearing it with a package-wide vouch. On `housekeeping` the pack clears every
+  Unknown "cannot-certify" finding (57 → 0: rich 37, yaml 20) while the set of
+  real forbidden-effect violations is unchanged (126 fs/net/process reaches, an
+  identical set with identical evidence paths) — no real leak vanished. The
+  SQLAlchemy rows are authored correctly now but will not reduce Unknowns until
+  the reference-level rung lands, because the call-only extractor emits no edges
+  for SQLAlchemy's largely module-level (class-scope) usage.
+
 - **Go is a first-class language, over gopls — the proof that a new language is a
   new config, not new extractor code.** `hinzu check` routes a `go.mod` module to
   the same generic Rust LSP extractor Python uses, driving gopls (the Go team's

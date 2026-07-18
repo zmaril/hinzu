@@ -39,6 +39,14 @@ pub const GO_CONFIG: &str = include_str!("../configs/go.toml");
 /// seeds from — one source of truth, no drift.
 pub const PYTHON_ANNOTATIONS: &str = include_str!("../../hinzu-core/annotations/python.toml");
 
+/// The Python third-party library pack — well-known packages the fleet sweep
+/// surfaced as Unknown (SQLAlchemy's execution surface → db; rich / PyYAML are
+/// pure and carry no `[roots]` effect, so only hinzu-core's pure vouch reads
+/// them). Merged onto `PYTHON_ANNOTATIONS` as a built-in Python default, the very
+/// same pair hinzu-core's root seeding merges — one source of truth, no drift.
+pub const PYTHON_LIB_ANNOTATIONS: &str =
+    include_str!("../../hinzu-core/annotations/python-libs.toml");
+
 /// The Go effect map, the very same shipped annotation table hinzu-core seeds
 /// from (`os/exec` → process, `os::ReadFile` → fs, `net/http` → net) — one
 /// source of truth, no drift.
@@ -56,7 +64,11 @@ pub fn python_config() -> Result<LanguageConfig> {
         "python_platform".to_string(),
         host_python_platform().to_string(),
     );
-    LanguageConfig::from_parts(PYTHON_CONFIG, PYTHON_ANNOTATIONS, &subst)
+    LanguageConfig::from_parts(
+        PYTHON_CONFIG,
+        &[PYTHON_ANNOTATIONS, PYTHON_LIB_ANNOTATIONS],
+        &subst,
+    )
 }
 
 /// Build the Go [`LanguageConfig`]. Go needs no host-specific substitution
@@ -64,7 +76,7 @@ pub fn python_config() -> Result<LanguageConfig> {
 /// empty; the effect map is the shipped `go.toml` annotation table.
 pub fn go_config() -> Result<LanguageConfig> {
     let subst = BTreeMap::new();
-    LanguageConfig::from_parts(GO_CONFIG, GO_ANNOTATIONS, &subst)
+    LanguageConfig::from_parts(GO_CONFIG, &[GO_ANNOTATIONS], &subst)
 }
 
 /// ty's `python-platform` spelling for the host OS.

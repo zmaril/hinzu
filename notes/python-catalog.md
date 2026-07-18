@@ -236,3 +236,44 @@ hinzu-core carries the same table as a shipped annotation set,
 `std.toml` and `node.toml` — so its `Unknown` classification agrees with what the
 adapter seeds, and a project's `[roots]` / `[trust]` overrides apply identically
 across all three languages.
+
+## The shipped library pack: common third-party packages
+
+`python.toml` maps only the standard library. A second shipped file,
+`crates/hinzu-core/annotations/python-libs.toml`, carries the well-known
+third-party packages a fleet sweep found most often as Unknown, so a project need
+not repeat those `[trust]` lines in every `hinzu.toml`. Both files are loaded
+as built-in Python defaults and merged — by hinzu-core's root seeding and by the
+extractor's effect map alike, one source of truth — and a project's own `[trust]`
+/ `[roots]` still overrides either. The pack lives by one rule: never vouch pure
+anything that reaches an effect in the tracked vocabulary
+(fs/net/db/process/env/clock/random); when a package's surface is mixed or
+uncertain, it is left Unknown (fail-closed) rather than guessed.
+
+The first pack ships three packages:
+
+- **rich** — terminal presentation (`Console.print`, `Console.input`, `Table`,
+  `Panel`, `markup.escape`, …). None of it reaches the tracked vocabulary, so it
+  is vouched pure. Caveat: rich writes to the terminal, which is console I/O;
+  hinzu has no `console` effect category today, so "pure" here is only with
+  respect to the vocabulary we track, not a claim rich is side-effect-free in
+  general.
+- **PyYAML** (imported as `yaml`) — `safe_load` / `load` / `dump` operate on a
+  string or stream the caller supplies; the library performs no fs or net of its
+  own. Pure.
+- **SQLAlchemy** — the engine / session / connection execution surface
+  (`create_engine`, `Engine.connect`, `Connection.execute`, `Session.execute` /
+  `.query` / `.commit`, `sessionmaker`, …) is a `db` effect. The declarative and
+  expression *construction* surface (`declarative_base`, `Column`,
+  `relationship`, the `select()` / `text()` builders) is pure metadata assembly
+  and is deliberately left fail-closed Unknown rather than cleared with a
+  package-wide pure vouch — a substring vouch would wrongly clear the execution
+  rows. Honest caveat: the extractor is call-only, and SQLAlchemy usage is largely
+  module-level (declarative models at class scope) which emits no call edges, so
+  these rows will not reduce Unknowns until the reference-level rung lands; they
+  are authored correctly now so they fire the moment it does.
+
+On `housekeeping` the pack clears every Unknown "cannot-certify" finding (rich 37,
+yaml 20 — 57 → 0) while the real forbidden-effect violation set is unchanged (126
+fs/net/process reaches, an identical set with identical evidence paths): making a
+pure package pure removes no genuine effect root, so no real leak can vanish.
