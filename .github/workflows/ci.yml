@@ -129,3 +129,36 @@ jobs:
       # compile within budget.
       - name: hinzu check the TypeScript fixture (functional-core leak)
         run: cargo test -p hinzu-cli --test ts_check -- --ignored --exact check_typescript_project_end_to_end
+
+  # Run `hinzu check` on the Python fixture end to end: build the CLI on stable,
+  # install the adapter's one dependency (jedi), and check the fixture project
+  # through the SHARED pipeline (adapter -> SQLite -> DBSP -> policy). It must
+  # flag the functional-core leaks with their evidence paths.
+  #
+  # Isolated from the `rust` job like `self-check` and `ts-check` are. Python
+  # lives only here; the stable Rust jobs never depend on it. This job builds the
+  # CLI on the workspace pin (1.96.0, via rust-toolchain.toml) and never touches
+  # the nightly driver.
+  py-check:
+    name: py-check
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install the Python adapter's dependencies
+        working-directory: adapters/python
+        run: pip install -r requirements.txt
+      # The live adapter path: the ignored py_check test builds the CLI (debug)
+      # itself via assert_cmd and drives it over the fixture — the Jedi adapter
+      # extracts facts, they propagate, and the functional-core leaks must be
+      # flagged. One build (no separate release step) keeps the cold `dbsp`
+      # compile within budget.
+      - name: hinzu check the Python fixture (functional-core leaks)
+        run: cargo test -p hinzu-cli --test py_check -- --ignored --exact check_python_project_end_to_end

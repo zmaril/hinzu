@@ -1,5 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
+mod adapter_harness;
+mod py_adapter;
 mod rust_adapter;
 mod ts_adapter;
 
@@ -141,8 +143,9 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
             .with_context(|| format!("parsing facts from {}", path.display()));
     }
     // A Cargo.toml routes to the Rust StableMIR path; a tsconfig/package.json to
-    // the TypeScript compiler-API adapter. Rust wins a tie so a Rust crate with a
-    // stray package.json is not misrouted.
+    // the TypeScript compiler-API adapter; a pyproject/setup.py/setup.cfg to the
+    // Python Jedi adapter. Rust wins a tie so a Rust crate with a stray
+    // package.json is not misrouted.
     if rust_adapter::is_cargo_project(&args.path) {
         return rust_adapter::extract_facts(&args.path)
             .with_context(|| format!("extracting Rust facts from {}", args.path.display()));
@@ -151,26 +154,27 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
         return ts_adapter::extract_facts(&args.path)
             .with_context(|| format!("extracting TypeScript facts from {}", args.path.display()));
     }
+    if py_adapter::is_python_project(&args.path) {
+        return py_adapter::extract_facts(&args.path)
+            .with_context(|| format!("extracting Python facts from {}", args.path.display()));
+    }
     anyhow::bail!(
-        "{} is neither a cargo project nor a TypeScript project — pass --facts <json> to analyze \
+        "{} is not a cargo, TypeScript, or Python project — pass --facts <json> to analyze \
          pre-extracted facts",
         args.path.display()
     )
 }
 
-/// The language to seed effect roots for: TypeScript if any definition is
-/// TypeScript, else Rust. Reading it from the facts keeps `--facts` JSON and a
-/// live extraction on the same path.
+/// The language to seed effect roots for: whichever non-Rust language any
+/// definition declares (TypeScript or Python), else Rust. Reading it from the
+/// facts keeps `--facts` JSON and a live extraction on the same path.
 fn facts_language(facts: &FactSet) -> Language {
-    if facts
+    facts
         .defs
         .values()
-        .any(|d| d.language == Language::TypeScript)
-    {
-        Language::TypeScript
-    } else {
-        Language::Rust
-    }
+        .map(|d| d.language)
+        .find(|l| *l != Language::Rust)
+        .unwrap_or(Language::Rust)
 }
 
 /// Read the policy file source from `--policy`, else `hinzu.toml` in the target

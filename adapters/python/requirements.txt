@@ -1,0 +1,4 @@
+# The hinzu Python adapter's only runtime dependency: Jedi, the name-resolution
+# engine it uses to resolve each call site's callee. `ast` is in the standard
+# library. Install with: pip install -r requirements.txt
+jedi==0.20.0

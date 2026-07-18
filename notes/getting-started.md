@@ -219,3 +219,48 @@ illustrative functional-core policy over the render and prompt layers then flagg
 such as `TUI.doRender -> node:fs::mkdirSync` and `stream -> (anonymous) ->
 global::fetch`, plus 661 `Unknown` warnings naming the npm packages the checker
 could not see through (chalk, semver, yaml, openai, typebox, and more).
+
+## Python adapter (shipped, slice 3)
+
+The Python adapter is now in the tree at `adapters/python/`, and
+`hinzu check <python-project>` runs it end to end through the same pipeline as
+Rust and TypeScript. It is a name-resolution extractor: the standard-library
+`ast` module walks each file with a stack of enclosing functions (the caller),
+and Jedi (`script.goto(follow_imports=True)`) resolves each call site's callee,
+supplying its `full_name` and module path. It emits hinzu's `FactSet` JSON
+directly — definitions, `call` and `reference` edges, and effect roots seeded by
+the callee's declaration provenance.
+
+`hinzu check` routes by project type: a `Cargo.toml` takes the StableMIR path, a
+`tsconfig.json` / `package.json` the TypeScript adapter, and a `pyproject.toml` /
+`setup.py` / `setup.cfg` the Python adapter (shelled out to `python3 analyze.py`;
+`HINZU_PY_ADAPTER` overrides the script location and `HINZU_PYTHON` the
+interpreter, and the run fails with an honest message when Python or Jedi is
+missing rather than faking an analysis). Everything downstream is shared: the
+SQLite store, DBSP propagation, and the `hinzu.toml` policy check.
+
+Effect roots use the one flat, shared vocabulary — `fs`, `net`, `process`, `env`,
+`clock`, `random` — the same names Rust and TypeScript use; Python seeds that
+subset, and there is no `alloc` for a garbage-collected runtime (see
+[`python-catalog.md`](./python-catalog.md)). The built-in Python annotation set
+lives in `crates/hinzu-core/annotations/python.toml`, the counterpart to
+`std.toml` and `node.toml`.
+
+Python is the weakest-resolution adapter: Jedi resolves about 78% of call sites,
+because duck-typed receivers, decorators, dynamic import, and un-typed `pathlib`
+chains such as `target.parent.mkdir` fall outside a name resolver. That is where
+Unknown-by-default earns its keep — each unresolved site is emitted as an
+unknown-target edge, becomes an `Unknown`, and fails closed under the default
+`on_unknown = fail`, so a call hinzu cannot see through reads as "cannot certify,"
+never as false-pure. Running the shared pipeline over housekeeping (a pure-Python
+fleet auditor, 82 files, 486 definitions) with an illustrative functional-core
+policy proves it: the adapter resolved 78.3% of 2,449 call sites and seeded 19
+effect roots; the policy then flagged 150 findings — 15 forbidden-effect
+violations (14 process, 1 fs) with evidence paths such as `policy_conflicts ->
+member_config -> _file_text -> RepoContext.try_api -> RepoContext.api -> run ->
+subprocess::run`, plus 135 `Unknown` findings (133 unresolved targets like
+`(ctx.workdir / name).is_file` and `target.parent.mkdir`, and 2 naming the
+third-party `yaml.safe_load` the analyzer could not see through). A native-Rust
+type checker (pyrefly, then ty) is the planned future backend behind the same
+`FactSet` seam, at higher fidelity, once one ships a stable library API; see
+[`python-catalog.md`](./python-catalog.md).

@@ -1,0 +1,124 @@
+{
+  "definitions": [
+    {
+      "id": "core.py#parse",
+      "display": "parse",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 10,
+      "line_end": 16
+    },
+    {
+      "id": "core.py#count_keys",
+      "display": "count_keys",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 19,
+      "line_end": 20
+    },
+    {
+      "id": "core.py#load_and_summarize",
+      "display": "load_and_summarize",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 23,
+      "line_end": 26
+    },
+    {
+      "id": "core.py#build_and_report",
+      "display": "build_and_report",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 29,
+      "line_end": 32
+    },
+    {
+      "id": "effects.py#read_config",
+      "display": "read_config",
+      "language": "python",
+      "file": "effects.py",
+      "line_start": 9,
+      "line_end": 13
+    },
+    {
+      "id": "effects.py#run_tool",
+      "display": "run_tool",
+      "language": "python",
+      "file": "effects.py",
+      "line_start": 16,
+      "line_end": 19
+    }
+  ],
+  "edges": [
+    {
+      "caller": "core.py#load_and_summarize",
+      "callee": "core.py#parse",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core.py",
+      "evidence_line": 25
+    },
+    {
+      "caller": "core.py#load_and_summarize",
+      "callee": "effects.py#read_config",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core.py",
+      "evidence_line": 25
+    },
+    {
+      "caller": "core.py#load_and_summarize",
+      "callee": "core.py#count_keys",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core.py",
+      "evidence_line": 26
+    },
+    {
+      "caller": "core.py#build_and_report",
+      "callee": "effects.py#run_tool",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core.py",
+      "evidence_line": 31
+    },
+    {
+      "caller": "effects.py#read_config",
+      "callee": "builtins::open",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects.py",
+      "evidence_line": 12
+    },
+    {
+      "caller": "effects.py#read_config",
+      "callee": "io::_IOBase.read",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects.py",
+      "evidence_line": 13
+    },
+    {
+      "caller": "effects.py#run_tool",
+      "callee": "subprocess::run",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects.py",
+      "evidence_line": 18
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "builtins::open",
+      "effect": "fs"
+    },
+    {
+      "symbol": "io::_IOBase.read",
+      "effect": "fs"
+    },
+    {
+      "symbol": "subprocess::run",
+      "effect": "process"
+    }
+  ]
+}

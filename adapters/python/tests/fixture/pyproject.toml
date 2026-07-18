@@ -1,0 +1,6 @@
+# A minimal project marker so `hinzu check` routes this fixture to the Python
+# adapter (a `pyproject.toml` / `setup.py` / `setup.cfg` selects Python).
+[project]
+name = "hinzu-python-fixture"
+version = "0.0.0"
+description = "Functional-core fixture for the hinzu Python adapter."

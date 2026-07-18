@@ -1,0 +1,13 @@
+# The hinzu Python adapter — a Jedi-based extractor emitting hinzu FactSet JSON.
+# Its only runtime dependency is Jedi (`ast` ships with CPython). This manifest
+# also lets a `pip install .` pull the dependency; `pip install jedi` or
+# `pip install -r requirements.txt` works the same.
+[project]
+name = "hinzu-python-adapter"
+version = "0.1.0"
+description = "The hinzu Python adapter — a name-resolution extractor emitting hinzu FactSet JSON."
+requires-python = ">=3.9"
+dependencies = ["jedi>=0.19"]
+
+[project.scripts]
+hinzu-py = "analyze:main"

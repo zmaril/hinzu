@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Python adapter (slice 3) — `hinzu check <python-project>` now works, through
+  the same pipeline as Rust and TypeScript: adapter, SQLite fact store, DBSP
+  propagation, `hinzu.toml` policy, violations. The adapter
+  (`adapters/python/`) is a name-resolution extractor: the standard-library
+  `ast` module walks each file with an enclosing-function stack, and Jedi
+  (`script.goto(follow_imports=True)`) resolves each call site's callee, emitting
+  hinzu's `FactSet` JSON — `call` and `reference` edges, effect roots seeded by
+  declaration provenance, and, for every call site Jedi cannot resolve, an edge
+  with `resolution: "unresolved"`. `hinzu check` routes by project type: a
+  `Cargo.toml` takes the Rust StableMIR path, a `tsconfig.json` / `package.json`
+  the TypeScript adapter, a `pyproject.toml` / `setup.py` / `setup.cfg` the
+  Python adapter (set `HINZU_PY_ADAPTER` / `HINZU_PYTHON` to override). Python
+  seeds the shared vocabulary subset `fs`, `net`, `process`, `env`, `clock`,
+  `random` — the same names Rust and TypeScript use, no `alloc` for a
+  garbage-collected runtime; the bare `pathlib.Path(...)` constructor is pure,
+  only its I/O methods are `fs`. Because Python resolves only about 78% of call
+  sites, an unresolved site becomes an `Unknown` that fails closed under the
+  default `on_unknown = fail` — that is what keeps the weakest-resolution adapter
+  sound. hinzu ships a built-in Python annotation set,
+  `crates/hinzu-core/annotations/python.toml` (the counterpart to `std.toml` /
+  `node.toml`). A native-Rust type checker (pyrefly, then ty) is the planned
+  future backend behind the same `FactSet` seam, once one ships a stable library
+  API. See [`notes/python-catalog.md`](./notes/python-catalog.md).
 - TypeScript adapter (slice 2) — `hinzu check <ts-project>` now works, through
   the same pipeline as Rust: adapter, SQLite fact store, DBSP propagation,
   `hinzu.toml` policy, violations. The adapter (`adapters/typescript/`) is a

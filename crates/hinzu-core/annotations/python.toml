@@ -1,0 +1,200 @@
+# hinzu's built-in Python effect annotations — the shipped library annotation
+# set for Python, the counterpart to `std.toml` for Rust and `node.toml` for
+# TypeScript. It maps the CPython standard library's built-in effect surface to
+# hinzu's ONE flat, shared effect vocabulary: `fs` is `fs` and `net` is `net`
+# for every language. Python seeds a SUBSET of the shared categories; a category
+# that does not apply simply does not appear.
+#
+# There is deliberately NO `alloc` effect for Python. Rust's `alloc` marks heap
+# allocation as a certifiable effect; on a garbage-collected runtime an
+# allocation is not an observable effect a functional-core policy can meaningfully
+# forbid, so it is absent here — absent, not renamed. `db` is a shared category
+# but Python reaches a database through a package (`sqlite3` is the one stdlib
+# exception), so it is declared per project with a `[trust]` line rather than
+# shipped here.
+#
+# The Python adapter (`adapters/python/analyze.py`) resolves each callee by
+# declaration provenance with Jedi and emits a canonical `::`-segmented symbol
+# for every no-body external it sees: `subprocess::run` for a stdlib call,
+# `builtins::open` for the ambient `open`, `pathlib::Path.mkdir` for a resolved
+# pathlib I/O method, `<package>::<member>` for a third-party call. This table
+# maps those symbols to their effect using the same segment-aligned matcher Rust
+# and TypeScript use, so a project's `[roots]` / `[trust]` overrides work
+# identically across all three languages. The adapter also emits these roots
+# directly; this table keeps hinzu-core's Unknown classification in agreement and
+# is the honest, auditable record of what Python's surface means.
+#
+# Un-listed third-party packages are NOT here: they are Unknown until a project
+# vouches for them in its own `hinzu.toml` (`[trust] "yaml" = "pure"`, or
+# `[trust] "psycopg" = ["db"]`). The well-known effectful packages the adapter
+# seeds directly (requests, httpx, urllib3, aiohttp) are the pragmatic exception,
+# documented in `notes/python-catalog.md`.
+
+[roots]
+
+# --- filesystem --------------------------------------------------------------
+# `open` is the ambient builtin (like TypeScript's `fetch`); the `io` module,
+# `shutil`, `tempfile`, `glob`, and `fileinput` are file I/O modules.
+"builtins::open" = "fs"
+"io::open" = "fs"
+"io::FileIO" = "fs"
+"shutil" = "fs"
+"tempfile" = "fs"
+"glob" = "fs"
+"fileinput" = "fs"
+"linecache" = "fs"
+
+# os filesystem operations (the pure `os.path.join`-style helpers stay pure).
+"os::open" = "fs"
+"os::fdopen" = "fs"
+"os::remove" = "fs"
+"os::unlink" = "fs"
+"os::mkdir" = "fs"
+"os::makedirs" = "fs"
+"os::rmdir" = "fs"
+"os::removedirs" = "fs"
+"os::listdir" = "fs"
+"os::scandir" = "fs"
+"os::walk" = "fs"
+"os::stat" = "fs"
+"os::lstat" = "fs"
+"os::rename" = "fs"
+"os::renames" = "fs"
+"os::replace" = "fs"
+"os::link" = "fs"
+"os::symlink" = "fs"
+"os::readlink" = "fs"
+"os::chmod" = "fs"
+"os::chown" = "fs"
+"os::truncate" = "fs"
+"os::access" = "fs"
+
+# os.path predicates that stat the filesystem. Jedi commonly resolves `os.path`
+# to the concrete `posixpath` / `ntpath` / `genericpath` implementation module,
+# so those spellings are listed too.
+"os::path.exists" = "fs"
+"os::path.isfile" = "fs"
+"os::path.isdir" = "fs"
+"os::path.islink" = "fs"
+"os::path.getsize" = "fs"
+"os::path.getmtime" = "fs"
+"os::path.getctime" = "fs"
+"os::path.getatime" = "fs"
+"os::path.realpath" = "fs"
+"os::path.samefile" = "fs"
+"posixpath::exists" = "fs"
+"posixpath::isfile" = "fs"
+"posixpath::isdir" = "fs"
+"posixpath::islink" = "fs"
+"posixpath::getsize" = "fs"
+"posixpath::getmtime" = "fs"
+"posixpath::realpath" = "fs"
+"posixpath::samefile" = "fs"
+"ntpath::exists" = "fs"
+"ntpath::isfile" = "fs"
+"ntpath::isdir" = "fs"
+"genericpath::exists" = "fs"
+"genericpath::isfile" = "fs"
+"genericpath::isdir" = "fs"
+"genericpath::getsize" = "fs"
+"genericpath::getmtime" = "fs"
+
+# pathlib I/O methods. The bare `pathlib.Path(...)` constructor and pure path
+# algebra (`joinpath`, `with_suffix`, `parent`, `name`) are NOT effects; only the
+# methods that touch the filesystem are `fs`.
+"pathlib::Path.open" = "fs"
+"pathlib::Path.read_text" = "fs"
+"pathlib::Path.write_text" = "fs"
+"pathlib::Path.read_bytes" = "fs"
+"pathlib::Path.write_bytes" = "fs"
+"pathlib::Path.mkdir" = "fs"
+"pathlib::Path.rmdir" = "fs"
+"pathlib::Path.unlink" = "fs"
+"pathlib::Path.touch" = "fs"
+"pathlib::Path.rename" = "fs"
+"pathlib::Path.replace" = "fs"
+"pathlib::Path.symlink_to" = "fs"
+"pathlib::Path.hardlink_to" = "fs"
+"pathlib::Path.chmod" = "fs"
+"pathlib::Path.stat" = "fs"
+"pathlib::Path.lstat" = "fs"
+"pathlib::Path.exists" = "fs"
+"pathlib::Path.is_file" = "fs"
+"pathlib::Path.is_dir" = "fs"
+"pathlib::Path.is_symlink" = "fs"
+"pathlib::Path.glob" = "fs"
+"pathlib::Path.rglob" = "fs"
+"pathlib::Path.iterdir" = "fs"
+"pathlib::Path.walk" = "fs"
+"pathlib::Path.resolve" = "fs"
+"pathlib::Path.samefile" = "fs"
+"pathlib::Path.expanduser" = "fs"
+
+# --- subprocess / process ----------------------------------------------------
+"subprocess" = "process"
+"multiprocessing" = "process"
+"os::system" = "process"
+"os::popen" = "process"
+"os::posix_spawn" = "process"
+"os::posix_spawnp" = "process"
+"os::spawnl" = "process"
+"os::spawnle" = "process"
+"os::spawnlp" = "process"
+"os::spawnlpe" = "process"
+"os::spawnv" = "process"
+"os::spawnve" = "process"
+"os::spawnvp" = "process"
+"os::spawnvpe" = "process"
+"os::execl" = "process"
+"os::execle" = "process"
+"os::execlp" = "process"
+"os::execlpe" = "process"
+"os::execv" = "process"
+"os::execve" = "process"
+"os::execvp" = "process"
+"os::execvpe" = "process"
+"os::fork" = "process"
+"os::forkpty" = "process"
+"os::kill" = "process"
+"os::abort" = "process"
+
+# --- network -----------------------------------------------------------------
+"socket" = "net"
+"ssl" = "net"
+"urllib" = "net"
+"http" = "net"
+"ftplib" = "net"
+"smtplib" = "net"
+"poplib" = "net"
+"imaplib" = "net"
+"telnetlib" = "net"
+"xmlrpc" = "net"
+"asyncio::open_connection" = "net"
+# Well-known effectful third-party packages (the pragmatic exception, like
+# TypeScript's undici / execa). Every other third-party package stays Unknown.
+"requests" = "net"
+"httpx" = "net"
+"urllib3" = "net"
+"aiohttp" = "net"
+
+# --- ambient environment -----------------------------------------------------
+"os::environ" = "env"
+"os::environb" = "env"
+"os::getenv" = "env"
+"os::getenvb" = "env"
+"os::putenv" = "env"
+"os::unsetenv" = "env"
+"os::getcwd" = "env"
+"os::getcwdb" = "env"
+"os::chdir" = "env"
+
+# --- clock -------------------------------------------------------------------
+"time" = "clock"
+"datetime::datetime.now" = "clock"
+"datetime::datetime.today" = "clock"
+"datetime::datetime.utcnow" = "clock"
+"datetime::date.today" = "clock"
+
+# --- randomness --------------------------------------------------------------
+"random" = "random"
+"secrets" = "random"
