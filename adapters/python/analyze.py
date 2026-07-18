@@ -725,8 +725,14 @@ class TyResolver:
                 client.notify("textDocument/didOpen", {"textDocument": {
                     "uri": uri(path), "languageId": "python", "version": 1,
                     "text": src}})
-            # Settle: wait for the first check pass (diagnostics) before asking.
+            # Settle. On a cold run ty resolves owned symbols and `builtins`
+            # before its vendored typeshed is warm for other stdlib modules
+            # (`subprocess`, …), so a batch fired too early sees those as null —
+            # the first-run race the spikes flagged. Wait until a stdlib
+            # definition actually resolves, using an in-memory probe doc, before
+            # asking anything. Cheap once warm (resolves on the first poll).
             client.wait_for_diagnostics(timeout=8.0)
+            self._await_ready(client, uri, root)
 
             qlist = list(queries)
             raw = self._pipeline(client, uri, sources, qlist)
@@ -742,6 +748,36 @@ class TyResolver:
             return {q: self._resolution(raw.get(q)) for q in qlist}
         finally:
             client.shutdown()
+
+    def _await_ready(self, client, uri, root, timeout=25.0):
+        """Block until ty can resolve a stdlib definition, so the real batch does
+        not race the cold-start warm-up. Opens a throwaway in-memory doc that
+        references `subprocess.run` (a call the fixtures and most projects use)
+        and polls its definition until it lands in typeshed or `timeout` elapses.
+        The probe doc is never written to disk; it is closed afterwards."""
+        import time  # noqa: PLC0415 — only when the ty backend runs
+
+        probe = os.path.join(root, "__hinzu_ty_ready__.py")
+        client.notify("textDocument/didOpen", {"textDocument": {
+            "uri": uri(probe), "languageId": "python", "version": 1,
+            "text": "import subprocess\nsubprocess.run\n"}})
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                try:
+                    result = client.request("textDocument/definition", {
+                        "textDocument": {"uri": uri(probe)},
+                        "position": {"line": 1, "character": 13}}, timeout=15).get("result")
+                except (RuntimeError, TimeoutError):
+                    result = None
+                if result:
+                    turi = result[0].get("targetUri") or result[0].get("uri") or ""
+                    if "/typeshed/" in turi or "subprocess" in turi:
+                        return
+                time.sleep(0.2)
+        finally:
+            client.notify("textDocument/didClose",
+                          {"textDocument": {"uri": uri(probe)}})
 
     def _pipeline(self, client, uri, sources, qlist):
         """Fire definition requests in windows of BATCH, then collect — the
