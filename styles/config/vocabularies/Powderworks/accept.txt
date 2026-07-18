@@ -93,6 +93,5 @@ bufio
 curlie
 PyYAML
 SQLAlchemy
-sqlalchemy
 sessionmaker
 boto3
