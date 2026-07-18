@@ -52,7 +52,3 @@ execSync
 buildSystemPrompt
 pi.dev
 earendil
-clippy
-miri
-MIR
-Cargo
