@@ -131,25 +131,22 @@ jobs:
         run: cargo test -p hinzu-cli --test ts_check -- --ignored --exact check_typescript_project_end_to_end
 
   # Run `hinzu check` on the Python fixture end to end: build the CLI on stable,
-  # install both resolution backends, and check the fixture project through the
-  # SHARED pipeline (adapter -> SQLite -> DBSP -> policy). It must flag the
-  # functional-core leaks with their evidence paths.
+  # install ty (the adapter's sole resolution backend), and check the fixture
+  # project through the SHARED pipeline (adapter -> SQLite -> DBSP -> policy). It
+  # must flag the functional-core leaks with their evidence paths.
   #
-  # BACKEND CHOICE IN CI. ty is the adapter's default backend everywhere the `ty`
-  # binary is present (local dev, real use). In this headless CI runner, though,
-  # ty's LSP resolves the fixture's `subprocess.run` inconsistently — the same
-  # cold run that resolves `builtins.open` returns null for imported-stdlib
-  # symbols, deterministically, in a way that does not reproduce on a normal
-  # workstation even cold (see notes/python-catalog.md). So the live CI assertion
-  # runs on the deterministic Jedi fallback; the ty backend's coverage is the real
-  # local numbers recorded in notes/python-catalog.md. (A non-blocking ty smoke
-  # step is deliberately NOT added: `continue-on-error` on a `cargo test` step is
-  # exactly what this repo's own ci-continue-on-error self-guard forbids, and
-  # dodging that guard would be dishonest. When ty's headless-CI behavior
-  # stabilizes, the live assertion moves to ty.)
+  # ty ON THE HEADLESS RUNNER. ty's environment auto-discovery is unreliable on a
+  # headless runner: an un-pinned `ty server` there resolves `builtins` but
+  # returns null for imported-stdlib symbols like `subprocess.run`. The adapter
+  # fixes this at the source — it pins ty's target `python-version` /
+  # `python-platform` in the LSP `initialize` and warms the vendored typeshed with
+  # a synchronous `ty check` before the batch (see notes/python-catalog.md), so
+  # stdlib imports resolve deterministically from vendored typeshed. So this job
+  # runs its live assertion on ty (pinned `ty==0.0.61`), the same backend used
+  # locally and in real use — no fallback.
   #
   # Isolated from the `rust` job like `self-check` and `ts-check` are. Python and
-  # Jedi live ONLY here; the stable Rust jobs never install them and never depend
+  # ty live ONLY here; the stable Rust jobs never install them and never depend
   # on Python — their Python coverage is the committed sample-facts test
   # (`check_python_facts_reports_the_core_violations`), which runs from JSON with
   # no backend. This job builds the CLI on the workspace pin (1.96.0, via
@@ -167,18 +164,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # Jedi is the fallback backend and the deterministic one in CI. `ast` is
-      # stdlib; this installs Jedi from requirements.txt. (ty, the local default,
-      # is intentionally not installed here — see the backend-choice note above.)
-      - name: install the Python adapter's resolution backend
+      # ty is the adapter's sole backend. `ast` is stdlib; this installs the
+      # pinned `ty==0.0.61` from requirements.txt (the `ty` binary lands on PATH).
+      - name: install the Python adapter's resolution backend (ty)
         working-directory: adapters/python
         run: pip install -r requirements.txt
-      # The live adapter path, on the deterministic Jedi backend: the ignored
-      # py_check test builds the CLI (debug) itself via assert_cmd and drives it
-      # over the fixture — the adapter extracts facts, they propagate, and the
-      # functional-core leaks must be flagged. One build (no separate release
-      # step) keeps the cold `dbsp` compile within budget.
-      - name: hinzu check the Python fixture with the Jedi backend (functional-core leaks)
-        env:
-          HINZU_PY_BACKEND: jedi
+      # Diagnostics: record ty's version and exactly how it resolves the fixture's
+      # environment and imported-stdlib symbols on THIS runner, so a resolution
+      # regression yields a real log (env discovery, python-version/platform, and
+      # a `subprocess.run` definition probe) rather than a bare test failure.
+      - name: ty resolution diagnostics on this runner
+        working-directory: adapters/python
+        run: |
+          ty --version
+          echo "--- ty check -vvv (environment + module resolution) ---"
+          ty check --project tests/fixture --python-version 3.11 \
+            --python-platform linux --exit-zero -vvv 2>&1 | \
+            grep -iE "python version|platform|stdlib|search path|vendored|requires-python|not found|subprocess" || true
+          echo "--- adapter dry run (ty backend, stderr diagnostics) ---"
+          python3 analyze.py tests/fixture >/dev/null
+      # The live adapter path, on ty: the ignored py_check test builds the CLI
+      # (debug) itself via assert_cmd and drives it over the fixture — the adapter
+      # extracts facts with ty, they propagate, and the functional-core leaks must
+      # be flagged. One build (no separate release step) keeps the cold `dbsp`
+      # compile within budget.
+      - name: hinzu check the Python fixture with ty (functional-core leaks)
         run: cargo test -p hinzu-cli --test py_check -- --ignored --exact check_python_project_end_to_end

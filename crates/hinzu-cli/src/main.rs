@@ -144,7 +144,7 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
     }
     // A Cargo.toml routes to the Rust StableMIR path; a tsconfig/package.json to
     // the TypeScript compiler-API adapter; a pyproject/setup.py/setup.cfg to the
-    // Python Jedi adapter. Rust wins a tie so a Rust crate with a stray
+    // ty-driven Python adapter. Rust wins a tie so a Rust crate with a stray
     // package.json is not misrouted.
     if rust_adapter::is_cargo_project(&args.path) {
         return rust_adapter::extract_facts(&args.path)

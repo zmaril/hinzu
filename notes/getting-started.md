@@ -224,42 +224,45 @@ could not see through (chalk, semver, yaml, openai, typebox, and more).
 
 The Python adapter is now in the tree at `adapters/python/`, and
 `hinzu check <python-project>` runs it end to end through the same pipeline as
-Rust and TypeScript. It is a name-resolution extractor: the standard-library
+Rust and TypeScript. It is a type-directed extractor: the standard-library
 `ast` module walks each file with a stack of enclosing functions (the caller),
-and Jedi (`script.goto(follow_imports=True)`) resolves each call site's callee,
-supplying its `full_name` and module path. It emits hinzu's `FactSet` JSON
-directly — definitions, `call` and `reference` edges, and effect roots seeded by
-the callee's declaration provenance.
+and ty (Astral's Rust type checker), driven over its LSP, resolves each call
+site's callee — the definition's target file plus the enclosing qualname supply
+the `full_name` and module path. It emits hinzu's `FactSet` JSON directly —
+definitions, `call` and `reference` edges, and effect roots seeded by the
+callee's declaration provenance. ty is the sole resolution backend; there is no
+fallback resolver.
 
 Project detection adds one row to the routing table: a `pyproject.toml`,
 `setup.py`, or `setup.cfg` selects the Python adapter, which the CLI runs as
 `python3 analyze.py` (`HINZU_PYTHON` picks the interpreter, `HINZU_PY_ADAPTER`
-the script; a missing `python3` or `jedi` is an honest failure, not a faked
-analysis). From the extracted facts onward nothing is language-specific — the
-same store, engine, and policy check that Rust and TypeScript already feed.
+the script, `HINZU_TY` the `ty` binary; a missing `python3` or `ty` is an honest
+nonzero failure, not a faked analysis). From the extracted facts onward nothing
+is language-specific — the same store, engine, and policy check that Rust and
+TypeScript already feed.
 
 The seeded categories are the shared vocabulary again, minus `alloc`: `fs`,
-`net`, `process`, `env`, `clock`, and `random`, keyed on Jedi's resolved
+`net`, `process`, `env`, `clock`, and `random`, keyed on ty's resolved
 `full_name`. One Python-specific care is the `pathlib.Path` constructor, which is
 pure — only its I/O methods count as `fs`. The shipped annotation set is
 `crates/hinzu-core/annotations/python.toml`, and
 [`python-catalog.md`](./python-catalog.md) records the full mapping.
 
-Python is the weakest-resolution adapter: Jedi resolves about 78% of call sites,
-because duck-typed receivers, decorators, dynamic import, and un-typed `pathlib`
-chains such as `target.parent.mkdir` fall outside a name resolver. That is where
+Python is still the weakest-resolution adapter, because duck-typed receivers,
+decorators, and dynamic import fall outside any resolver. That is where
 Unknown-by-default earns its keep — each unresolved site is emitted as an
 unknown-target edge, becomes an `Unknown`, and fails closed under the default
 `on_unknown = fail`, so a call hinzu cannot see through reads as "cannot certify,"
 never as false-pure. Running the shared pipeline over housekeeping (a pure-Python
 fleet auditor, 82 files, 486 definitions) with an illustrative functional-core
-policy proves it: the adapter resolved 78.3% of 2,449 call sites and seeded 19
-effect roots; the policy then flagged 150 findings — 15 forbidden-effect
-violations (14 process, 1 fs) with evidence paths such as `policy_conflicts ->
-member_config -> _file_text -> RepoContext.try_api -> RepoContext.api -> run ->
-subprocess::run`, plus 135 `Unknown` findings (133 unresolved targets like
-`(ctx.workdir / name).is_file` and `target.parent.mkdir`, and 2 naming the
-third-party `yaml.safe_load` the analyzer could not see through). A native-Rust
-type checker (pyrefly, then ty) is the planned future backend behind the same
-`FactSet` seam, at higher fidelity, once one ships a stable library API; see
+policy proves it: ty resolved 89.5% of 2,449 call sites and seeded 22 effect
+roots, driving `fs` coverage to 117 call edges because a real type system closes
+the un-typed `pathlib` gap — `(ctx.workdir / name).is_file()` and
+`target.parent.mkdir()` resolve to precise `pathlib::Path` `fs` roots instead of
+Unknowns. The policy then flagged 20 forbidden-effect violations (14 process, 6
+fs) with evidence paths such as `policy_conflicts -> member_config -> _file_text
+-> RepoContext.try_api -> RepoContext.api -> run -> subprocess::run`, plus 86
+`Unknown` findings. Because ty runs over its LSP as a subprocess today, a native
+in-process ty backend is the planned future resolution primitive behind the same
+`FactSet` seam once ty ships a stable Rust library API; see
 [`python-catalog.md`](./python-catalog.md).

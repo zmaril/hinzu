@@ -7,8 +7,8 @@
 #
 # It is intentionally tiny and dependency-free (standard library only) so the
 # Python adapter's ty backend needs no package beyond the `ty` binary itself —
-# the honest-capability contract is "ty present or fall back to Jedi," never a
-# hidden third dependency.
+# the honest-capability contract is "ty present, or an honest nonzero exit,"
+# never a hidden extra dependency and never a faked resolution.
 from __future__ import annotations
 
 import json

@@ -14,8 +14,8 @@
 # shipped here.
 #
 # The Python adapter (`adapters/python/analyze.py`) resolves each callee by
-# declaration provenance — with ty (Astral's type checker, over its LSP) by
-# default, or the Jedi fallback when ty is absent — and emits a canonical
+# declaration provenance — with ty (Astral's type checker, over its LSP), its
+# sole resolution backend — and emits a canonical
 # `::`-segmented symbol for every no-body external it sees: `subprocess::run`
 # for a stdlib call,
 # `builtins::open` for the ambient `open`, `pathlib::Path.mkdir` for a resolved
@@ -71,9 +71,9 @@
 "os::truncate" = "fs"
 "os::access" = "fs"
 
-# os.path predicates that stat the filesystem. Jedi commonly resolves `os.path`
-# to the concrete `posixpath` / `ntpath` / `genericpath` implementation module,
-# so those spellings are listed too.
+# os.path predicates that stat the filesystem. ty resolves `os.path` to the
+# concrete `posixpath` / `ntpath` / `genericpath` implementation module, so
+# those spellings are listed too.
 "os::path.exists" = "fs"
 "os::path.isfile" = "fs"
 "os::path.isdir" = "fs"

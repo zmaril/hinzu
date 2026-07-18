@@ -32,7 +32,7 @@ call to, which is what the adapter reads.
   `os.environb`), and `os.getenv` / `os.putenv` / `os.unsetenv`. The common
   idiom is `os.environ.get(...)`, where the `.get` itself is a pure dict method,
   so the adapter seeds the effect on the `os.environ` receiver, confirmed against
-  Jedi so a shadowed local `os` never misfires.
+  ty so a shadowed local `os` never misfires.
 - **`clock`** — the `time` module, and the wall-clock reads of `datetime`
   (`datetime.now`, `datetime.utcnow`, `date.today`). The rest of `datetime` —
   date arithmetic, formatting — stays pure, because it is not a clock read.
@@ -65,60 +65,88 @@ caller, governs it. So `alloc` is absent for Python, exactly as it is for
 TypeScript. It is absent, not renamed: there is no `py/alloc` and no substitute
 category. Python seeds the subset above and nothing more.
 
-## The resolution backend: ty over LSP, with Jedi as the fallback
+## The resolution backend: ty over LSP, the sole backend
 
-The adapter resolves each call site with one of two interchangeable backends
-behind the `FactSet` seam. The AST walk, the caller attribution, and the whole
-owned/effect/stdlib/third-party classification are identical whichever backend
-ran; the only swappable part is how a call-site position becomes a declaration.
+The adapter resolves each call site with **ty** (Astral's Rust type checker), its
+sole resolution backend, driven over its LSP behind the `FactSet` seam. The AST
+walk, the caller attribution, and the whole owned/effect/stdlib/third-party
+classification are backend-independent; the only thing the seam abstracts is how a
+call-site position becomes a declaration.
 
-- **ty** (Astral's Rust type checker) is the default, driven over its LSP. The
-  adapter spawns `ty server`, opens every source file, waits for the first check
-  pass to settle, then pipelines a `textDocument/definition` request at each
-  callee token. The definition's target — a file in ty's vendored typeshed, or an
-  owned or third-party module — plus the enclosing qualname at the target give the
-  provenance the effect roots key on. Because ty is a real type system it resolves
-  the un-typed `pathlib` receivers and much of the duck-typed surface Jedi cannot.
-- **Jedi** is the zero-extra-dependency fallback: name-resolution-grade
-  `script.goto(follow_imports=True)`, used automatically when the `ty` binary is
-  absent so the adapter always runs. `HINZU_PY_BACKEND` forces `ty` or `jedi`;
-  `HINZU_TY` overrides the ty binary path.
+The adapter spawns `ty server`, opens every source file, settles the first check
+pass, then pipelines a `textDocument/definition` request at each callee token. The
+definition's target — a file in ty's vendored typeshed, or an owned or third-party
+module — plus the enclosing qualname at the target give the provenance the effect
+roots key on. Because ty is a real type system it resolves the un-typed `pathlib`
+receivers and much of the duck-typed surface a name-resolver cannot.
+
+There is **no fallback resolver**. If the `ty` binary is absent the adapter exits
+nonzero with an honest message; it never silently degrades to a weaker resolver
+and never fakes a resolution. `HINZU_TY` overrides the ty binary path.
 
 ### What ty buys, measured on housekeeping
 
 Running the full pipeline over `housekeeping` (a pure-Python fleet auditor, 82
 files, 486 definitions, 2,449 call sites) with an illustrative functional-core
-policy, ty against the Jedi baseline:
+policy:
 
-| | Jedi (fallback) | ty (default) |
-| --- | --- | --- |
-| call sites resolved | 83.0% (2,032) | **89.5% (2,192)** |
-| unresolved (Unknown) call sites | 417 | **257** |
-| `fs`-effect call edges | 28 | **117** (≈4×) |
-| effect roots | 19 | 22 |
-| forbidden-effect violations | 15 (1 fs, 14 process) | **20 (6 fs, 14 process)** |
-| `cannot certify` (Unknown) findings | 136 | **86** |
+| | ty |
+| --- | --- |
+| call sites resolved | **89.5% (2,192)** |
+| unresolved (Unknown) call sites | **257** |
+| `fs`-effect call edges | **117** |
+| effect roots | 22 |
+| forbidden-effect violations | **20 (6 fs, 14 process)** |
+| `cannot certify` (Unknown) findings | **86** |
 
-The `fs` coverage roughly quadruples and the Unknown pile shrinks by a third. The
-gain is almost entirely the un-typed `pathlib` gap ty closes: chains like
-`(ctx.workdir / "src-tauri").is_dir()` and `p.parent.mkdir()`, which Jedi emitted
-as unresolved Unknowns, ty resolves to real `pathlib::Path.is_dir` /
-`pathlib::Path.mkdir` `fs` roots — so they become precise `forbids fs` findings in
-the core rather than "cannot certify." The total finding count *drops* (151 → 106)
-precisely because honest gaps turn into precise edges (some pure, some real
-violations). The whole run stays well under two seconds with request pipelining.
+Because ty is a real type system, un-typed `pathlib` chains like
+`(ctx.workdir / "src-tauri").is_dir()` and `p.parent.mkdir()` — which a
+name-resolver leaves unresolved — resolve to real `pathlib::Path.is_dir` /
+`pathlib::Path.mkdir` `fs` roots, so they become precise `forbids fs` findings in
+the core rather than "cannot certify." That is why `fs` coverage reaches 117 call
+edges. The whole run stays well under two seconds with request pipelining.
 
-### Sound whichever backend runs
+### Deterministic stdlib resolution on any host (the headless-runner fix)
 
-No backend resolves everything — Python's dynamism (duck-typed receivers,
-`getattr`, decorators, dynamic import) leaves a residue, 10.5% even for ty. This
-is where Unknown-by-default earns its keep: every unresolved call site is emitted
-as an unknown-target edge, so hinzu-core turns it into an `Unknown` that
-propagates up the call graph and fails closed under `on_unknown = fail`, with an
-evidence path down to the exact site. A weak-resolution language would be unsound
-if unresolved calls read as pure; here they read as "cannot certify." Soundness
-does not depend on resolution strength — only precision does, and that is exactly
-what ty improves.
+ty resolves stdlib imports from a **vendored typeshed** it ships and materializes
+into a per-user cache; which stdlib it exposes is keyed on the target
+`python-version`. When ty is left to *infer* its target environment, that
+inference is unreliable on a headless CI runner: an un-pinned `ty server` there
+resolves `builtins` (the always-present prelude, which needs no import resolution)
+but returns **null** for imported-stdlib symbols such as `subprocess.run` — it
+never settles a stdlib search path for resolved imports. The same run resolves
+those symbols on a workstation, so the failure is environment-inference-specific,
+not a timing race (a readiness probe and retry-on-null did not fix it).
+
+The adapter removes the dependence on that inference:
+
+- It **pins ty's target** `python-version` and `python-platform` (to the
+  interpreter running the adapter) in the LSP `initialize`, via ty's
+  `initializationOptions` (`configuration.environment`, with
+  `diagnosticMode: workspace` so the whole project is indexed). These options are
+  passed at the top level of `initializationOptions`, not nested under a
+  `settings` key — ty rejects the latter as "unknown options."
+- It **warms ty's vendored typeshed** with a synchronous `ty check --project`
+  (same pinned target) before the definition batch, so the vendored stubs are
+  materialized into ty's shared cache — the same cache the LSP server serves
+  definitions from — and the batch never races an async, half-warm index.
+
+With the target pinned, `import subprocess` → `subprocess.run` resolves from
+vendored typeshed deterministically on every host, including the headless runner.
+The fixture also carries a `[tool.ty.environment]` section in its `pyproject.toml`
+so a plain `ty check` of it is deterministic too.
+
+### Sound whichever call resolves
+
+ty does not resolve everything — Python's dynamism (duck-typed receivers,
+`getattr`, decorators, dynamic import) leaves a residue, about 10.5%. This is where
+Unknown-by-default earns its keep: every unresolved call site is emitted as an
+unknown-target edge, so hinzu-core turns it into an `Unknown` that propagates up
+the call graph and fails closed under `on_unknown = fail`, with an evidence path
+down to the exact site. A weak-resolution language would be unsound if unresolved
+calls read as pure; here they read as "cannot certify." Soundness does not depend
+on resolution strength — only precision does, and that is exactly what a real type
+system improves.
 
 ### Why ty, and toward a native backend
 
@@ -144,25 +172,16 @@ The swap changes only how a call site resolves, not the schema the adapter emits
 or the shared pipeline downstream — the same design that lets Rust and TypeScript
 feed one engine.
 
-### ty in CI: default locally, non-blocking on the runner
+### ty in CI
 
-ty is the default backend everywhere the `ty` binary is present — local
-development and real use. On the headless GitHub Actions runner, though, ty's LSP
-resolves the fixture inconsistently: the same cold run that resolves
-`builtins.open` returns null for imported-stdlib symbols such as `subprocess.run`,
-deterministically, in a way that does not reproduce on a normal workstation even
-with an empty ty cache (cold, the server resolves `subprocess.run` on the first
-poll in about 50 ms). The adapter already settles on a readiness probe and retries
-nulls with backoff, but this specific runner behavior persists. Rather than gate
-the pull request on that ty-in-CI flakiness, the `py-check` job runs its live
-assertion on the deterministic Jedi fallback; the ty numbers above are from a real
-local run of the full pipeline. A non-blocking ty smoke step is deliberately *not*
-added — `continue-on-error` on a `cargo test` step is exactly what this repo's own
-`ci-continue-on-error` self-guard forbids, and dodging that guard to show a green
-ty run would be dishonest. When ty's headless-CI behavior stabilizes, the live
-assertion moves to ty. The stable Rust jobs stay backend-free regardless: their
-Python coverage is the committed sample-facts test, which runs from JSON with no ty
-or Jedi.
+The `py-check` job installs the pinned `ty==0.0.61` and runs its live fixture
+assertion on **ty** — the same backend used locally and in real use, no fallback.
+Because the adapter pins ty's target and warms the vendored typeshed, stdlib
+resolution is deterministic on the runner. The job also dumps ty resolution
+diagnostics (version, `ty check -vvv` environment/module-resolution, and the
+adapter's stderr) so a future resolution regression yields a real log rather than a
+bare failure. The stable Rust jobs stay backend-free regardless: their Python
+coverage is the committed sample-facts test, which runs from JSON with no ty.
 
 ## How the adapter maps provenance to a category
 

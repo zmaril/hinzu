@@ -12,9 +12,9 @@
 //! engine and policy as Rust and TypeScript, with no Python toolchain required —
 //! proving the shared pipeline ingests Python facts and the language-aware root
 //! seeding (`python.toml`) resolves the stdlib effects. The second test runs the
-//! live Jedi adapter and is `#[ignore]`d so it stays off the stable job; the
+//! live ty adapter and is `#[ignore]`d so it stays off the stable job; the
 //! `py-check` CI job (and a local `cargo test -- --ignored`) exercises it with
-//! Python and Jedi present.
+//! Python and the `ty` binary present.
 
 use std::path::PathBuf;
 
@@ -86,11 +86,11 @@ fn check_python_facts_reports_the_core_violations() {
     assert_fixture_violations(&out);
 }
 
-/// The live adapter path: extract facts from the Python fixture with the Jedi
+/// The live adapter path: extract facts from the Python fixture with the ty
 /// adapter, then run the full pipeline. Ignored by default so the stable Rust job
-/// (no Python/Jedi) stays green; the `py-check` job runs it.
+/// (no Python/ty) stays green; the `py-check` job runs it.
 #[test]
-#[ignore = "needs python3 and the adapter's jedi dependency"]
+#[ignore = "needs python3 and the `ty` binary"]
 fn check_python_project_end_to_end() {
     let fixture = repo_root().join("adapters/python/tests/fixture");
     let mut cmd = Command::cargo_bin("hinzu").unwrap();

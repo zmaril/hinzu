@@ -5,7 +5,7 @@
 # It is *extraction, not interpretation*. Walk every owned source file with the
 # standard-library `ast` module keeping a stack of enclosing functions (the
 # caller) and record every call, function-value reference, and ambient-env read
-# as a *site*. A resolution BACKEND then resolves each site's callee to a
+# as a *site*. The resolution BACKEND then resolves each site's callee to a
 # declaration, supplying the module + name provenance the effect roots key on.
 # Effect roots are seeded by that declaration provenance: a callee resolving to
 # `subprocess.run` seeds a `process` root, `pathlib.Path.mkdir` an `fs` root.
@@ -13,30 +13,35 @@
 # seeds a subset (fs, net, process, env, clock, random) and never invents a
 # Python-specific category. There is deliberately no `alloc` for a GC'd runtime.
 #
-# TWO BACKENDS, one classification. The AST walk, the caller attribution, the
-# reference edges, and the whole owned/effect/stdlib/third-party classification
-# are backend-independent — they run identically no matter what resolved a site.
-# The only swappable part is how a call-site position becomes a resolution:
+# ONE BACKEND: ty. The AST walk, the caller attribution, the reference edges, and
+# the whole owned/effect/stdlib/third-party classification are backend-independent
+# — they run identically no matter what resolved a site. The resolution primitive
+# is ty (Astral's Rust type checker), kept behind a seam so it can be swapped for a
+# native in-process ty backend later:
 #
-#   * ty (DEFAULT when the `ty` binary is present) — Astral's Rust type checker,
-#     driven over its LSP (`ty server`): `textDocument/definition` at each
+#   * ty — driven over its LSP (`ty server`): `textDocument/definition` at each
 #     callee token resolves the definition, whose target file (ty's vendored
 #     typeshed, or an owned/third-party module) + enclosing qualname give the
-#     provenance. A real type system resolves the un-typed `pathlib` receivers
-#     and much of the duck-typed surface Jedi cannot, so many of Jedi's Unknowns
-#     become precise `fs`/`clock`/… edges. It is an LSP/subprocess upgrade today;
-#     the intent is a native in-process ty backend behind this same seam once ty
-#     ships a stable Rust library API.
-#   * Jedi (FALLBACK, zero extra binary) — `script.goto(follow_imports=True)`,
-#     name-resolution-grade. Used when `ty` is absent, so the adapter always
-#     runs. Select explicitly with `HINZU_PY_BACKEND=jedi` (or `=ty`).
+#     provenance. A real type system resolves the un-typed `pathlib` receivers and
+#     much of the duck-typed surface a name-resolver cannot, so they become precise
+#     `fs`/`clock`/… edges. To make stdlib import resolution DETERMINISTIC on any
+#     host (including headless CI runners, where ty's environment auto-discovery is
+#     unreliable), the adapter pins ty's target `python-version` and
+#     `python-platform` explicitly in the LSP `initialize` and warms ty's vendored
+#     typeshed with a synchronous `ty check` before the batch, rather than relying
+#     on ty to infer an environment. It is an LSP/subprocess upgrade today; the
+#     intent is a native in-process ty backend behind this same seam once ty ships
+#     a stable Rust library API.
 #
-# CRITICAL soundness rule (sound-by-default via Unknown): no backend resolves
+# If the `ty` binary is absent the adapter exits nonzero with an honest message —
+# it never falls back to a weaker resolver and never fakes a resolution.
+#
+# CRITICAL soundness rule (sound-by-default via Unknown): ty does not resolve
 # every call site — duck-typed receivers, `getattr`, decorators, dynamic import.
 # An UNRESOLVED call site is emitted as an edge with `resolution: "unresolved"`,
 # so hinzu-core turns it into an `Unknown` that FAILS CLOSED under the default
 # `on_unknown = fail`. It is never silently dropped as pure — that is what keeps
-# a weak-resolution language sound, whichever backend ran.
+# a weak-resolution language sound.
 #
 # Output (stdout) is exactly the schema `hinzu_core::FactSet::from_json` ingests:
 #   { definitions: [...], edges: [...], effect_roots: [...] }
@@ -103,9 +108,9 @@ EFFECT_DOTTED = {
     "datetime.datetime.utcnow": CLOCK, "datetime.date.today": CLOCK,
 }
 
-# os.path predicates that stat the filesystem. Both Jedi and ty resolve `os.path`
-# to the platform implementation module (posixpath / ntpath / genericpath), so
-# those spellings are covered too.
+# os.path predicates that stat the filesystem. ty resolves `os.path` to the
+# platform implementation module (posixpath / ntpath / genericpath), so those
+# spellings are covered too.
 OS_PATH_FS = {
     "exists", "isfile", "isdir", "islink", "getsize", "getmtime", "getctime",
     "getatime", "realpath", "samefile",
@@ -132,8 +137,8 @@ IGNORE_DIRS = {
 
 def effect_for(full_name: str) -> str | None:
     """The effect a resolved external callee seeds, or None if it is pure. Keyed
-    on the callee's `full_name`; the resolution order mirrors python.toml. The
-    same function for both backends — ty and Jedi hand it the same dotted name."""
+    on the callee's `full_name`; the resolution order mirrors python.toml. Keyed
+    on the dotted name ty hands it, so it is backend-independent by construction."""
     if full_name in EFFECT_DOTTED:
         return EFFECT_DOTTED[full_name]
     # os.path / posixpath predicates that stat the filesystem.
@@ -164,8 +169,8 @@ class Resolution:
     """A backend-independent, normalized resolution of one call/reference site:
     the callee's dotted `full_name`, the filesystem `module_path` of the module
     that declares it (or None for a C builtin), and its `kind`
-    (`function`/`method`/`class`/…). Both the Jedi and ty backends produce this
-    same shape, so the classification downstream is one shared code path."""
+    (`function`/`method`/`class`/…). This is the seam a future native ty backend
+    would produce too, so the classification downstream is one shared code path."""
 
     __slots__ = ("full_name", "module_path", "kind")
 
@@ -618,57 +623,19 @@ class Collector(ast.NodeVisitor):
 # the effect classification — is shared and lives above.
 
 
-class JediResolver:
-    """The zero-extra-binary fallback: name-resolution-grade goto. Used when the
-    `ty` binary is absent, or forced with `HINZU_PY_BACKEND=jedi`."""
-
-    name = "jedi"
-
-    def __init__(self, adapter: Adapter):
-        self.a = adapter
-        import jedi  # noqa: PLC0415 — imported only when this backend is chosen
-
-        self.jedi = jedi
-        self.project_obj = jedi.Project(
-            str(adapter.project),
-            added_sys_path=[str(r) for r in adapter.source_roots],
-        )
-        self._scripts: dict[str, object] = {}
-
-    def describe(self) -> str:
-        return f"jedi {self.jedi.__version__}"
-
-    def _script(self, path: str, source: str):
-        if path not in self._scripts:
-            self._scripts[path] = self.jedi.Script(
-                source, path=path, project=self.project_obj
-            )
-        return self._scripts[path]
-
-    def resolve_batch(self, sources, queries):
-        results = {}
-        for key in queries:
-            file, line, col = key
-            try:
-                defs = self._script(file, sources[file]).goto(
-                    line, col, follow_imports=True, follow_builtin_imports=True
-                )
-            except Exception:  # noqa: BLE001 — Jedi raises broadly; treat as null
-                defs = []
-            if not defs:
-                results[key] = None
-                continue
-            d = defs[0]
-            mp = str(d.module_path) if d.module_path else None
-            results[key] = Resolution(d.full_name, mp, d.type)
-        return results
-
-
 class TyResolver:
-    """The default backend: Astral's ty type checker over its LSP. Opens every
-    source file, waits for the first check pass to settle, then PIPELINES a
+    """The resolution backend: Astral's ty type checker over its LSP. Warms ty's
+    vendored typeshed with a synchronous `ty check`, then opens every source file,
+    waits for the first check pass to settle, then PIPELINES a
     `textDocument/definition` at each query point and maps the target
-    (ty's vendored typeshed, or an owned/third-party module) to a Resolution."""
+    (ty's vendored typeshed, or an owned/third-party module) to a Resolution.
+
+    The target `python-version` and `python-platform` are pinned explicitly (to
+    the running interpreter's) in both the `ty check` warm-up and the LSP
+    `initialize`, so stdlib import resolution does not depend on ty's environment
+    auto-discovery — which is unreliable on headless CI runners, where an
+    un-pinned ty resolves `builtins` but returns null for imported-stdlib symbols
+    like `subprocess.run`."""
 
     name = "ty"
     BATCH = 64
@@ -678,9 +645,16 @@ class TyResolver:
         self.ty_bin = ty_bin
         self._version = "unknown"
         self._detect_version()
+        # Pin ty's target to the interpreter actually running the adapter, so its
+        # vendored-typeshed stdlib is selected deterministically on every host.
+        self.py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        self.py_platform = sys.platform  # "linux" / "darwin" / "win32"
 
     def describe(self) -> str:
-        return f"ty {self._version} (LSP)"
+        return (
+            f"ty {self._version} (LSP, python-version {self.py_version}, "
+            f"platform {self.py_platform})"
+        )
 
     @staticmethod
     def _to_utf16(source: str, line1: int, bytecol: int) -> int:
@@ -704,15 +678,59 @@ class TyResolver:
         except (OSError, subprocess.SubprocessError, IndexError):
             pass
 
+    def _warm_check(self, root: str):
+        """Warm ty's vendored typeshed and build the module graph DETERMINISTICALLY
+        with a synchronous `ty check` before the LSP batch. `ty check` resolves
+        every import to completion and materializes the vendored typeshed stubs
+        into ty's shared cache — the same cache the LSP server then serves
+        `textDocument/definition` from — so the batch never races an async,
+        half-warm index. Pinning `--python-version`/`--python-platform` to the same
+        values the LSP uses keeps the two in agreement. Best-effort: a nonzero exit
+        (a project with type errors is normal and expected) does not stop the run;
+        the resolution comes from the LSP, this only warms and diagnoses."""
+        import subprocess  # noqa: PLC0415 — only when the ty backend runs
+
+        cmd = [
+            self.ty_bin, "check", "--project", root,
+            "--python-version", self.py_version,
+            "--python-platform", self.py_platform,
+            "--exit-zero", "--output-format", "concise",
+        ]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            tail = (out.stderr or out.stdout or "").strip().splitlines()
+            sys.stderr.write(
+                f"hinzu-py: ty check warm-up exit {out.returncode}"
+                + (f" | {tail[-1]}" if tail else "")
+                + "\n"
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(f"hinzu-py: ty check warm-up skipped ({e})\n")
+
     def resolve_batch(self, sources, queries):
         from lspclient import LSP, uri  # noqa: PLC0415 — only when ty is chosen
 
         root = str(self.a.project)
+        self._warm_check(root)
         client = LSP([self.ty_bin, "server"], cwd=root)
         try:
             client.request("initialize", {
                 "processId": os.getpid(),
                 "rootUri": uri(root),
+                # Pin ty's target environment so imported-stdlib resolution does
+                # not depend on ty's environment auto-discovery (unreliable on
+                # headless runners). `diagnosticMode: workspace` makes ty index the
+                # whole project, not just open files, so cross-module definitions
+                # settle. These options are ty's LSP `initializationOptions`
+                # (GlobalOptions), passed at the top level — NOT nested under a
+                # `settings` key, which ty rejects as "unknown options".
+                "initializationOptions": {
+                    "diagnosticMode": "workspace",
+                    "configuration": {"environment": {
+                        "python-version": self.py_version,
+                        "python-platform": self.py_platform,
+                    }},
+                },
                 "capabilities": {"textDocument": {
                     "definition": {"linkSupport": True},
                     "hover": {"contentFormat": ["plaintext", "markdown"]},
@@ -839,46 +857,19 @@ class TyResolver:
 
 
 def choose_backend(adapter: Adapter):
-    """Pick the resolution backend. `HINZU_PY_BACKEND` forces `ty` or `jedi`;
-    otherwise ty when its binary is present (`HINZU_TY` overrides the path),
-    else Jedi. An honest capability edge: if the requested/only backend is
-    unavailable, fail with a message saying what is missing — never fake it."""
+    """Build the ty resolution backend, the adapter's SOLE backend. ty's binary
+    must be present (`HINZU_TY` overrides the path); if it is absent the adapter
+    exits nonzero with an honest message. There is no fallback resolver — an
+    honest capability edge, never a faked or weaker resolution."""
     ty_bin = os.environ.get("HINZU_TY") or shutil.which("ty")
-    forced = os.environ.get("HINZU_PY_BACKEND", "").strip().lower()
-
-    if forced == "ty":
-        if not ty_bin:
-            sys.stderr.write(
-                "hinzu-py: HINZU_PY_BACKEND=ty but the `ty` binary was not found "
-                "— install it (`uv tool install ty` or `pip install ty`) or set "
-                "HINZU_TY to its path\n"
-            )
-            sys.exit(3)
-        return TyResolver(adapter, ty_bin)
-    if forced == "jedi":
-        return _jedi_or_exit(adapter)
-    if forced:
+    if not ty_bin:
         sys.stderr.write(
-            f"hinzu-py: unknown HINZU_PY_BACKEND={forced!r} (use `ty` or `jedi`)\n"
-        )
-        sys.exit(2)
-
-    # Default: ty if present, else Jedi.
-    if ty_bin:
-        return TyResolver(adapter, ty_bin)
-    return _jedi_or_exit(adapter)
-
-
-def _jedi_or_exit(adapter: Adapter):
-    try:
-        return JediResolver(adapter)
-    except ImportError:
-        sys.stderr.write(
-            "hinzu-py: no resolution backend — install ty (`uv tool install ty` "
-            "or `pip install ty`, the default backend) or the `jedi` fallback "
-            "(`pip install jedi`, see adapters/python/requirements.txt)\n"
+            "hinzu-py: the `ty` binary was not found — ty is the adapter's sole "
+            "resolution backend. Install it (`uv tool install ty` or "
+            "`pip install ty`) or set HINZU_TY to its path.\n"
         )
         sys.exit(3)
+    return TyResolver(adapter, ty_bin)
 
 
 def main(argv: list[str]) -> int:

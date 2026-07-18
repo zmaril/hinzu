@@ -1,12 +1,12 @@
-# The hinzu Python adapter's resolution backends.
+# The hinzu Python adapter's resolution backend.
 #
-# The DEFAULT backend is ty (Astral's Rust type checker), driven over its LSP. It
-# is a separate binary, not a Python package dependency — install it however you
-# like: `uv tool install ty`, or `pip install ty`. When the `ty` binary is on
-# PATH the adapter uses it automatically (`HINZU_TY` overrides the path).
+# ty (Astral's Rust type checker), driven over its LSP, is the adapter's SOLE
+# resolution backend. It is a separate binary, not a Python package dependency —
+# install it however you like: `uv tool install ty`, or `pip install ty` (this
+# file). When the `ty` binary is on PATH the adapter uses it automatically
+# (`HINZU_TY` overrides the path). If `ty` is absent the adapter exits nonzero
+# with an honest message — there is no fallback resolver.
 #
-# Jedi is the zero-configuration FALLBACK, used when `ty` is absent so the adapter
-# always runs. `ast` is in the standard library. Install the fallback with:
-#   pip install -r requirements.txt
-# Force a backend with HINZU_PY_BACKEND=ty or HINZU_PY_BACKEND=jedi.
-jedi==0.20.0
+# `ast` is in the standard library, so the adapter has no Python-package
+# dependency of its own; this pin makes the backend reproducible in CI.
+ty==0.0.61
