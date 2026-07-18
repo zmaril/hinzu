@@ -8,6 +8,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- DBSP engine (`hinzu-dbsp`): the `DbspEngine` plugs into the `EffectEngine`
+  seam and propagates effects with a recursive DBSP (Feldera) circuit —
+  `effect(caller, e) :- edge(caller, callee), effect(callee, e)` over the union
+  of call and reference edges, collapsed to set semantics with `.distinct()` so
+  the fixed point terminates through call-graph cycles. Each `(function,
+  effect)` pair gets an evidence path from a shared breadth-first helper in the
+  engine core, so the path logic lives in one place. Unit tests cross-check the
+  effect sets against the reference `NaiveEngine` pair for pair.
+- StableMIR driver (`hinzu-rustc-driver`, excluded from the workspace default
+  members): a `rustc_public` custom rustc driver that walks each monomorphized
+  function's MIR, resolves call terminators with `Instance::resolve`, and emits
+  JSON facts in hinzu's `FactSet` schema — definitions, call and reference
+  edges tagged by resolution, and standard-library effect roots (`std::fs`,
+  `std::net`, `std::process`, `std::time`, `std::env`, and random). Indirect
+  function-pointer and `dyn` calls are recorded as unresolved rather than
+  faked. The crate pins its own nightly and stays off the stable build and CI.
+- Rust extraction harness in the CLI (`rust_adapter`): `hinzu check` on a cargo
+  project with no `--facts` builds the driver, runs the target's compile with
+  the driver set as `RUSTC_WORKSPACE_WRAPPER` (the clippy and miri trick),
+  merges the per-crate facts, and ingests them — real extraction replacing the
+  earlier stub. A missing nightly or driver fails with an honest message. The
+  `--facts` JSON path stays as the offline route.
+- `hinzu check --engine dbsp|naive` selects the propagation engine, defaulting
+  to `dbsp`; both produce the same effect sets, so a run is reproducible either
+  way.
+- Slice 1 findings (`notes/slice-1-findings.md`): the first end-to-end run on
+  real Rust code. On straitjacket the pipeline extracts 341 functions and 1171
+  distinct edges (99.91% statically resolved, one honest unresolved
+  function-pointer edge), finds four standard-library effect roots and eight
+  transitively effectful functions, and confirms a functional-core policy that
+  carves out the IO layer leaves the analysis core with no violations.
 - Cargo workspace scaffold: `hinzu-core` (library) and `hinzu-cli` (the
   `hinzu` binary), with an `hinzu run` placeholder command.
 - CI (fmt, clippy, test), Dependabot, CODEOWNERS, and the fleet housekeeping,
