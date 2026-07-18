@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 hinzu-core = { path = "../hinzu-core" }
 hinzu-dbsp = { path = "../hinzu-dbsp" }
+hinzu-lsp = { path = "../hinzu-lsp" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }

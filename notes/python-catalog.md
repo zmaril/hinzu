@@ -28,11 +28,12 @@ call to, which is what the adapter reads.
 - **`process`** — `subprocess` and `multiprocessing`; and the `os` process
   primitives `os.system`, `os.popen`, the `os.spawn*` and `os.exec*` families,
   `os.fork`, and `os.kill`.
-- **`env`** — reads of the ambient process environment: `os.environ` (and
-  `os.environb`), and `os.getenv` / `os.putenv` / `os.unsetenv`. The common
-  idiom is `os.environ.get(...)`, where the `.get` itself is a pure dict method,
-  so the adapter seeds the effect on the `os.environ` receiver, confirmed against
-  ty so a shadowed local `os` never misfires.
+- **`env`** — reads of the ambient process environment: `os.getenv` /
+  `os.putenv` / `os.unsetenv` (calls, which the call graph sees), and the
+  `os.environ` / `os.environb` mapping. Note that a bare `os.environ[...]` /
+  `os.environ.get(...)` read is an *attribute access*, not a call, so the
+  call-only generic extractor does not see it (see "Honest fidelity" below); the
+  `os.getenv(...)` call form is seeded normally.
 - **`clock`** — the `time` module, and the wall-clock reads of `datetime`
   (`datetime.now`, `datetime.utcnow`, `date.today`). The rest of `datetime` —
   date arithmetic, formatting — stays pure, because it is not a clock read.
@@ -65,46 +66,68 @@ caller, governs it. So `alloc` is absent for Python, exactly as it is for
 TypeScript. It is absent, not renamed: there is no `py/alloc` and no substitute
 category. Python seeds the subset above and nothing more.
 
-## The resolution backend: ty over LSP, the sole backend
+## The extraction mechanism: the generic Rust LSP adapter, over ty
 
-The adapter resolves each call site with **ty** (Astral's Rust type checker), its
-sole resolution backend, driven over its LSP behind the `FactSet` seam. The AST
-walk, the caller attribution, and the whole owned/effect/stdlib/third-party
-classification are backend-independent; the only thing the seam abstracts is how a
-call-site position becomes a declaration.
+Python is analyzed by hinzu's **generic Rust LSP extractor** (`crates/hinzu-lsp`),
+all in Rust — not a Python script. The retired `analyze.py` / `lspclient.py` pair
+is replaced by a synchronous Rust LSP client plus a language-agnostic extractor
+parameterized by a per-language config
+(`crates/hinzu-lsp/configs/python.toml`): the ty server command, file globs, ty's
+`initializationOptions`, the provenance rules, and (loaded from this very
+`python.toml`) the effect map. **ty** (Astral's Rust type checker) is the sole
+resolution backend; the only non-Rust artifact on the whole path is the external
+`ty` binary the client spawns.
 
-The adapter spawns `ty server`, opens every source file, settles the first check
-pass, then pipelines a `textDocument/definition` request at each callee token. The
-definition's target — a file in ty's vendored typeshed, or an owned or third-party
-module — plus the enclosing qualname at the target give the provenance the effect
-roots key on. Because ty is a real type system it resolves the un-typed `pathlib`
-receivers and much of the duck-typed surface a name-resolver cannot.
+The extractor spawns `ty server`, opens every source file, settles the first check
+pass (plus a ready-probe on `subprocess.run` so resolution does not race cold
+start), then: `documentSymbol` per file → definitions; `prepareCallHierarchy` +
+`callHierarchy/outgoingCalls` per definition → a real, type-resolved call graph.
+An external callee's defining-file uri gives the provenance the effect roots key
+on, and its class-qualified name (`pathlib::Path.is_file`) is reconstructed from
+the target file's own `documentSymbol`. Because ty is a real type system it
+resolves the un-typed `pathlib` receivers and the `self.api()` method dispatch a
+name-resolver cannot.
 
-There is **no fallback resolver**. If the `ty` binary is absent the adapter exits
-nonzero with an honest message; it never silently degrades to a weaker resolver
-and never fakes a resolution. `HINZU_TY` overrides the ty binary path.
+There is **no fallback resolver**. If the `ty` binary is absent the run exits
+nonzero with an honest message; it never silently degrades and never fakes a
+resolution. `HINZU_TY` overrides the ty binary path; `HINZU_PY_VERSION` pins ty's
+target Python version (default `3.11`).
 
-### What ty buys, measured on housekeeping
+### Honest fidelity: call-only
 
-Running the full pipeline over `housekeeping` (a pure-Python fleet auditor, 82
-files, 486 definitions, 2,449 call sites) with an illustrative functional-core
-policy:
+`callHierarchy/outgoingCalls` reports only the calls ty resolved, so the generic
+extractor is **call-only**: unlike the old AST walk it does not see three things —
+higher-order `reference` edges (a function passed as a value/callback/decorator),
+an ambient attribute read such as `os.environ`, and a call site ty could not
+resolve at all. All three need a language body walk, deferred to a future
+language-agnostic tree-sitter rung (also Rust). Unknown-by-default over the calls
+it *does* resolve keeps the result sound — a resolved call into an unvouched
+third-party package is an `Unknown` that fails closed, never a silent pure.
 
-| | ty |
-| --- | --- |
-| call sites resolved | **89.5% (2,192)** |
-| unresolved (Unknown) call sites | **257** |
-| `fs`-effect call edges | **117** |
-| effect roots | 22 |
-| forbidden-effect violations | **20 (6 fs, 14 process)** |
-| `cannot certify` (Unknown) findings | **86** |
+### Measured on housekeeping (before → after)
 
-Because ty is a real type system, un-typed `pathlib` chains like
-`(ctx.workdir / "src-tauri").is_dir()` and `p.parent.mkdir()` — which a
-name-resolver leaves unresolved — resolve to real `pathlib::Path.is_dir` /
-`pathlib::Path.mkdir` `fs` roots, so they become precise `forbids fs` findings in
-the core rather than "cannot certify." That is why `fs` coverage reaches 117 call
-edges. The whole run stays well under two seconds with request pipelining.
+Running the shared pipeline over `housekeeping` (a pure-Python fleet auditor, 82
+files) with the same illustrative functional-core policy, old script vs new
+extractor:
+
+| | old `analyze.py` (AST + ty-definition) | new Rust LSP adapter (callHierarchy) |
+| --- | --- | --- |
+| definitions | 486 | 471 (`__init__`, which ty's documentSymbol omits — mostly ignored `tests/`) |
+| forbidden-effect violations | **20 (6 fs, 14 process)** | **20 (6 fs, 14 process)** — exact, identical evidence paths |
+| `fs`-effect call edges | 117 | 114 |
+| effect roots | 22 (fs 11, clock 3, net 6, env 1, process 1) | 21 — identical but for `env 1` (`os::environ`, an ambient read) |
+| `cannot certify` (Unknown) findings | 86 | 41 |
+
+The **20 forbidden-effect violations match exactly**, with identical evidence
+paths — the process/fs leaks flow through resolved calls, which call hierarchy
+captures well (ty resolves the `self.api()` → `run` → `subprocess.run` chain). Un-typed
+`pathlib` chains like `(ctx.workdir / "src-tauri").is_dir()` and
+`p.parent.mkdir()` resolve to precise `pathlib::Path.is_dir` / `pathlib::Path.mkdir`
+`fs` roots, so `fs` coverage stays at 114 edges. The `Unknown` count drops (86 →
+41) because the old adapter emitted an `Unknown` for every one of its ~257
+unresolved call sites, which the call-only driver does not enumerate; it flags an
+`Unknown` only for a *resolved* call into an unvouched package. The whole run stays
+around five seconds.
 
 ### Recognizing every stdlib target (the headless-runner fix)
 
@@ -115,48 +138,46 @@ notably a headless GitHub Actions runner — ty resolves `import subprocess` to 
 interpreter's **real stdlib source** (`.../lib/python3.11/subprocess.py`) instead.
 Both are the standard library; ty picks one per host.
 
-The adapter reconstructs a callee's provenance from that definition *target file*.
-Its `module_of_target` originally recognized only two external shapes — ty's
-vendored typeshed and installed `site-packages` — and classified anything else,
-including a real-stdlib source path, as an unknown `OTHER`. So on the runner
-`subprocess.run` resolved to `.../lib/python3.11/subprocess.py`, fell into `OTHER`,
-and was emitted as an **unresolved** edge that fails closed as `Unknown` — while
-`builtins.open` (a C builtin with no real source module, always resolved to the
-vendored `builtins.pyi`) classified fine. That asymmetry — `builtins.open` resolves
-but `subprocess.run` does not — read like ty "returning null for imported-stdlib,"
-but it was a provenance-classification gap in the adapter, not a ty failure; ty
-resolved the symbol correctly, just to a path the adapter did not recognize. It did
-not reproduce on a workstation because there ty resolved the same import to its
-vendored typeshed, which the adapter already recognized.
+The extractor reconstructs a callee's provenance from that definition *target
+file* via the config's provenance rules (`crates/hinzu-lsp/configs/python.toml`,
+`[[provenance]]`). Those rules recognize four external shapes — ty's vendored
+typeshed stdlib, its vendored third-party stubs, installed `site-packages`, and a
+real CPython stdlib path — the last being the headless-runner fix, ported from the
+old adapter's `module_of_target`:
 
-The fix classifies **any** stdlib target as STDLIB:
+- a real CPython stdlib path — a `.../pythonX.Y/<module>.pyi?` file that is not
+  under `site-packages` / `dist-packages` — classifies as **stdlib**
+  (`.../python3.11/subprocess.py` → `subprocess`), alongside the vendored-typeshed
+  and site-packages shapes.
 
-- `module_of_target` now recognizes a real CPython stdlib path — a
-  `.../pythonX.Y/<module>.pyi?` file that is not under `site-packages` /
-  `dist-packages` — as STDLIB (`.../python3.11/subprocess.py` → `subprocess`),
-  alongside the vendored-typeshed and site-packages shapes it already handled.
+Without it, on the runner `subprocess.run` resolves to
+`.../lib/python3.11/subprocess.py`, which — if unrecognized — would fall through to
+`Unknown` while `builtins.open` (a C builtin always resolved to the vendored
+`builtins.pyi`) classified fine. The rule closes that asymmetry, and it did not
+reproduce on a workstation because there ty resolves the same import to its
+vendored typeshed.
 
-The adapter also **pins ty's target** `python-version` and `python-platform` (to
-the interpreter running the adapter) in the LSP `initialize`, via ty's
-`initializationOptions` (`configuration.environment`, with
-`diagnosticMode: workspace` so the whole project is indexed), so the stdlib
-typeshed is selected deterministically rather than by ty's environment inference.
-These options are passed at the top level of `initializationOptions`, not nested
-under a `settings` key — ty rejects the latter as "unknown options." The fixture
-also carries a `[tool.ty.environment]` section in its `pyproject.toml` so a plain
-`ty check` of it is deterministic too.
+The extractor also **pins ty's target** `python-version` and `python-platform` in
+the LSP `initialize`, via the config's `[init_options]`
+(`configuration.environment`, with `diagnosticMode = workspace` so the whole
+project is indexed), so the stdlib typeshed is selected deterministically rather
+than by ty's environment inference. These options are passed at the top level of
+`initializationOptions`, not nested under a `settings` key — ty rejects the latter
+as "unknown options." The fixture also carries a `[tool.ty.environment]` section in
+its `pyproject.toml` so a plain `ty check` of it is deterministic too.
 
-### Sound whichever call resolves
+### Sound over what it resolves
 
-ty does not resolve everything — Python's dynamism (duck-typed receivers,
-`getattr`, decorators, dynamic import) leaves a residue, about 10.5%. This is where
-Unknown-by-default earns its keep: every unresolved call site is emitted as an
-unknown-target edge, so hinzu-core turns it into an `Unknown` that propagates up
-the call graph and fails closed under `on_unknown = fail`, with an evidence path
-down to the exact site. A weak-resolution language would be unsound if unresolved
-calls read as pure; here they read as "cannot certify." Soundness does not depend
-on resolution strength — only precision does, and that is exactly what a real type
-system improves.
+Because the extractor is call-only, its `Unknown` set is narrower than the old AST
+adapter's: it flags an `Unknown` for a *resolved* call into a third-party package
+the analyzer cannot see through, but it cannot enumerate a call site ty failed to
+resolve (that needs a body walk — the deferred tree-sitter rung). Over the calls it
+does see, Unknown-by-default holds: a resolved third-party call becomes an edge to a
+`<package>::<member>` symbol with no effect root, so hinzu-core turns it into an
+`Unknown` that propagates up the call graph and fails closed under
+`on_unknown = fail`, with an evidence path down to the exact package. A resolved
+call is never read as false-pure — it reads as "cannot certify" until a `[trust]`
+line vouches for the package.
 
 ### Why ty, and toward a native backend
 
@@ -185,21 +206,22 @@ feed one engine.
 ### ty in CI
 
 The `py-check` job installs the pinned `ty==0.0.61` and runs its live fixture
-assertion on **ty** — the same backend used locally and in real use, no fallback.
-Because the adapter recognizes every stdlib target shape and pins ty's target,
-stdlib resolution is deterministic on the runner. The job also dumps ty resolution
-diagnostics (version, `ty check -vvv` environment/module-resolution, and a
-`textDocument/definition` probe of `subprocess.run` vs `open` with the ty server's
-own logs) so a future resolution regression yields a real log rather than a bare
+assertion by driving the **all-Rust** extractor over ty — the same backend used
+locally and in real use, no fallback. Because the provenance rules recognize every
+stdlib target shape and the extractor pins ty's target, stdlib resolution is
+deterministic on the runner. The job also dumps diagnostics (ty version, a
+`ty check -vvv` environment/module-resolution grep, and an all-Rust
+`HINZU_LSP_DEBUG` dry run of the extractor over the fixture with its stderr
+summary) so a future resolution regression yields a real log rather than a bare
 failure. The stable Rust jobs stay backend-free regardless: their Python coverage
 is the committed sample-facts test, which runs from JSON with no ty.
 
-## How the adapter maps provenance to a category
+## How the extractor maps provenance to a category
 
-The adapter (`adapters/python/analyze.py`) resolves each call with the chosen
-backend and reads the callee's `full_name` and module path (for ty, reconstructed
-from the definition target file and its enclosing qualname). A call into an owned
-source file becomes a normal call edge; its effects propagate through its own body.
+The extractor (`crates/hinzu-lsp`) reconstructs each external callee's canonical
+symbol from its definition target file and its enclosing (class-)qualname. A call
+into an owned source file becomes a normal call edge; its effects propagate through
+its own body.
 A call into one of the built-ins above becomes an effect root, seeded by that
 declaration provenance and emitted with a canonical `::`-segmented symbol
 (`subprocess::run`, `builtins::open`, `pathlib::Path.mkdir`) — the same shape

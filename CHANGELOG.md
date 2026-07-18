@@ -8,6 +8,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A generic, all-Rust LSP-driven fact extractor (`crates/hinzu-lsp`) — hinzu's
+  new baseline extraction mechanism.** A synchronous Rust LSP client (the port of
+  the retired `lspclient.py`) plus a language-agnostic extractor parameterized
+  entirely by a per-language config (server command, file globs, the server's
+  `initializationOptions`, provenance rules, and the effect map). It drives any
+  server that speaks `documentSymbol` + `callHierarchy` and emits hinzu's
+  `FactSet` in-process — no per-language parser, no script subprocess, no JSON
+  round-trip. The pipeline (ported from the Go/gopls spike): `documentSymbol` →
+  definitions; `prepareCallHierarchy` + `callHierarchy/outgoingCalls` →
+  caller→callee `call` edges (a local callee mapped by source location); each
+  external callee's defining-file uri → provenance → effect, its class-qualified
+  name reconstructed from the target file's own `documentSymbol`. Adding a
+  language is a new config file plus its provenance/effect rows, not new code — a
+  Go config stub ships beside the Python one to keep that seam honest.
+
+### Changed
+
+- **Python is now analyzed all-in-Rust, over ty's LSP** — the out-of-process
+  `analyze.py` / `lspclient.py` script adapter is **retired and deleted** (along
+  with its `requirements.txt` / `pyproject.toml`). Its AST walk, caller
+  attribution, and ty-over-LSP resolution are now the generic Rust extractor
+  above, driven by `crates/hinzu-lsp/configs/python.toml` plus the shipped
+  `python.toml` effect map (one source of truth). ty (Astral's Rust type checker)
+  remains the sole resolution backend — spawned by the Rust client, the only
+  non-Rust artifact on the path; a missing `ty` is still an honest nonzero
+  failure. `HINZU_TY` overrides the binary, `HINZU_PY_VERSION` pins ty's target
+  version (default `3.11`). The real-CPython-stdlib provenance fix and the
+  class-qualified symbol reconstruction (`pathlib::Path.is_file`) are ported into
+  the config/extractor. On `housekeeping` the new extractor reproduces the **20
+  forbidden-effect violations (6 fs, 14 process) exactly, with identical evidence
+  paths**; effect roots match but for `os::environ` (an ambient read), and `fs`
+  coverage holds at 114 edges. **Honest fidelity note:** the generic extractor is
+  **call-only** — `callHierarchy` drops higher-order `reference` edges, ambient
+  attribute reads (`os.environ`), and call sites the server could not resolve
+  (so `Unknown` findings fall 86 → 41). Those need a body walk, deferred to a
+  future language-agnostic tree-sitter rung (also Rust); unknown-by-default over
+  resolved calls keeps it sound. The native StableMIR driver stays hinzu's
+  Rust-precision path.
+
 - Python adapter — **ty as the sole resolution backend** (no fallback). The
   adapter resolves call sites with **ty** (Astral's Rust type checker), driven
   over its **LSP** (`ty server`, stdio JSON-RPC): it opens every source file,

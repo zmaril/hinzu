@@ -1,0 +1,32 @@
+# A Go config STUB for hinzu's generic LSP extractor — proof that a new language
+# is a new config, not new extractor code. It is NOT wired into `hinzu check`
+# routing (a separate decision), but it parses and carries a real gopls
+# provenance ruleset, so the seam the Python config exercises is honestly generic.
+#
+# Go over gopls was the spike that proved `callHierarchy/outgoingCalls` yields
+# caller->callee edges with no per-language parser (100% function coverage on a
+# real Go repo). Wiring it on would add: a Go effect-map annotation table (the
+# `os/exec -> process`, `net/http -> net`, `os::Getenv -> env` rows), a
+# `hinzu check` routing row for `go.mod`, and a CI job with gopls — all config and
+# glue, no extractor change.
+
+language_id = "go"
+server_cmd = ["gopls", "serve"]
+file_globs = ["**/*.go"]
+exclude_dirs = [".git", "vendor", "testdata"]
+exclude_suffixes = ["_test.go"]
+
+# gopls needs no special initializationOptions for this extraction.
+[init_options]
+
+# The Go toolchain's standard library, under GOROOT's `src`.
+[[provenance]]
+regex = '/go(?:/[0-9.]+)?/src/(.+)/[^/]+\.go$'
+package = '$1'
+origin = 'stdlib'
+
+# A module dependency in the Go module cache: `.../pkg/mod/<module>@<ver>/...`.
+[[provenance]]
+regex = '/pkg/mod/(.+?)@[^/]+((?:/.+?)?)/[^/]+\.go$'
+package = '$1$2'
+origin = 'module'

@@ -13,9 +13,9 @@
 # exception), so it is declared per project with a `[trust]` line rather than
 # shipped here.
 #
-# The Python adapter (`adapters/python/analyze.py`) resolves each callee by
-# declaration provenance — with ty (Astral's type checker, over its LSP), its
-# sole resolution backend — and emits a canonical
+# The Python path (hinzu's generic Rust LSP extractor, `crates/hinzu-lsp`, driving
+# ty — Astral's type checker — over its LSP as the sole resolution backend)
+# resolves each callee by declaration provenance and emits a canonical
 # `::`-segmented symbol for every no-body external it sees: `subprocess::run`
 # for a stdlib call,
 # `builtins::open` for the ambient `open`, `pathlib::Path.mkdir` for a resolved
