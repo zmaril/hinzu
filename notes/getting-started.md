@@ -47,7 +47,7 @@ The minimum that supports effect propagation and matches design.md's "normalize 
 - **SymbolId** — a stable, structured string in the SCIP symbol style (package/crate + version + descriptor path). This *is* the design's "stable identity that survives repeated analysis"; SCIP gives it to us for Rust directly, and we synthesize the same shape for TS from the declaration's package + module + descriptor.
 - **Edge** — `{ caller: SymbolId, callee: SymbolId, kind: Call | Reference, evidence: (file, line) }`.
 - **EffectRoot** — `{ symbol: SymbolId (or prefix pattern), effect: Effect }`. The per-language seed lists.
-- **Effect** — the closed category set: `Fs, Net, Db, Clock, Random, Process, Env`.
+- **Effect** — the category set: `Fs, Net, Db, Clock, Random, Process, Env, Alloc` (heap allocation), plus `Unknown` — not a real-world effect but an uncertainty marker that propagates like one (see "Unknown and trusted external summaries" below).
 - **Confidence** (design's trust model) — `Proven | Inferred | Assumed | Unknown`, attached to edges/summaries so a policy can set a threshold. v0 marks compiler-resolved edges `Proven` and unresolved-dispatch approximations `Assumed`.
 
 Derived by the engine:
@@ -89,6 +89,7 @@ External to source, region-based, matching design.md's policy section (architect
 [analysis]
 confidence_threshold = "inferred"     # ignore findings weaker than this
 ignore = ["**/tests/**", "**/*.test.ts"]
+on_unknown = "fail"                   # unseen external => cannot certify (default)
 
 # The functional core: no I/O effects, however deep the call chain.
 [region.core]
@@ -98,14 +99,31 @@ forbid = ["fs", "net", "db", "process"]
 # Where effects are allowed to live.
 [region.adapters]
 paths = ["crates/*/src/adapters/**", "crates/*-cli/src/**"]
-allow = ["fs", "net", "process", "env"]
+allow = ["fs", "net", "process", "env", "alloc"]
 
 [trust]
-# Treat these unresolved externals as pure, on the maintainer's word.
-assume_pure = ["log::*", "tracing::*"]
+# Vouch for externals the analyzer cannot see through, on the maintainer's word.
+"log" = "pure"
+"tracing" = "pure"
+"rusqlite" = ["db"]
 ```
 
 A callable **violates** policy when it sits in a region, that region forbids effect *E*, and its EffectSummary contains *E* at or above the confidence threshold. The report prints the callable, the forbidden effect, and the evidence path to the root — "why," per design.md's "explain every conclusion."
+
+## Unknown and trusted external summaries
+
+The call graph stops at the edge of what the analyzer compiled. A call into a registry dependency, or an indirect call through a function pointer or `dyn` object, has no body to walk. Reading such a call as pure is the unsound choice: the code on the other side could touch anything.
+
+So an unseen callee that nothing accounts for becomes **Unknown** — the fourth confidence level made to propagate. It rides the same machinery as a real effect: it seeds a root at the offending callee, flows up the call graph, and carries an evidence path. Two shapes become Unknown: a foreign, no-body callee that no rule resolved (unknown effect), and an indirect call the driver could not resolve (unknown target). `hinzu check` fails on Unknown by default; `[analysis] on_unknown` can lower that to `warn` or `ignore`.
+
+Each callee resolves in a fixed order — the first rule that matches wins:
+
+1. an explicit `[trust]` pure vouch,
+2. an effect rule (`[roots]`, `[trust]` with effects, or the built-in table),
+3. the trusted-pure baseline — the standard library, and calls through a standard-library trait,
+4. otherwise Unknown.
+
+hinzu ships a built-in annotation set (`crates/hinzu-core/annotations/std.toml`) for the standard library: its I/O surface as effect roots, its allocating APIs as `alloc` roots, and the genuinely-pure remainder left to the baseline. A project clears its own externals in `hinzu.toml`: `"serde" = "pure"` vouches a crate effect-free, `"rusqlite" = ["db"]` declares the effects it does carry. This is the design's "trusted external summaries," stated outside the source so the trust list is explicit and auditable — and the way to turn an Unknown into a certified boundary is to add one honest line, not to weaken the check.
 
 ## Slice plan
 

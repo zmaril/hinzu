@@ -16,6 +16,7 @@ use anyhow::Result;
 pub mod effects;
 pub mod facts;
 pub mod policy;
+pub mod roots;
 pub mod store;
 
 /// Shared builders for the unit tests across the engine's modules, kept in one
@@ -84,9 +85,13 @@ pub fn check_facts(
 
     let violations = check(&facts, &summaries, policy);
     let report = format_report("hinzu effect analysis", &facts, &summaries, &violations)?;
+    // Only errors fail the run. `on_unknown = "warn"` produces reported-but-
+    // non-failing warnings, so the count that drives the exit code is the
+    // number of error-severity findings.
+    let errors = violations.iter().filter(|v| v.is_error()).count();
     Ok(CheckOutcome {
         report,
-        violations: violations.len(),
+        violations: errors,
     })
 }
 
@@ -116,23 +121,54 @@ fn format_report(
     }
 
     writeln!(out)?;
-    if violations.is_empty() {
+    let errors: Vec<&policy::Violation> = violations.iter().filter(|v| v.is_error()).collect();
+    let warnings: Vec<&policy::Violation> = violations.iter().filter(|v| !v.is_error()).collect();
+
+    if errors.is_empty() {
         writeln!(out, "policy: no violations")?;
     } else {
-        writeln!(out, "policy violations ({}):", violations.len())?;
-        for v in violations {
-            writeln!(
-                out,
-                "  {} forbids {} in region '{}': {}",
-                v.display,
-                v.effect.as_str(),
-                v.region,
-                v.evidence.join(" -> "),
-            )?;
+        writeln!(out, "policy violations ({}):", errors.len())?;
+        for v in &errors {
+            writeln!(out, "  {}", describe_violation(v))?;
+        }
+    }
+    if !warnings.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "warnings ({}):", warnings.len())?;
+        for v in &warnings {
+            writeln!(out, "  {}", describe_violation(v))?;
         }
     }
 
     Ok(out)
+}
+
+/// One line describing a finding, distinguishing a forbidden-effect violation
+/// from an unknown-external one so the two never read the same.
+fn describe_violation(v: &policy::Violation) -> String {
+    use policy::{Finding, UnknownFlavor};
+    match &v.finding {
+        Finding::ForbiddenEffect => format!(
+            "{} forbids {} in region '{}': {}",
+            v.display,
+            v.effect.as_str(),
+            v.region,
+            v.evidence.join(" -> "),
+        ),
+        Finding::Unknown { callee, flavor } => {
+            let what = match flavor {
+                UnknownFlavor::Effect => format!("unknown external `{callee}`"),
+                UnknownFlavor::Target => "an unresolved call target".to_string(),
+            };
+            format!(
+                "{} cannot certify in region '{}': reaches {} — {}",
+                v.display,
+                v.region,
+                what,
+                v.evidence.join(" -> "),
+            )
+        }
+    }
 }
 
 /// The synthetic scenario: `handle_request` (in the functional core) calls
@@ -244,5 +280,48 @@ mod tests {
         // parse_config is pure.
         let parse = summaries.get("crate::core::parse_config").cloned();
         assert!(parse.map(|s| s.effects.is_empty()).unwrap_or(true));
+    }
+
+    /// The performance use case: a region that forbids `alloc` flags a function
+    /// that pushes onto a `Vec`, with the evidence path down to the allocation.
+    #[test]
+    fn alloc_forbidding_region_flags_a_vec_push() {
+        use crate::roots::RootSeeds;
+
+        let mut facts = FactSet::default();
+        facts.add_def(Definition {
+            id: "app::hot_loop".to_string(),
+            display: "hot_loop".to_string(),
+            language: Language::Rust,
+            file: "src/hot.rs".to_string(),
+            line_start: 1,
+            line_end: 4,
+        });
+        // The call the driver emits for `v.push(i)` — a no-body std leaf.
+        facts.add_edge(Edge::call(
+            "app::hot_loop",
+            "std::vec::Vec::<usize>::push",
+            "src/hot.rs",
+            2,
+        ));
+        // Seed roots from the shipped std annotations: Vec::push -> alloc.
+        RootSeeds::default().seed(&mut facts);
+
+        let summaries = NaiveEngine.propagate(&facts);
+        assert!(summaries["app::hot_loop"].effects.contains(&Effect::Alloc));
+
+        let policy =
+            Policy::from_toml("[region.hot]\npaths = [\"src/**\"]\nforbid = [\"alloc\"]\n")
+                .unwrap();
+        let violations = check(&facts, &summaries, &policy);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].effect, Effect::Alloc);
+        assert_eq!(
+            violations[0].evidence,
+            vec![
+                "app::hot_loop".to_string(),
+                "std::vec::Vec::<usize>::push".to_string(),
+            ]
+        );
     }
 }

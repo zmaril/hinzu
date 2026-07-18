@@ -1,9 +1,10 @@
 # hinzu's own functional-core policy, and a worked example of the format.
 #
-# Effects — filesystem, network, database, subprocess, ambient environment — are
-# allowed only where they belong: the CLI and the adapter layer. The engine core
-# stays pure, however deep the call chain. `hinzu check` reports any core
-# callable that can reach a forbidden effect, with the evidence path to the root.
+# Effects — filesystem, network, database, subprocess, ambient environment,
+# heap allocation — are allowed only where they belong: the CLI and the adapter
+# layer. The engine core stays pure, however deep the call chain. `hinzu check`
+# reports any core callable that can reach a forbidden effect, with the evidence
+# path to the root.
 
 [analysis]
 # Ignore weaker-than-this findings once confidence grading lands (parsed now,
@@ -11,7 +12,15 @@
 confidence_threshold = "inferred"
 ignore = ["**/tests/**"]
 
-# The functional core: no effects, however deep the call chain.
+# What to do when a callable reaches an external the analysis cannot see through
+# (a foreign no-body callee nothing vouched for, or an unresolved indirect
+# call): "fail" (default) — cannot certify, exit nonzero; "warn" — report but
+# pass; "ignore" — treat as pure (the old, unsound behavior).
+on_unknown = "fail"
+
+# The functional core: no effects, however deep the call chain. `alloc` is not
+# forbidden here — most code allocates, and that is fine; see [region.hot] below
+# for a policy that does forbid it.
 [region.core]
 paths  = ["crates/*/src/**"]
 forbid = ["fs", "net", "db", "process"]
@@ -19,9 +28,31 @@ forbid = ["fs", "net", "db", "process"]
 # The adapter layer — where extraction touches the outside world.
 [region.adapters]
 paths = ["crates/*/src/adapters/**"]
-allow = ["fs", "net", "db", "process", "env"]
+allow = ["fs", "net", "db", "process", "env", "alloc"]
 
 # The CLI shell — argv in, effects out.
 [region.cli]
 paths = ["crates/*-cli/src/**"]
-allow = ["fs", "net", "db", "process", "env"]
+allow = ["fs", "net", "db", "process", "env", "alloc"]
+
+# A performance-sensitive region can forbid heap allocation. hinzu ships effect
+# annotations for the allocating standard-library APIs (Vec::push, Box::new,
+# String growth, format!, .collect(), Rc/Arc::new, map/set inserts), so a
+# function on a hot path that allocates is flagged with the evidence path down
+# to the allocating call — for example `render -> Vec::push`. (Illustrative: no
+# `hot/` tree exists in this repo yet.)
+[region.hot]
+paths  = ["crates/*/src/hot/**"]
+forbid = ["alloc"]
+
+# Trusted external summaries: vouch for a registry dependency the analyzer never
+# sees the body of. "pure" clears its calls (no effect); a list declares the
+# effects it does carry. These extend hinzu's built-in std/core/alloc defaults.
+[trust]
+"serde" = "pure"
+"serde_json" = "pure"
+"toml" = "pure"
+"anyhow" = "pure"
+"glob" = "pure"
+# rusqlite carries the database effect (also covered by the built-in default).
+"rusqlite" = ["db"]

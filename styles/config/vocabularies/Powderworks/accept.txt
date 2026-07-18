@@ -27,6 +27,7 @@ stack-graphs
 nvim-treesitter
 rust-analyzer
 rusqlite
+libsqlite3_sys
 ts-morph
 cpd-finder
 tokio
@@ -52,3 +53,8 @@ execSync
 buildSystemPrompt
 pi.dev
 earendil
+serde
+serde_json
+anyhow
+turbofish
+UFCS

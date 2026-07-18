@@ -219,6 +219,21 @@ mod tests {
     }
 
     #[test]
+    fn unknown_propagates_like_an_effect() {
+        // An `Unknown` root must flow up the graph and match the reference
+        // engine, so `on_unknown` fires the same way under either engine.
+        let mut facts = FactSet::default();
+        facts.add_edge(Edge::call("caller", "serde_json::from_str", "x.rs", 1));
+        facts.add_root(EffectRoot {
+            symbol: "serde_json::from_str".to_string(),
+            effect: Effect::Unknown,
+        });
+        assert_same_effect_sets(&facts);
+        let dbsp = DbspEngine.propagate(&facts);
+        assert!(dbsp["caller"].effects.contains(&Effect::Unknown));
+    }
+
+    #[test]
     fn cycle_terminates_and_matches_naive() {
         // a <-> b, a -> root
         let mut facts = FactSet::default();

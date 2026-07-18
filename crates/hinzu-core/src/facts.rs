@@ -43,8 +43,19 @@ impl FromStr for Language {
     }
 }
 
-/// The closed set of effect categories. An operation either belongs to one of
-/// these or is pure.
+/// The closed set of effect categories, plus [`Effect::Unknown`] — the honest
+/// marker for "we could not tell." An operation either belongs to one of the
+/// seven real categories, is `Unknown`, or is pure.
+///
+/// `Unknown` is not a real-world effect: it is uncertainty made first-class, so
+/// that an unseen external call (a foreign callee with no body, or an
+/// unresolved indirect call) *propagates* up the call graph exactly like an
+/// effect instead of being silently read as pure. It rides the same
+/// root-seeding, propagation, evidence-path, and store machinery as the real
+/// effects; the policy check treats it specially, governed by
+/// `[analysis] on_unknown` rather than by a region's forbid/allow list. Because
+/// `Unknown` is never a real effect, it is excluded from a region's effect
+/// vocabulary — see [`Effect::REAL`] and the policy parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effect {
@@ -55,9 +66,34 @@ pub enum Effect {
     Random,
     Process,
     Env,
+    /// Heap allocation — the "may allocate" effect. `Vec::push`, `Box::new`,
+    /// `String` growth, collection inserts, `format!`, `.collect()`, `Rc`/`Arc`
+    /// construction. Tracked like any other effect so a performance-sensitive
+    /// region can forbid it; over-approximate on purpose (an API that *may*
+    /// allocate is marked, even if a given call does not).
+    Alloc,
+    /// "We could not tell." An unseen external call that no annotation, root, or
+    /// trusted-pure baseline resolved — carried up the graph so a policy can
+    /// refuse to certify anything that reaches it.
+    Unknown,
 }
 
 impl Effect {
+    /// The real effect categories — the vocabulary a policy region may forbid or
+    /// allow. Deliberately excludes [`Effect::Unknown`], which is an uncertainty
+    /// marker governed by `[analysis] on_unknown`, not a category a region can
+    /// name.
+    pub const REAL: [Effect; 8] = [
+        Effect::Fs,
+        Effect::Net,
+        Effect::Db,
+        Effect::Clock,
+        Effect::Random,
+        Effect::Process,
+        Effect::Env,
+        Effect::Alloc,
+    ];
+
     /// The lowercase policy-file spelling of this effect.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -68,6 +104,8 @@ impl Effect {
             Effect::Random => "random",
             Effect::Process => "process",
             Effect::Env => "env",
+            Effect::Alloc => "alloc",
+            Effect::Unknown => "unknown",
         }
     }
 }
@@ -76,6 +114,9 @@ impl FromStr for Effect {
     type Err = anyhow::Error;
 
     /// Parse the policy-file / store spelling back into an effect category.
+    /// Accepts `"unknown"` so derived summaries round-trip through the store;
+    /// region and root parsing reject it separately (it is not a category a
+    /// policy can name — see [`Effect::REAL`]).
     fn from_str(s: &str) -> anyhow::Result<Self> {
         match s {
             "fs" => Ok(Effect::Fs),
@@ -85,6 +126,8 @@ impl FromStr for Effect {
             "random" => Ok(Effect::Random),
             "process" => Ok(Effect::Process),
             "env" => Ok(Effect::Env),
+            "alloc" => Ok(Effect::Alloc),
+            "unknown" => Ok(Effect::Unknown),
             other => anyhow::bail!("unknown effect: {other}"),
         }
     }

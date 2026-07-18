@@ -1,0 +1,99 @@
+# hinzu's built-in effect annotations — the first shipped library annotation
+# set. These are loaded as defaults; a project's own `hinzu.toml` `[roots]` /
+# `[trust]` sections override or extend them (a rule with the same prefix wins,
+# a new prefix is added).
+#
+# This is a "trusted external summary" table: the standard library and a few
+# common crates have no body the analyzer can walk, so hinzu ships honest
+# effect labels for them here rather than pretending the calls are pure.
+#
+# Matching runs on the callee's monomorphized path with generic arguments
+# stripped, as a substring — so `"std::fs::"` catches `std::fs::read_to_string`
+# and `"Vec::push"` catches `std::vec::Vec::<usize>::push`. The genuinely-pure
+# rest of the standard library (arithmetic, slices, comparisons, iterator
+# adapters) is handled by the built-in trusted-pure baseline, not listed here.
+#
+# The model is deliberately over-approximate: an API that *may* allocate or
+# perform I/O is labelled with that effect even when a particular call might
+# not. A false "pure" is the expensive error for a functional-core policy.
+#
+# This set is curated and best-effort. It covers the standard library's I/O
+# surface and its most common allocating APIs; extend it in your own
+# `hinzu.toml` when your code reaches an unlisted no-body leaf and hinzu reports
+# it as Unknown.
+
+[roots]
+
+# --- I/O effects: standard-library operations that ARE an effect -------------
+"std::fs::" = "fs"
+"std::net::" = "net"
+"std::os::unix::net::" = "net"
+"std::process::" = "process"
+"std::time::" = "clock"
+"std::env::" = "env"
+
+# --- common effectful crates (no body to walk) -------------------------------
+"rand::" = "random"
+"rand_core::" = "random"
+"tokio::net" = "net"
+"mio::" = "net"
+"socket2::" = "net"
+# hinzu's own fact store reaches the database through rusqlite, which links the
+# bundled libsqlite3_sys C library.
+"rusqlite::" = "db"
+"libsqlite3_sys::" = "db"
+
+# --- heap allocation: "may allocate" -----------------------------------------
+# Matching is segment-aligned (whole `::` components), so `"Vec::push"` catches
+# `std::vec::Vec::push` and bare `"to_string"` catches `<T as ToString>::to_string`
+# — but never a user function merely named `collect_it` or `to_string_helper`.
+#
+# Growable buffers.
+"Vec::with_capacity" = "alloc"
+"Vec::push" = "alloc"
+"Vec::insert" = "alloc"
+"Vec::append" = "alloc"
+"Vec::extend" = "alloc"
+"Vec::extend_from_slice" = "alloc"
+"Vec::reserve" = "alloc"
+"Vec::resize" = "alloc"
+"Vec::from_iter" = "alloc"
+"Vec::from_elem" = "alloc"
+"VecDeque::push_back" = "alloc"
+"VecDeque::push_front" = "alloc"
+"VecDeque::with_capacity" = "alloc"
+"to_vec" = "alloc"
+
+# Strings.
+"String::with_capacity" = "alloc"
+"String::push" = "alloc"
+"String::push_str" = "alloc"
+"String::insert" = "alloc"
+"String::insert_str" = "alloc"
+"String::from" = "alloc"
+"to_string" = "alloc"
+"to_owned" = "alloc"
+"into_string" = "alloc"
+"repeat" = "alloc"
+"std::fmt::format" = "alloc"
+"alloc::fmt::format" = "alloc"
+
+# Boxing and shared ownership.
+"Box::new" = "alloc"
+"Box::pin" = "alloc"
+"Rc::new" = "alloc"
+"Arc::new" = "alloc"
+
+# Maps and sets (node / table allocation).
+"BTreeMap::insert" = "alloc"
+"BTreeSet::insert" = "alloc"
+"HashMap::insert" = "alloc"
+"HashSet::insert" = "alloc"
+"HashMap::with_capacity" = "alloc"
+"HashSet::with_capacity" = "alloc"
+"HashMap::reserve" = "alloc"
+"HashMap::from_iter" = "alloc"
+"BTreeMap::from_iter" = "alloc"
+
+# Iterator terminal that builds an owned collection.
+"collect" = "alloc"

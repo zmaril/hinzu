@@ -8,6 +8,67 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Honest treatment of unseen externals — the `Unknown` marker. A call the
+  analyzer cannot see through — a foreign, no-body callee that no rule resolved,
+  or an indirect call (function pointer / `dyn`) the driver marked unresolved —
+  used to contribute nothing and read as pure. It now becomes `Unknown`, a
+  first-class uncertainty that propagates up the call graph like an effect with
+  an evidence path down to the offending callee. `hinzu check` fails on
+  `Unknown` by default; `[analysis] on_unknown = "fail" | "warn" | "ignore"`
+  tunes that (`ignore` restores the old effects-only behavior). The report
+  distinguishes an unknown finding ("cannot certify: reaches unknown external
+  `serde_json::from_str`") from a forbidden-effect violation.
+- Effect-root classification at seed time (`RootSeeds::seed_unknowns`): each
+  unseen callee resolves in a fixed order — explicit pure annotation, then an
+  effect rule, then a built-in trusted-pure baseline (the standard library and
+  calls through a standard-library trait), else `Unknown`. A callee in the
+  analyzed workspace's own crates is never `Unknown`, even when a monomorphized
+  turbofish makes it differ from its generic definition. Matching is
+  segment-aligned (whole `::` path components), so a rule never matches a
+  substring of an identifier.
+- `[trust]` policy section — trusted external summaries stated outside the
+  source. `"serde" = "pure"` vouches a crate effect-free (clearing its
+  `Unknown`s); `"rusqlite" = ["db"]` declares the effects a crate carries.
+  Merged over hinzu's built-in defaults; an explicit rule overrides.
+- `Alloc` effect — heap allocation, tracked like any other effect so a
+  performance-sensitive region can forbid it (`forbid = ["alloc"]`). hinzu ships
+  its first library annotation set, `crates/hinzu-core/annotations/std.toml`,
+  loaded as the built-in default and overridable by `hinzu.toml`: the standard
+  library's I/O surface as effect roots, its allocating APIs (`Vec::push`,
+  `Box::new`, `String` growth, `format!`, `.collect()`, `Rc`/`Arc::new`, map and
+  set inserts) as `alloc` roots, and the genuinely-pure remainder (arithmetic,
+  slices, comparisons, lazy iterator adapters) left to the trusted-pure
+  baseline. The model is over-approximate: an API that may allocate is marked
+  even when a given call does not.
+- Self-check tightened: `hinzu-self.toml` now sets `on_unknown = "fail"`, allows
+  `alloc` in every region while forbidding the real I/O effects, and carries an
+  explicit `[trust]` list (`anyhow`, `toml`, `serde_json` → pure) for the three
+  foreign crates hinzu-core reaches that the baseline does not already cover.
+  The functional-core guard stays green because that trust list honestly
+  accounts for every external, not because the boundary was weakened.
+- Configurable effect-root seeding (`hinzu-core::roots`): a prefix table maps a
+  callee's path to an effect category, so calls that leave the analyzed
+  workspace into a registry dependency become effect roots. A built-in default
+  covers the standard library (`std::fs`, `std::net`, `std::process`,
+  `std::time`, `std::env`) plus a few common crates — `rand` for randomness and
+  `rusqlite` / `libsqlite3_sys` for the database — and a `[roots]` section in
+  the policy file extends or overrides it. The match strips generic arguments
+  first, so a type such as `rusqlite::Error` inside a `Result` never seeds a
+  spurious root. `hinzu check` seeds the fact set before propagation. This is
+  what lets the tool see that a program whose I/O is all SQLite is effectful at
+  all; a standard-library-only seed found nothing in it.
+- Functional-core self-check: `hinzu check` now runs on hinzu-core itself in
+  CI, as a regression guard. A dedicated policy (`hinzu-self.toml`) states the
+  boundary — the fact schema, the propagation engine, and the policy check must
+  reach no filesystem, network, database, subprocess, or environment effect,
+  and effects are confined to the SQLite fact store (`store.rs`) and the seam
+  that drives it (`check_facts` in `lib.rs`). A new `self-check` CI job builds
+  the CLI on stable and the StableMIR driver on its nightly, extracts facts
+  from hinzu-core, and fails on any leak. The job is isolated from the stable
+  `rust` job: the nightly only ever builds the driver and hinzu-core-under-the-
+  driver, never the workspace or its `dbsp` dependency. See
+  `notes/self-check.md`.
+
 - Toolchain pin (`rust-toolchain.toml`): the workspace is pinned to stable
   1.96.0. rustc 1.97.x hits an internal compiler error building the `dbsp`
   dependency (a `dyn_clone` vtable-slot panic in the new trait solver); 1.96.0
