@@ -15,6 +15,10 @@ This is early scaffolding: the CLI exposes a single `run` placeholder command
 while the actual surface is designed. Everything below already works, so new
 functionality slots into an established shape rather than a blank repo.
 
+See [notes/design.md](notes/design.md) for the design — a language-independent
+analysis layer that extracts semantic facts from existing compilers and reasons
+over them, with effect analysis as the first application.
+
 ## Install
 
 Build from a checkout with a recent stable Rust toolchain:
