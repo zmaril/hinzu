@@ -231,20 +231,19 @@ supplying its `full_name` and module path. It emits hinzu's `FactSet` JSON
 directly — definitions, `call` and `reference` edges, and effect roots seeded by
 the callee's declaration provenance.
 
-`hinzu check` routes by project type: a `Cargo.toml` takes the StableMIR path, a
-`tsconfig.json` / `package.json` the TypeScript adapter, and a `pyproject.toml` /
-`setup.py` / `setup.cfg` the Python adapter (shelled out to `python3 analyze.py`;
-`HINZU_PY_ADAPTER` overrides the script location and `HINZU_PYTHON` the
-interpreter, and the run fails with an honest message when Python or Jedi is
-missing rather than faking an analysis). Everything downstream is shared: the
-SQLite store, DBSP propagation, and the `hinzu.toml` policy check.
+Project detection adds one row to the routing table: a `pyproject.toml`,
+`setup.py`, or `setup.cfg` selects the Python adapter, which the CLI runs as
+`python3 analyze.py` (`HINZU_PYTHON` picks the interpreter, `HINZU_PY_ADAPTER`
+the script; a missing `python3` or `jedi` is an honest failure, not a faked
+analysis). From the extracted facts onward nothing is language-specific — the
+same store, engine, and policy check that Rust and TypeScript already feed.
 
-Effect roots use the one flat, shared vocabulary — `fs`, `net`, `process`, `env`,
-`clock`, `random` — the same names Rust and TypeScript use; Python seeds that
-subset, and there is no `alloc` for a garbage-collected runtime (see
-[`python-catalog.md`](./python-catalog.md)). The built-in Python annotation set
-lives in `crates/hinzu-core/annotations/python.toml`, the counterpart to
-`std.toml` and `node.toml`.
+The seeded categories are the shared vocabulary again, minus `alloc`: `fs`,
+`net`, `process`, `env`, `clock`, and `random`, keyed on Jedi's resolved
+`full_name`. One Python-specific care is the `pathlib.Path` constructor, which is
+pure — only its I/O methods count as `fs`. The shipped annotation set is
+`crates/hinzu-core/annotations/python.toml`, and
+[`python-catalog.md`](./python-catalog.md) records the full mapping.
 
 Python is the weakest-resolution adapter: Jedi resolves about 78% of call sites,
 because duck-typed receivers, decorators, dynamic import, and un-typed `pathlib`

@@ -1,3 +1,10 @@
+// straitjacket-allow-file[:duplication] — this is the Python twin of
+// `ts_check.rs`: the two per-language integration harnesses are deliberately
+// parallel (the same repo-root helper, the same stable-facts-then-live-adapter
+// pair, the same violation assertions) so a reader can compare a language's
+// coverage line for line. The shared shell-out/parse code already lives once in
+// `adapter_harness.rs`; what overlaps here is the test scaffolding, whose
+// parallelism is the point.
 //! Integration coverage for the Python path of `hinzu check`.
 //!
 //! The first test is stable-CI-safe: it feeds pre-extracted Python facts
