@@ -24,14 +24,14 @@
 #     typeshed, or an owned/third-party module) + enclosing qualname give the
 #     provenance. A real type system resolves the un-typed `pathlib` receivers and
 #     much of the duck-typed surface a name-resolver cannot, so they become precise
-#     `fs`/`clock`/… edges. To make stdlib import resolution DETERMINISTIC on any
-#     host (including headless CI runners, where ty's environment auto-discovery is
-#     unreliable), the adapter pins ty's target `python-version` and
-#     `python-platform` explicitly in the LSP `initialize` and warms ty's vendored
-#     typeshed with a synchronous `ty check` before the batch, rather than relying
-#     on ty to infer an environment. It is an LSP/subprocess upgrade today; the
-#     intent is a native in-process ty backend behind this same seam once ty ships
-#     a stable Rust library API.
+#     `fs`/`clock`/… edges. The definition target is classified by module_of_target:
+#     ty may resolve an imported stdlib symbol to its VENDORED typeshed stub OR to
+#     the interpreter's REAL stdlib source (`.../lib/python3.11/subprocess.py`),
+#     depending on the host — both are recognized as stdlib. ty's target
+#     `python-version`/`python-platform` are pinned in the LSP `initialize` so the
+#     typeshed is selected deterministically. It is an LSP/subprocess upgrade today;
+#     the intent is a native in-process ty backend behind this same seam once ty
+#     ships a stable Rust library API.
 #
 # If the `ty` binary is absent the adapter exits nonzero with an honest message —
 # it never falls back to a weaker resolver and never fakes a resolution.
@@ -315,6 +315,23 @@ class Adapter:
         m = re.search(r"/(?:site|dist)-packages/(.+)\.pyi?$", p)
         if m:
             return ("THIRD_PARTY", m.group(1).replace("/__init__", "").replace("/", "."))
+        # A real CPython stdlib module (source `.py` or stub `.pyi`) under a
+        # `.../pythonX.Y/` lib directory but NOT site-packages (handled above).
+        # ty resolves imported stdlib to its vendored typeshed on most hosts, but
+        # on some — notably a headless CI runner whose interpreter ships a full
+        # stdlib — it resolves `import subprocess` to the interpreter's real
+        # `.../lib/python3.11/subprocess.py` instead. That is still the stdlib, so
+        # classify it as STDLIB rather than dropping it as an unknown OTHER (which
+        # would fail closed on a legitimate stdlib effect). `.../python3.11/
+        # subprocess.py` -> STDLIB `subprocess`; `.../python3.11/importlib/
+        # util.py` -> STDLIB `importlib.util`.
+        m = re.search(r"/python\d+(?:\.\d+)?/(.+)\.pyi?$", p)
+        if m and "/site-packages/" not in p and "/dist-packages/" not in p:
+            mod = m.group(1).replace("/__init__", "").replace("/", ".")
+            # `lib-dynload` C-extension shims and private `_vendor` trees are not
+            # importable stdlib module names; leave them OTHER.
+            if not mod.startswith(("lib-dynload.", "_vendor.")):
+                return ("STDLIB", mod)
         return ("OTHER", None)
 
     def qualname_at(self, path: str, line0: int) -> tuple[str | None, str | None]:
@@ -624,18 +641,20 @@ class Collector(ast.NodeVisitor):
 
 
 class TyResolver:
-    """The resolution backend: Astral's ty type checker over its LSP. Warms ty's
-    vendored typeshed with a synchronous `ty check`, then opens every source file,
-    waits for the first check pass to settle, then PIPELINES a
-    `textDocument/definition` at each query point and maps the target
-    (ty's vendored typeshed, or an owned/third-party module) to a Resolution.
+    """The resolution backend: Astral's ty type checker over its LSP. Opens every
+    source file, waits for the first check pass to settle, then PIPELINES a
+    `textDocument/definition` at each query point and maps the target to a
+    Resolution. A definition target is classified by `module_of_target`: ty's
+    vendored typeshed, an installed third-party package, OR the interpreter's real
+    CPython stdlib source — ty resolves an imported stdlib symbol to whichever it
+    finds. On some hosts (notably a headless CI runner whose interpreter ships a
+    full stdlib) `import subprocess` resolves to `.../lib/python3.11/subprocess.py`
+    rather than the vendored `subprocess.pyi`; both are the stdlib and both classify
+    as STDLIB.
 
-    The target `python-version` and `python-platform` are pinned explicitly (to
-    the running interpreter's) in both the `ty check` warm-up and the LSP
-    `initialize`, so stdlib import resolution does not depend on ty's environment
-    auto-discovery — which is unreliable on headless CI runners, where an
-    un-pinned ty resolves `builtins` but returns null for imported-stdlib symbols
-    like `subprocess.run`."""
+    The target `python-version` and `python-platform` are pinned explicitly (to the
+    running interpreter's) in the LSP `initialize`, so the stdlib typeshed is
+    selected deterministically instead of depending on ty's environment inference."""
 
     name = "ty"
     BATCH = 64
@@ -678,52 +697,22 @@ class TyResolver:
         except (OSError, subprocess.SubprocessError, IndexError):
             pass
 
-    def _warm_check(self, root: str):
-        """Warm ty's vendored typeshed and build the module graph DETERMINISTICALLY
-        with a synchronous `ty check` before the LSP batch. `ty check` resolves
-        every import to completion and materializes the vendored typeshed stubs
-        into ty's shared cache — the same cache the LSP server then serves
-        `textDocument/definition` from — so the batch never races an async,
-        half-warm index. Pinning `--python-version`/`--python-platform` to the same
-        values the LSP uses keeps the two in agreement. Best-effort: a nonzero exit
-        (a project with type errors is normal and expected) does not stop the run;
-        the resolution comes from the LSP, this only warms and diagnoses."""
-        import subprocess  # noqa: PLC0415 — only when the ty backend runs
-
-        cmd = [
-            self.ty_bin, "check", "--project", root,
-            "--python-version", self.py_version,
-            "--python-platform", self.py_platform,
-            "--exit-zero", "--output-format", "concise",
-        ]
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            tail = (out.stderr or out.stdout or "").strip().splitlines()
-            sys.stderr.write(
-                f"hinzu-py: ty check warm-up exit {out.returncode}"
-                + (f" | {tail[-1]}" if tail else "")
-                + "\n"
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            sys.stderr.write(f"hinzu-py: ty check warm-up skipped ({e})\n")
-
     def resolve_batch(self, sources, queries):
         from lspclient import LSP, uri  # noqa: PLC0415 — only when ty is chosen
 
         root = str(self.a.project)
-        self._warm_check(root)
         client = LSP([self.ty_bin, "server"], cwd=root)
         try:
             client.request("initialize", {
                 "processId": os.getpid(),
                 "rootUri": uri(root),
-                # Pin ty's target environment so imported-stdlib resolution does
-                # not depend on ty's environment auto-discovery (unreliable on
-                # headless runners). `diagnosticMode: workspace` makes ty index the
-                # whole project, not just open files, so cross-module definitions
-                # settle. These options are ty's LSP `initializationOptions`
-                # (GlobalOptions), passed at the top level — NOT nested under a
-                # `settings` key, which ty rejects as "unknown options".
+                # Pin ty's target so the stdlib typeshed is selected
+                # deterministically instead of depending on ty's environment
+                # inference. `diagnosticMode: workspace` makes ty index the whole
+                # project, not just open files, so cross-module definitions settle.
+                # These options are ty's LSP `initializationOptions` (GlobalOptions),
+                # passed at the top level — NOT nested under a `settings` key, which
+                # ty rejects as "unknown options".
                 "initializationOptions": {
                     "diagnosticMode": "workspace",
                     "configuration": {"environment": {

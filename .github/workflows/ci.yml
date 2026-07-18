@@ -135,15 +135,14 @@ jobs:
   # project through the SHARED pipeline (adapter -> SQLite -> DBSP -> policy). It
   # must flag the functional-core leaks with their evidence paths.
   #
-  # ty ON THE HEADLESS RUNNER. ty's environment auto-discovery is unreliable on a
-  # headless runner: an un-pinned `ty server` there resolves `builtins` but
-  # returns null for imported-stdlib symbols like `subprocess.run`. The adapter
-  # fixes this at the source — it pins ty's target `python-version` /
-  # `python-platform` in the LSP `initialize` and warms the vendored typeshed with
-  # a synchronous `ty check` before the batch (see notes/python-catalog.md), so
-  # stdlib imports resolve deterministically from vendored typeshed. So this job
-  # runs its live assertion on ty (pinned `ty==0.0.61`), the same backend used
-  # locally and in real use — no fallback.
+  # ty ON THE HEADLESS RUNNER. On this runner ty resolves `import subprocess` to
+  # the interpreter's REAL stdlib source (`.../lib/python3.11/subprocess.py`), not
+  # its vendored typeshed stub. The adapter's `module_of_target` recognizes that
+  # real-stdlib path as STDLIB (alongside vendored typeshed + site-packages), so
+  # `subprocess.run` resolves here exactly as it does locally against vendored
+  # typeshed (see notes/python-catalog.md). So this job runs its live assertion on
+  # ty (pinned `ty==0.0.61`), the same backend used locally and in real use — no
+  # fallback. The diagnostics step below dumps a definition probe + ty server logs.
   #
   # Isolated from the `rust` job like `self-check` and `ts-check` are. Python and
   # ty live ONLY here; the stable Rust jobs never install them and never depend

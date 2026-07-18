@@ -2,9 +2,12 @@
 # A focused ty-LSP diagnostic: drive `ty server` over the fixture exactly as the
 # adapter does, probe `textDocument/definition` for an imported-stdlib symbol
 # (`subprocess.run`) and an ambient builtin (`open`), and dump the ty server's own
-# stderr (under whatever `RUST_LOG` the caller set). It exists to diagnose the
-# headless-runner behavior where the LSP resolves `open` but returns null for
-# `subprocess.run`, by making each CI run print ty's server-side reasoning.
+# stderr (under whatever `RUST_LOG` the caller set). It prints the raw definition
+# TARGET URI for each, which is what pinned down the headless-runner behavior: ty
+# resolves `open` to its vendored `builtins.pyi` but `subprocess.run` to the
+# interpreter's real `.../lib/python3.11/subprocess.py` — a stdlib path the adapter
+# now classifies as STDLIB. It keeps each CI run honest by showing exactly where ty
+# resolves each symbol on that host.
 #
 # It never asserts and always exits 0 — it is a diagnostic, not a gate. Run it as
 #   RUST_LOG=ty_server=debug,ty_ide=debug,ty_module_resolver=debug \

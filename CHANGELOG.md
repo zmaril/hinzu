@@ -25,24 +25,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   86 — un-typed `.is_dir()` / `.mkdir()` gaps become precise `forbids fs` findings
   instead of "cannot certify." Unresolved sites still fail closed as `Unknown`
   under `on_unknown = fail`, so precision rises without weakening soundness.
-- Python adapter — **deterministic ty stdlib resolution on headless CI runners**.
-  ty's environment auto-discovery is unreliable on a headless GitHub Actions
-  runner: an un-pinned `ty server` there resolves `builtins` but returns null for
-  imported-stdlib symbols like `subprocess.run` (it never settles a stdlib search
-  path), a failure that does not reproduce on a workstation. The adapter now pins
-  ty's target `python-version` and `python-platform` explicitly in the LSP
-  `initialize` (`initializationOptions`, with `diagnosticMode: workspace`) and
-  warms ty's vendored typeshed with a synchronous `ty check --project` before the
-  batch, so stdlib imports resolve from vendored typeshed deterministically on any
-  host instead of depending on inferred environment. This lets the `py-check` CI
-  job run its live fixture assertion on **ty** (pinned `ty==0.0.61`), the same
-  backend used locally and in real use. The stable Rust jobs stay backend-free —
-  their Python coverage is the committed sample-facts test, which runs from JSON
-  with no ty. The intent remains a native in-process ty backend behind the same
-  `FactSet` seam once ty ships a stable Rust library API; pyrefly was evaluated
-  and near-tied but ty was chosen (Astral trajectory + native-later intent), and
-  zuban is excluded (AGPL). See
-  [`notes/python-catalog.md`](./notes/python-catalog.md).
+- Python adapter — **recognize the interpreter's real stdlib as a ty definition
+  target**, fixing imported-stdlib resolution on headless CI runners. ty resolves
+  an imported stdlib symbol to whichever declaration it finds: its VENDORED
+  typeshed stub on most hosts, but the interpreter's REAL stdlib source
+  (`.../lib/python3.11/subprocess.py`) on a headless GitHub Actions runner, whose
+  interpreter ships a full stdlib. The adapter's target-provenance mapping only
+  recognized the vendored-typeshed and site-packages paths, so it dropped a
+  real-stdlib target as an unknown `OTHER` — turning `subprocess.run` into an
+  unresolved `Unknown` while `builtins.open` (a C builtin, always vendored)
+  resolved. This looked like ty "returning null for imported-stdlib" but was a
+  classification gap: `module_of_target` now recognizes a `.../pythonX.Y/…` stdlib
+  path (source or stub, excluding site-packages) as STDLIB. The adapter also pins
+  ty's target `python-version`/`python-platform` in the LSP `initialize`
+  (`initializationOptions`, `diagnosticMode: workspace`) so the typeshed is
+  selected deterministically. This lets the `py-check` CI job run its live fixture
+  assertion on **ty** (pinned `ty==0.0.61`), the same backend used locally and in
+  real use, and dump ty resolution diagnostics (a `textDocument/definition` probe
+  + ty server logs) each run. The stable Rust jobs stay backend-free — their Python
+  coverage is the committed sample-facts test, which runs from JSON with no ty. The
+  intent remains a native in-process ty backend behind the same `FactSet` seam once
+  ty ships a stable Rust library API; pyrefly was evaluated and near-tied but ty was
+  chosen (Astral trajectory + native-later intent), and zuban is excluded (AGPL).
+  See [`notes/python-catalog.md`](./notes/python-catalog.md).
 - Python adapter (slice 3) — `hinzu check <python-project>` now works, through
   the same pipeline as Rust and TypeScript: adapter, SQLite fact store, DBSP
   propagation, `hinzu.toml` policy, violations. The adapter

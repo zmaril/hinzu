@@ -106,35 +106,45 @@ name-resolver leaves unresolved — resolve to real `pathlib::Path.is_dir` /
 the core rather than "cannot certify." That is why `fs` coverage reaches 117 call
 edges. The whole run stays well under two seconds with request pipelining.
 
-### Deterministic stdlib resolution on any host (the headless-runner fix)
+### Recognizing every stdlib target (the headless-runner fix)
 
-ty resolves stdlib imports from a **vendored typeshed** it ships and materializes
-into a per-user cache; which stdlib it exposes is keyed on the target
-`python-version`. When ty is left to *infer* its target environment, that
-inference is unreliable on a headless CI runner: an un-pinned `ty server` there
-resolves `builtins` (the always-present prelude, which needs no import resolution)
-but returns **null** for imported-stdlib symbols such as `subprocess.run` — it
-never settles a stdlib search path for resolved imports. The same run resolves
-those symbols on a workstation, so the failure is environment-inference-specific,
-not a timing race (a readiness probe and retry-on-null did not fix it).
+ty resolves an imported stdlib symbol to whichever declaration it finds. Usually
+that is a stub in ty's **vendored typeshed** (`.../typeshed/<hash>/stdlib/
+subprocess.pyi`). But on a host whose interpreter ships a full standard library —
+notably a headless GitHub Actions runner — ty resolves `import subprocess` to the
+interpreter's **real stdlib source** (`.../lib/python3.11/subprocess.py`) instead.
+Both are the standard library; ty picks one per host.
 
-The adapter removes the dependence on that inference:
+The adapter reconstructs a callee's provenance from that definition *target file*.
+Its `module_of_target` originally recognized only two external shapes — ty's
+vendored typeshed and installed `site-packages` — and classified anything else,
+including a real-stdlib source path, as an unknown `OTHER`. So on the runner
+`subprocess.run` resolved to `.../lib/python3.11/subprocess.py`, fell into `OTHER`,
+and was emitted as an **unresolved** edge that fails closed as `Unknown` — while
+`builtins.open` (a C builtin with no real source module, always resolved to the
+vendored `builtins.pyi`) classified fine. That asymmetry — `builtins.open` resolves
+but `subprocess.run` does not — read like ty "returning null for imported-stdlib,"
+but it was a provenance-classification gap in the adapter, not a ty failure; ty
+resolved the symbol correctly, just to a path the adapter did not recognize. It did
+not reproduce on a workstation because there ty resolved the same import to its
+vendored typeshed, which the adapter already recognized.
 
-- It **pins ty's target** `python-version` and `python-platform` (to the
-  interpreter running the adapter) in the LSP `initialize`, via ty's
-  `initializationOptions` (`configuration.environment`, with
-  `diagnosticMode: workspace` so the whole project is indexed). These options are
-  passed at the top level of `initializationOptions`, not nested under a
-  `settings` key — ty rejects the latter as "unknown options."
-- It **warms ty's vendored typeshed** with a synchronous `ty check --project`
-  (same pinned target) before the definition batch, so the vendored stubs are
-  materialized into ty's shared cache — the same cache the LSP server serves
-  definitions from — and the batch never races an async, half-warm index.
+The fix classifies **any** stdlib target as STDLIB:
 
-With the target pinned, `import subprocess` → `subprocess.run` resolves from
-vendored typeshed deterministically on every host, including the headless runner.
-The fixture also carries a `[tool.ty.environment]` section in its `pyproject.toml`
-so a plain `ty check` of it is deterministic too.
+- `module_of_target` now recognizes a real CPython stdlib path — a
+  `.../pythonX.Y/<module>.pyi?` file that is not under `site-packages` /
+  `dist-packages` — as STDLIB (`.../python3.11/subprocess.py` → `subprocess`),
+  alongside the vendored-typeshed and site-packages shapes it already handled.
+
+The adapter also **pins ty's target** `python-version` and `python-platform` (to
+the interpreter running the adapter) in the LSP `initialize`, via ty's
+`initializationOptions` (`configuration.environment`, with
+`diagnosticMode: workspace` so the whole project is indexed), so the stdlib
+typeshed is selected deterministically rather than by ty's environment inference.
+These options are passed at the top level of `initializationOptions`, not nested
+under a `settings` key — ty rejects the latter as "unknown options." The fixture
+also carries a `[tool.ty.environment]` section in its `pyproject.toml` so a plain
+`ty check` of it is deterministic too.
 
 ### Sound whichever call resolves
 
@@ -176,12 +186,13 @@ feed one engine.
 
 The `py-check` job installs the pinned `ty==0.0.61` and runs its live fixture
 assertion on **ty** — the same backend used locally and in real use, no fallback.
-Because the adapter pins ty's target and warms the vendored typeshed, stdlib
-resolution is deterministic on the runner. The job also dumps ty resolution
-diagnostics (version, `ty check -vvv` environment/module-resolution, and the
-adapter's stderr) so a future resolution regression yields a real log rather than a
-bare failure. The stable Rust jobs stay backend-free regardless: their Python
-coverage is the committed sample-facts test, which runs from JSON with no ty.
+Because the adapter recognizes every stdlib target shape and pins ty's target,
+stdlib resolution is deterministic on the runner. The job also dumps ty resolution
+diagnostics (version, `ty check -vvv` environment/module-resolution, and a
+`textDocument/definition` probe of `subprocess.run` vs `open` with the ty server's
+own logs) so a future resolution regression yields a real log rather than a bare
+failure. The stable Rust jobs stay backend-free regardless: their Python coverage
+is the committed sample-facts test, which runs from JSON with no ty.
 
 ## How the adapter maps provenance to a category
 

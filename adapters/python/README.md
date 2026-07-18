@@ -30,15 +30,17 @@ through the shared pipeline (SQLite store, DBSP propagation, `hinzu.toml` policy
 Point `HINZU_PY_ADAPTER` at this `analyze.py` to override the location,
 `HINZU_PYTHON` at a specific interpreter, and `HINZU_TY` at a specific `ty` binary.
 
-## Deterministic stdlib resolution
+## Stdlib resolution on any host
 
-The adapter pins ty's target `python-version` and `python-platform` (to the
-interpreter running the adapter) in the LSP `initialize`, and warms ty's vendored
-typeshed with a synchronous `ty check --project` before the definition batch. This
-makes imported-stdlib resolution (`import subprocess` → `subprocess.run`) resolve
-from vendored typeshed **deterministically on any host** — including headless CI
-runners, where ty's own environment auto-discovery is unreliable and an un-pinned
-`ty server` resolves `builtins` but returns null for imported-stdlib symbols. See
+ty resolves an imported stdlib symbol to whichever declaration it finds — its
+vendored typeshed stub on most hosts, or the interpreter's real stdlib source
+(`.../lib/python3.11/subprocess.py`) on a host that ships a full stdlib, such as a
+headless CI runner. The adapter's provenance mapping (`module_of_target`)
+recognizes **all** of these shapes — vendored typeshed, installed site-packages,
+and a real `.../pythonX.Y/…` stdlib path — as stdlib, so `import subprocess` →
+`subprocess.run` resolves the same way everywhere. It also pins ty's target
+`python-version` / `python-platform` in the LSP `initialize` so the typeshed is
+selected deterministically. See
 [`notes/python-catalog.md`](../../notes/python-catalog.md).
 
 ## What it emits
