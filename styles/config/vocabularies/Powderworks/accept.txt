@@ -38,6 +38,15 @@ charon
 AeneasVerif
 Datalog
 Doop
+[Dd][Bb][Ss][Pp]
+Feldera
+ascent
+Cozo
+FnPtr
+FnDef
+dylib
+[Rr]etraction
+BFS
 execSync
 buildSystemPrompt
 pi.dev

@@ -54,7 +54,12 @@ Derived by the engine:
 
 - **EffectSummary** per Definition — the set of transitively-reachable effects, plus, per effect, one **evidence path** (the caller chain from this callable to the effectful root).
 
-Storage: **a SQLite fact database from day one** — tables for definitions, edges, effect roots, and the derived effect summaries. The facts are relational and the analysis is naturally reachability/queries over them (a Datalog-style formulation is a clean future fit), and persistence is what makes the design's incremental cached summaries and cross-revision comparison possible. The pi.dev run below already writes this schema.
+Storage and analysis engine (decided empirically — see the validation section):
+
+- **Durable fact store: SQLite.** Embedded, portable, no operational overhead; it holds the source-of-truth facts and backs the design's incremental cached summaries and cross-revision comparison. The pi.dev run already writes this schema.
+- **Analysis engine: DBSP (Feldera).** One engine covers both modes. The initial whole-repo analysis is a single full step; re-analysis after a code edit is an incremental delta step that recomputes in time proportional to the change, and it supports exact *retraction* — un-tainting a function when an edge is removed. Effect propagation is a recursive fixed point over the edge relation, and each rung of the precision ladder is a rule change in the circuit.
+
+We ran a bake-off of batch Datalog engines (`ascent`, Cozo) as a separate analysis layer, and both reproduced the reference summaries exactly — but DBSP matches that batch answer and adds incrementality, so hinzu uses DBSP alone rather than carrying a second engine. Cozo was additionally dropped as stale.
 
 ## The propagation engine
 
@@ -74,7 +79,7 @@ Whether an edge exists is really a question about function *values* and indirect
 - **Call-only.** An edge only at real invocation sites. Precise, but it misses higher-order flow — a callback invoked elsewhere never connects.
 - **Value-flow / points-to-resolved calls + effect-polymorphic summaries (target).** Resolve indirect call sites by tracking where function values flow (the CHA to RTA to points-to to k-CFA ladder), and give higher-order functions a summary parameterized over their function-typed arguments (`runner`'s effect is its callback's effect, discharged per call site). This recovers call-only precision *and* callback coverage — what CodeQL/Semgrep-style taint and Datalog points-to (Doop) do in practice. Unresolved indirect calls fall back to the conservative over-approximation, preserving "every ambiguity degrades to an effect."
 
-So each `Edge` records *how* it was resolved (`call` / `reference` / `value-flow` / `unresolved`), letting precision tighten later without reshaping the fact schema. hinzu ships reference + call in v0 (the pi.dev run uses exactly this) and climbs the ladder where real code shows it matters.
+So each `Edge` records *how* it was resolved (`call` / `reference` / `value-flow` / `unresolved`), letting precision tighten later without reshaping the fact schema. hinzu ships reference + call in v0 (the pi.dev run uses exactly this) and climbs the ladder where real code shows it matters. Each rung is a rule change in the DBSP circuit — validated on the pi facts, where switching from reference-plus-call to call-only is a single atom swap (2,484 down to 2,357 pairs).
 
 ## Policy file (`hinzu.toml`)
 
@@ -116,14 +121,16 @@ A callable **violates** policy when it sits in a region, that region forbids eff
 
 The forks flagged in the first draft are now settled:
 
-1. **Native adapters for both languages** — StableMIR for Rust, the TypeScript compiler API for TypeScript, normalized to one schema. Not SCIP.
-2. **Storage: SQLite from day one** (a persistent fact database), not in-memory/JSON.
-3. **Edge granularity: reference + call in v0** (over-approximate, bias to flagging), with the value-flow / effect-polymorphic ladder above as the precision path.
-4. **First validation target: pi.dev** (earendil-works/pi) — done; see below.
+1. **Native adapters for both languages** — a StableMIR (`rustc_public`) driver for Rust, the TypeScript compiler API for TypeScript, normalized to one schema. Not SCIP.
+2. **Store and engine: SQLite plus DBSP.** A durable SQLite fact store, with DBSP (Feldera) as the single analysis engine — the initial full step plus incremental delta steps. `ascent` and Cozo were evaluated and dropped: DBSP covers batch and incremental together, and Cozo is stale.
+3. **Edge granularity: reference plus call in v0** (over-approximate, bias to flagging), with the value-flow / effect-polymorphic ladder above as the precision path — each rung a circuit rule.
+4. **First validation target: pi.dev** (earendil-works/pi) — done; see below. The Rust adapter is validated on straitjacket; see below.
 
 Still genuinely open: whether to run a charon spike first to de-risk the schema before writing the StableMIR driver; whether to drive the Rust workspace crate-by-crate or via `RUSTC_WORKSPACE_WRAPPER` from the start; and the exact `hinzu.toml` region grammar (glob syntax).
 
-## Empirical validation: pi.dev
+## Empirical validation
+
+### TypeScript: pi.dev
 
 To pressure-test the TypeScript adapter before committing to the design, we ran a native compiler-API extractor (TypeScript 5.9.3, `@types/node` 22.19.19) over all five packages of pi (earendil-works/pi, ~207k LOC), effect roots seeded by declaration provenance, facts written to SQLite.
 
@@ -141,3 +148,21 @@ What it surfaced (hand-verified):
 Honest limits observed: 3.2% of calls were unresolved (any-typed / dynamic / third-party), so effects flowing only through those are missed (an under-approximation); third-party effect libraries are invisible without `node_modules` and were caught by a name-based import fallback; dynamic `import()`/`require()` and pointer aliasing are not followed.
 
 Takeaway: the native TypeScript path produces a real, queryable effect map on a large real codebase, the SQLite schema holds, and reference-level taint earns its keep on actual higher-order code.
+
+### Rust: StableMIR on straitjacket
+
+A ~230-line `rustc_public` (StableMIR) driver, run over straitjacket via `RUSTC_WORKSPACE_WRAPPER` on nightly 1.99: **341 functions, 1,912 call edges, 99.95% statically resolved.** The single unresolved edge is an honest stored-function-pointer call (`FnPtr`, not `FnDef`), bucketed rather than faked; no `dyn` calls survived to MIR, because monomorphization lowered them to concrete `FnDef`s. It found 4 std effect roots and 8 transitively-effectful functions, for example `resolve → load_file_config → config::load_config → std::fs::read_to_string`. The costs of rustc_public's youth: the `stable_mir` to `rustc_public` rename dates every existing tutorial, and `rustc_private` plus dylib linkage pins the binary to one exact nightly.
+
+### The analysis engine: DBSP
+
+DBSP (`dbsp` 0.322) reproduced the reference effect summaries exactly on the pi facts (1,357 functions / 2,484 pairs, set-equal to an independent BFS), then showed diff-proportional recompute:
+
+| change | affected | time | vs full |
+|---|---|---|---|
+| initial full build | 1,357 funcs | ~23 ms | 1x |
+| add a leaf call edge | 18 funcs | ~3 ms | ~8x |
+| remove that edge (retraction) | 18 funcs | ~2.8 ms | ~8x |
+| add a new effect root | 20 funcs | ~1.3 ms | ~18x |
+| add an edge into a hub (in-degree 223) | 431 funcs | ~13.5 ms | ~1.7x |
+
+Cost tracks the change: a one-call-site edit recomputes almost instantly, retraction correctly un-taints downstream functions, and a genuinely broad change does proportional work. A bake-off confirmed `ascent` and Cozo reproduce the same batch answer, but DBSP subsumes the batch case and adds incrementality, so it is the single engine.
