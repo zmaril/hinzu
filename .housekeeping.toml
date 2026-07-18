@@ -10,3 +10,9 @@ conventional-commits = "required"
 # Auto-merge is enabled on the repo so a green PR can land without a babysitter.
 # The check asserts GitHub's allow_auto_merge matches this declaration.
 enabled = true
+
+[lockfiles]
+# The typescript adapter deliberately gitignores package-lock.json (.gitignore
+# line 26) — rust is the product and the adapter is a thin binding, so its
+# lockfile isn't tracked. Exempt it rather than reverse that decision.
+ignore = ["adapters/typescript"]
