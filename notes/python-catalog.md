@@ -154,14 +154,15 @@ deterministically, in a way that does not reproduce on a normal workstation even
 with an empty ty cache (cold, the server resolves `subprocess.run` on the first
 poll in about 50 ms). The adapter already settles on a readiness probe and retries
 nulls with backoff, but this specific runner behavior persists. Rather than gate
-the pull request on that ty-in-CI flakiness, the `py-check` job runs its
-*blocking* assertion on the deterministic Jedi fallback and exercises the ty
-backend in a separate *non-blocking* (`continue-on-error`) step, so ty's output
-stays visible without making a red job. The measured ty numbers above come from a
-real local run of the full pipeline. When ty's headless-CI behavior stabilizes,
-the ty step is promoted to blocking. The stable Rust jobs stay backend-free
-regardless: their Python coverage is the committed sample-facts test, which runs
-from JSON with no ty or Jedi.
+the pull request on that ty-in-CI flakiness, the `py-check` job runs its live
+assertion on the deterministic Jedi fallback; the ty numbers above are from a real
+local run of the full pipeline. A non-blocking ty smoke step is deliberately *not*
+added — `continue-on-error` on a `cargo test` step is exactly what this repo's own
+`ci-continue-on-error` self-guard forbids, and dodging that guard to show a green
+ty run would be dishonest. When ty's headless-CI behavior stabilizes, the live
+assertion moves to ty. The stable Rust jobs stay backend-free regardless: their
+Python coverage is the committed sample-facts test, which runs from JSON with no ty
+or Jedi.
 
 ## How the adapter maps provenance to a category
 
