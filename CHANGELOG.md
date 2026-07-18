@@ -8,6 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Go is a first-class language, over gopls — the proof that a new language is a
+  new config, not new extractor code.** `hinzu check` routes a `go.mod` module to
+  the same generic Rust LSP extractor Python uses, driving gopls (the Go team's
+  language server) as the sole resolution backend. Everything Go lives as data:
+  the config `crates/hinzu-lsp/configs/go.toml` (gopls command, `**/*.go` globs,
+  and GOROOT + module-cache + downloaded-toolchain provenance rules, robust to
+  the plain, versioned, and `setup-go` toolcache GOROOT layouts) plus the shipped
+  effect map `crates/hinzu-core/annotations/go.toml`, which the config and
+  hinzu-core's own root seeding both read — one source of truth. Go seeds the
+  shared vocabulary minus `alloc`: `fs`, `net`, `process`, `env`, `clock`,
+  `random`. Provenance is package-granular by import path and does **not** inherit
+  to a nested import path (`net/url` is pure, independent of `net` — the opposite
+  of Python's dotted-module inheritance); the effect-mixed `os` splits into `fs`
+  file operations and `env` accessors, while `io` / `bufio` / `path/filepath` /
+  `time` take honest whole-package over-approximations a project can clear with a
+  `[trust]` line. `_test.go` files are analyzed; `vendor/` and `testdata/` are
+  excluded. Go interface dispatch rides the extractor's existing
+  `textDocument/implementation` follow-up (a CHA over-approximation). `HINZU_GOPLS`
+  overrides the gopls binary; a missing gopls is an honest nonzero failure, never
+  a faked analysis. On [`rs/curlie`](https://github.com/rs/curlie) the extractor
+  surfaces the `exec.Command("curl", …)` subprocess spawn with its evidence path
+  (`main.go#main -> os/exec::Command`) and fails closed on the third-party
+  `golang.org/x/term` / `golang.org/x/sys` console calls it cannot see through. A
+  stable-CI test runs Go facts from committed JSON with no toolchain; the isolated
+  `go-check` job runs the live gopls path. See
+  [`notes/go-catalog.md`](./notes/go-catalog.md). The Go config `stub` that
+  shipped with the generic extractor is now the complete, wired config.
+
 - **A generic, all-Rust LSP-driven fact extractor (`crates/hinzu-lsp`) — hinzu's
   new baseline extraction mechanism.** A synchronous Rust LSP client (the port of
   the retired `lspclient.py`) plus a language-agnostic extractor parameterized

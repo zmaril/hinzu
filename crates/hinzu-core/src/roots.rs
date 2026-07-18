@@ -98,6 +98,15 @@ const NODE_ANNOTATIONS: &str = include_str!("../annotations/node.toml");
 /// `alloc` rules — there is no `alloc` effect for a garbage-collected runtime.
 const PYTHON_ANNOTATIONS: &str = include_str!("../annotations/python.toml");
 
+/// hinzu's shipped Go effect-annotation defaults: the Go standard library's I/O
+/// surface, mapped to the same shared vocabulary. The counterpart to
+/// `std.toml` / `node.toml` / `python.toml` for the Go adapter's canonical
+/// external symbols (`os/exec::Command`, `os::ReadFile`, `net/http::Get`).
+/// Package-granular by import path, since Go has no submodule inheritance
+/// (`net/url` is pure, independent of `net`); it carries no `alloc` rules —
+/// there is no `alloc` effect for a garbage-collected runtime.
+const GO_ANNOTATIONS: &str = include_str!("../annotations/go.toml");
+
 impl Default for RootSeeds {
     /// The shipped Rust defaults (from `annotations/std.toml`) with no policy
     /// overrides. `pure_prefixes` carries only what that file's `[trust]`
@@ -131,6 +140,7 @@ impl RootSeeds {
             Language::Rust => Self::with_base(STD_ANNOTATIONS),
             Language::TypeScript => Self::with_base(NODE_ANNOTATIONS),
             Language::Python => Self::with_base(PYTHON_ANNOTATIONS),
+            Language::Go => Self::with_base(GO_ANNOTATIONS),
         }
     }
 

@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod adapter_harness;
+mod go_adapter;
 mod py_adapter;
 mod rust_adapter;
 mod ts_adapter;
@@ -144,8 +145,8 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
     }
     // A Cargo.toml routes to the Rust StableMIR path; a tsconfig/package.json to
     // the TypeScript compiler-API adapter; a pyproject/setup.py/setup.cfg to the
-    // ty-driven Python adapter. Rust wins a tie so a Rust crate with a stray
-    // package.json is not misrouted.
+    // ty-driven Python adapter; a go.mod to the gopls-driven Go adapter. Rust
+    // wins a tie so a Rust crate with a stray package.json is not misrouted.
     if rust_adapter::is_cargo_project(&args.path) {
         return rust_adapter::extract_facts(&args.path)
             .with_context(|| format!("extracting Rust facts from {}", args.path.display()));
@@ -158,16 +159,20 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
         return py_adapter::extract_facts(&args.path)
             .with_context(|| format!("extracting Python facts from {}", args.path.display()));
     }
+    if go_adapter::is_go_project(&args.path) {
+        return go_adapter::extract_facts(&args.path)
+            .with_context(|| format!("extracting Go facts from {}", args.path.display()));
+    }
     anyhow::bail!(
-        "{} is not a cargo, TypeScript, or Python project — pass --facts <json> to analyze \
+        "{} is not a cargo, TypeScript, Python, or Go project — pass --facts <json> to analyze \
          pre-extracted facts",
         args.path.display()
     )
 }
 
 /// The language to seed effect roots for: whichever non-Rust language any
-/// definition declares (TypeScript or Python), else Rust. Reading it from the
-/// facts keeps `--facts` JSON and a live extraction on the same path.
+/// definition declares (TypeScript, Python, or Go), else Rust. Reading it from
+/// the facts keeps `--facts` JSON and a live extraction on the same path.
 fn facts_language(facts: &FactSet) -> Language {
     facts
         .defs

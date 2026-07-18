@@ -81,3 +81,13 @@ JSON-RPC
 stdio
 monotonic
 utf
+gopls
+goroutine
+GOROOT
+GOMODCACHE
+GOTOOLCHAIN
+golang
+ioutil
+filepath
+bufio
+curlie

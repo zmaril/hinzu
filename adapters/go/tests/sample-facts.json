@@ -1,0 +1,124 @@
+{
+  "definitions": [
+    {
+      "id": "core/core.go#BuildAndReport",
+      "display": "BuildAndReport",
+      "language": "go",
+      "file": "core/core.go",
+      "line_start": 42,
+      "line_end": 45
+    },
+    {
+      "id": "core/core.go#CountKeys",
+      "display": "CountKeys",
+      "language": "go",
+      "file": "core/core.go",
+      "line_start": 29,
+      "line_end": 31
+    },
+    {
+      "id": "core/core.go#LoadAndSummarize",
+      "display": "LoadAndSummarize",
+      "language": "go",
+      "file": "core/core.go",
+      "line_start": 35,
+      "line_end": 38
+    },
+    {
+      "id": "core/core.go#Parse",
+      "display": "Parse",
+      "language": "go",
+      "file": "core/core.go",
+      "line_start": 17,
+      "line_end": 26
+    },
+    {
+      "id": "effects/effects.go#ReadConfig",
+      "display": "ReadConfig",
+      "language": "go",
+      "file": "effects/effects.go",
+      "line_start": 13,
+      "line_end": 19
+    },
+    {
+      "id": "effects/effects.go#RunTool",
+      "display": "RunTool",
+      "language": "go",
+      "file": "effects/effects.go",
+      "line_start": 23,
+      "line_end": 30
+    }
+  ],
+  "edges": [
+    {
+      "caller": "core/core.go#LoadAndSummarize",
+      "callee": "core/core.go#Parse",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core/core.go",
+      "evidence_line": 36
+    },
+    {
+      "caller": "core/core.go#LoadAndSummarize",
+      "callee": "core/core.go#CountKeys",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core/core.go",
+      "evidence_line": 37
+    },
+    {
+      "caller": "core/core.go#LoadAndSummarize",
+      "callee": "effects/effects.go#ReadConfig",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core/core.go",
+      "evidence_line": 36
+    },
+    {
+      "caller": "core/core.go#BuildAndReport",
+      "callee": "effects/effects.go#RunTool",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core/core.go",
+      "evidence_line": 43
+    },
+    {
+      "caller": "effects/effects.go#ReadConfig",
+      "callee": "os::ReadFile",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects/effects.go",
+      "evidence_line": 14
+    },
+    {
+      "caller": "effects/effects.go#RunTool",
+      "callee": "os/exec::Command",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects/effects.go",
+      "evidence_line": 24
+    },
+    {
+      "caller": "effects/effects.go#RunTool",
+      "callee": "os/exec::(*Cmd).Output",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects/effects.go",
+      "evidence_line": 24
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "os/exec::(*Cmd).Output",
+      "effect": "process"
+    },
+    {
+      "symbol": "os/exec::Command",
+      "effect": "process"
+    },
+    {
+      "symbol": "os::ReadFile",
+      "effect": "fs"
+    }
+  ]
+}

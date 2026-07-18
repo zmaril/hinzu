@@ -1,0 +1,126 @@
+# hinzu's built-in Go effect annotations — the shipped library annotation set
+# for Go, the counterpart to `std.toml` for Rust, `node.toml` for TypeScript,
+# and `python.toml` for Python. It maps the Go standard library's built-in
+# effect surface to hinzu's ONE flat, shared effect vocabulary: `fs` is `fs` and
+# `net` is `net` for every language. Go seeds a SUBSET of the shared categories;
+# a category that does not apply simply does not appear.
+#
+# There is deliberately NO `alloc` effect for Go. Rust's `alloc` marks heap
+# allocation as a certifiable effect; on a garbage-collected runtime an
+# allocation is not an observable effect a functional-core policy can
+# meaningfully forbid, so it is absent here — absent, not renamed (the same call
+# TypeScript and Python make). `db` is a shared category but Go reaches a
+# database through a driver package behind `database/sql`, so it is declared per
+# project with a `[trust]` line rather than shipped here.
+#
+# The Go path (hinzu's generic Rust LSP extractor, `crates/hinzu-lsp`, driving
+# gopls over its LSP as the sole resolution backend) resolves each callee by
+# declaration provenance and emits a canonical `<import-path>::<qualname>`
+# symbol for every no-body external it sees: `os/exec::Command` for a process
+# spawn, `os::ReadFile` for a stdlib filesystem read, `net/http::Get` for an
+# HTTP call. This table maps those symbols to their effect using the same
+# segment-aligned matcher Rust, TypeScript, and Python use, so a project's
+# `[roots]` / `[trust]` overrides work identically across all four languages.
+# The adapter also emits these roots directly; this table keeps hinzu-core's
+# Unknown classification in agreement and is the honest, auditable record of
+# what Go's surface means.
+#
+# Provenance is PACKAGE-GRANULAR by import path, and Go effects do NOT inherit to
+# a nested import path (`net/url` is pure, independent of `net`; the config sets
+# `package_effects_inherit = false`). Where a whole package is effect-dominant it
+# gets a bare rule; where a package is effect-MIXED — most of all `os`, whose
+# accessors are `env` but whose file operations are `fs` — it gets specific
+# `<pkg>::<Func>` rows instead, so the pure remainder stays pure. See
+# notes/go-catalog.md for the over-approximation caveat on the coarse rules.
+
+[roots]
+
+# --- filesystem --------------------------------------------------------------
+# The buffered/streaming I/O packages and the path-walking helpers. These are
+# coarse, whole-package rules: `io`/`bufio` are the Reader/Writer plumbing most
+# file and socket I/O flows through, and `path/filepath` walks and globs the
+# disk (its pure path algebra — `Join`, `Dir`, `Base`, `Clean` — is the
+# over-approximated remainder a project can `[trust] "path/filepath" = "pure"`).
+"io" = "fs"
+"io/ioutil" = "fs"
+"bufio" = "fs"
+"path/filepath" = "fs"
+
+# os filesystem operations. `os` is effect-MIXED — its file operations are `fs`,
+# its environment accessors are `env` (below), and the rest (os.Args, os.Exit,
+# os.Getpid) is pure — so it takes specific rows rather than a whole-package
+# rule.
+"os::ReadFile" = "fs"
+"os::WriteFile" = "fs"
+"os::Open" = "fs"
+"os::OpenFile" = "fs"
+"os::Create" = "fs"
+"os::CreateTemp" = "fs"
+"os::Remove" = "fs"
+"os::RemoveAll" = "fs"
+"os::Mkdir" = "fs"
+"os::MkdirAll" = "fs"
+"os::MkdirTemp" = "fs"
+"os::Rename" = "fs"
+"os::Link" = "fs"
+"os::Symlink" = "fs"
+"os::Readlink" = "fs"
+"os::Truncate" = "fs"
+"os::Stat" = "fs"
+"os::Lstat" = "fs"
+"os::ReadDir" = "fs"
+"os::Chmod" = "fs"
+"os::Chown" = "fs"
+"os::Chtimes" = "fs"
+"os::NewFile" = "fs"
+"os::Pipe" = "fs"
+
+# --- process -----------------------------------------------------------------
+# `os/exec` is wholly about running external commands — every entry point
+# (Command, CommandContext, Cmd.Run, Cmd.Output, Cmd.Start, LookPath) is a
+# process effect, so it takes a whole-package rule. os.StartProcess is the
+# low-level spawn primitive.
+"os/exec" = "process"
+"os::StartProcess" = "process"
+
+# --- network -----------------------------------------------------------------
+# `net` (sockets, Dial, Listen) and the protocol packages built on it are net.
+# `net/url` is deliberately absent — it is pure URL parsing and construction,
+# not I/O. `crypto/tls` opens secured connections.
+"net" = "net"
+"net/http" = "net"
+"net/rpc" = "net"
+"net/smtp" = "net"
+"net/textproto" = "net"
+"crypto/tls" = "net"
+
+# --- ambient environment -----------------------------------------------------
+# The `os` environment and working-directory accessors (the `env` half of the
+# effect-mixed `os` package).
+"os::Getenv" = "env"
+"os::LookupEnv" = "env"
+"os::Setenv" = "env"
+"os::Unsetenv" = "env"
+"os::Clearenv" = "env"
+"os::Environ" = "env"
+"os::ExpandEnv" = "env"
+"os::Getwd" = "env"
+"os::Chdir" = "env"
+"os::Hostname" = "env"
+"os::UserHomeDir" = "env"
+"os::UserConfigDir" = "env"
+"os::UserCacheDir" = "env"
+
+# --- clock -------------------------------------------------------------------
+# The `time` package. Its wall-clock reads (`time.Now`, `time.Since`) and sleeps
+# (`time.Sleep`, `time.After`, `time.Tick`) are the clock effect; the pure
+# remainder (Duration arithmetic, `time.Parse`, formatting) is the coarse
+# over-approximation a project can `[trust] "time" = "pure"` if it uses only
+# those.
+"time" = "clock"
+
+# --- randomness --------------------------------------------------------------
+# Nondeterminism: `math/rand` (and its v2), `crypto/rand`.
+"math/rand" = "random"
+"math/rand/v2" = "random"
+"crypto/rand" = "random"
