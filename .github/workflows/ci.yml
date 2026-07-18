@@ -31,6 +31,7 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - 'hinzu-self.toml'
+              - 'adapters/**'
               - '.github/workflows/ci.yml'
 
   rust:
@@ -96,3 +97,34 @@ jobs:
         env:
           HINZU_RUSTC_DRIVER: ${{ github.workspace }}/crates/hinzu-rustc-driver/target/release/hinzu-rustc-driver
         run: ./target/release/hinzu check crates/hinzu-core --policy hinzu-self.toml
+
+  # Run `hinzu check` on the TypeScript fixture end to end: build the CLI on
+  # stable, install the Node adapter's one dependency (typescript), and check the
+  # fixture project through the SHARED pipeline (adapter -> SQLite -> DBSP ->
+  # policy). It must flag the functional-core leak with the evidence path.
+  #
+  # Isolated from the `rust` job like `self-check` is. Node lives only here; the
+  # stable Rust jobs never depend on it. This job builds the CLI on the workspace
+  # pin (1.96.0, via rust-toolchain.toml) and never touches the nightly driver.
+  ts-check:
+    name: ts-check
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: build the hinzu CLI (stable 1.96.0)
+        run: cargo build --release -p hinzu-cli
+      - name: install the TypeScript adapter's dependencies
+        working-directory: adapters/typescript
+        run: npm install --no-audit --no-fund
+      # The live adapter path: extract facts from the fixture with the Node
+      # compiler API, propagate, and check. A missing violation fails the test.
+      - name: hinzu check the TypeScript fixture (functional-core leak)
+        run: cargo test -p hinzu-cli --test ts_check -- --ignored --exact check_typescript_project_end_to_end

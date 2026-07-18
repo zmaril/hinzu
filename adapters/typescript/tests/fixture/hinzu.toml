@@ -1,0 +1,19 @@
+# The fixture's functional-core policy. `src/core.ts` is the pure core — no
+# filesystem, network, or subprocess effects, however deep the call chain.
+# `src/io.ts` is the sanctioned adapter layer, where the filesystem effect is
+# allowed to live. `hinzu check` must flag `loadAndSummarize` (in the core) for
+# reaching the filesystem through `readConfig`, with the evidence path down to
+# the `node:fs` root.
+
+[analysis]
+on_unknown = "fail"
+
+# The functional core: no effects. `src/io.ts` is carved out below.
+[region.core]
+paths  = ["src/**"]
+forbid = ["fs", "net", "process"]
+
+# The adapter layer — where the filesystem effect belongs.
+[region.io]
+paths = ["src/io.ts"]
+allow = ["fs", "net", "process", "env", "clock", "random"]

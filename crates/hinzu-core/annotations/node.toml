@@ -1,0 +1,69 @@
+# hinzu's built-in TypeScript / Node effect annotations — the shipped library
+# annotation set for TypeScript, the counterpart to `std.toml` for Rust. It maps
+# the Node runtime's built-in effect surface to hinzu's ONE flat, shared effect
+# vocabulary: `fs` is `fs` and `net` is `net` for both languages. TypeScript
+# seeds a SUBSET of the shared categories; a category that does not apply simply
+# does not appear.
+#
+# There is deliberately NO `alloc` effect for TypeScript. Rust's `alloc` marks
+# heap allocation as a certifiable effect; on a garbage-collected runtime an
+# allocation is not an observable effect a functional-core policy can meaningfully
+# forbid, so it is absent here — absent, not renamed.
+#
+# The TypeScript adapter (`adapters/typescript/analyze.mjs`) resolves each callee
+# by *declaration provenance* with the compiler API and emits a canonical
+# `::`-segmented symbol for every no-body external it sees: `node:fs::readFileSync`
+# for a Node built-in, `global::fetch` for an ambient global, `<package>::<member>`
+# for an npm call. This table maps those symbols to their effect using the same
+# segment-aligned matcher Rust's std annotations use, so a project's `[roots]` /
+# `[trust]` overrides work identically across both languages. The adapter also
+# emits these roots directly; this table keeps hinzu-core's Unknown classification
+# in agreement, and is the honest, auditable record of what Node's surface means.
+#
+# Third-party npm packages are NOT listed here: they are Unknown until a project
+# vouches for them in its own `hinzu.toml` (`[trust] "pg" = ["db"]`, or
+# `"left-pad" = "pure"`). The well-known effectful packages the adapter seeds
+# directly (cross-spawn, execa, undici, node-fetch, ws) are the pragmatic
+# exception, documented in `notes/typescript-catalog.md`.
+
+[roots]
+
+# --- filesystem --------------------------------------------------------------
+"node:fs" = "fs"
+"node:fs/promises" = "fs"
+
+# --- subprocess --------------------------------------------------------------
+"node:child_process" = "process"
+
+# --- network -----------------------------------------------------------------
+"node:net" = "net"
+"node:http" = "net"
+"node:https" = "net"
+"node:http2" = "net"
+"node:tls" = "net"
+"node:dgram" = "net"
+"node:dns" = "net"
+"global::fetch" = "net"
+"global::WebSocket" = "net"
+
+# --- ambient environment -----------------------------------------------------
+"global::process.env" = "env"
+"global::process.argv" = "env"
+"global::process.argv0" = "env"
+"global::process.cwd" = "env"
+"global::process.exit" = "env"
+
+# --- clock -------------------------------------------------------------------
+"global::Date.now" = "clock"
+"global::performance.now" = "clock"
+
+# --- randomness --------------------------------------------------------------
+"global::Math.random" = "random"
+"node:crypto::getRandomValues" = "random"
+"node:crypto::randomBytes" = "random"
+"node:crypto::randomUUID" = "random"
+"node:crypto::randomInt" = "random"
+"node:crypto::randomFillSync" = "random"
+"node:crypto::randomFill" = "random"
+"node:crypto::generateKeyPair" = "random"
+"node:crypto::generateKeyPairSync" = "random"

@@ -60,7 +60,10 @@ fn check_without_facts_on_a_non_cargo_path_fails_honestly() {
         .failure();
 
     let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    assert!(err.contains("is not a cargo project"), "stderr was:\n{err}");
+    assert!(
+        err.contains("is neither a cargo project nor a TypeScript project"),
+        "stderr was:\n{err}"
+    );
 }
 
 /// The reference `naive` engine produces the same violation as the default
