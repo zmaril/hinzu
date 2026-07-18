@@ -1,3 +1,5 @@
+<!-- housekeeper:description A Rust CLI, laid out as a Cargo workspace with a core engine crate and a thin command-line shell -->
+<!-- housekeeper:topics cargo-workspace, cli, command-line-tool, rust -->
 # hinzu
 
 hinzu is a language-independent analysis layer that sits above existing
