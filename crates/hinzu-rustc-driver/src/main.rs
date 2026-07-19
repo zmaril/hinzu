@@ -47,7 +47,7 @@ use std::ops::ControlFlow;
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::mir::{AggregateKind, MirVisitor, Operand, Rvalue, TerminatorKind};
-use rustc_public::ty::{RigidTy, TyKind};
+use rustc_public::ty::{FnDef, GenericArgs, RigidTy, TyKind};
 use rustc_public::{CrateDef, ItemKind};
 use serde::Serialize;
 
@@ -133,6 +133,19 @@ fn effect_category(name: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The precise monomorphic name of a function item, falling back to the
+/// polymorphic def name when `Instance::resolve` cannot monomorphize it (a
+/// generic or trait call in a polymorphic body — the fallback keeps the
+/// statically-known trait-method name). Shared by the call path
+/// ([`CallCollector::visit_terminator`]) and the reference path
+/// ([`CallCollector::reference_operand`]) so both resolve a callee identically.
+fn fndef_name(def: FnDef, args: &GenericArgs) -> String {
+    match Instance::resolve(def, args) {
+        Ok(inst) => inst.name(),
+        Err(_) => def.name(),
+    }
 }
 
 /// A span's file and 1-based start line.
@@ -243,11 +256,7 @@ impl CallCollector<'_> {
         if let Operand::Constant(_) = op {
             match op.ty(self.locals).map(|t| t.kind()) {
                 Ok(TyKind::RigidTy(RigidTy::FnDef(def, args))) => {
-                    let callee = match Instance::resolve(def, &args) {
-                        Ok(inst) => inst.name(),
-                        Err(_) => def.name(),
-                    };
-                    self.push_reference(callee, file.to_string(), line);
+                    self.push_reference(fndef_name(def, &args), file.to_string(), line);
                 }
                 Ok(TyKind::RigidTy(RigidTy::Closure(def, _))) => {
                     self.push_reference(def.name(), file.to_string(), line);
@@ -273,11 +282,7 @@ impl MirVisitor for CallCollector<'_> {
                 // trait-method name — it is still a named `call`, classified by
                 // name downstream, not an anonymous unresolved target.
                 Ok(TyKind::RigidTy(RigidTy::FnDef(def, args))) => {
-                    let callee = match Instance::resolve(def, &args) {
-                        Ok(inst) => inst.name(),
-                        Err(_) => def.name(),
-                    };
-                    self.push_direct(callee, file.clone(), line);
+                    self.push_direct(fndef_name(def, &args), file.clone(), line);
                 }
                 // A fn-pointer / dyn value, or an operand whose type is
                 // unavailable: unresolved either way.
