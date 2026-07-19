@@ -274,17 +274,33 @@ The seeded categories are the shared vocabulary, minus `alloc`: `fs`, `net`,
 hinzu's Rust-precision path; the generic LSP adapter is the baseline everywhere
 else.
 
-### Honest fidelity: call-only
+### Fidelity: call edges plus a tree-sitter reference rung
 
-The generic extractor is **call-only**. `callHierarchy/outgoingCalls` reports only
-the calls the server resolved, so — unlike the old AST walk — it does not see three
-things: higher-order `reference` edges (a function passed as a
-value/callback/decorator); an ambient attribute read such as `os.environ`; and a
-call site the server could not resolve at all. All three need a language body walk,
-deferred to a future language-agnostic tree-sitter rung (also Rust). Unknown-by-default over the
-calls it *does* resolve keeps the result sound — a resolved call into an unvouched
+`callHierarchy/outgoingCalls` reports only the calls the server resolved, so on its
+own the generic extractor is **call-only** — it misses higher-order `reference`
+uses (a function passed as a value/callback/decorator) and any use at module scope
+(which call hierarchy never anchors). The **reference-level rung of the precision
+ladder is now implemented for Python**, restoring what the native Rust/TypeScript
+adapters already emit. `crates/hinzu-lsp/src/treesitter.rs` parses each file with
+`tree-sitter` and enumerates its non-call reference sites (a name used as a value,
+plus module-scope call callees); `extract.rs` resolves each through the *same*
+`textDocument/definition` → provenance → effect path as calls, attributes it to the
+enclosing function (or a synthetic per-file `<module>` node for import-time /
+class-body code), and emits a `reference` edge. It is **sound-additive** — only
+adding edges/effects, so no violation the call pass found can vanish. What remains
+uncovered is an ambient *attribute read* (`os.environ`) and a call site the server
+could not resolve at all. **Go and other LSP-tier languages** are a documented
+follow-up: the same rung with a per-grammar node/field table. Unknown-by-default
+over what it resolves keeps the result sound — a resolved use into an unvouched
 third-party package is an `Unknown` that fails closed under `on_unknown = fail`,
 never a silent pure.
+
+The rung's payoff, measured on **entl-python** (whose SQLAlchemy read-plane is used
+entirely at module scope): the `db` effect goes from **0 → 3 roots**
+(`create_engine`, `Session.scalar`, `Session.scalars`) where call-only saw none,
+and `entl.models`' module-level model construction (`declarative_base`, `Column`,
+`event.listen`) becomes visible/policeable for the first time — see
+[python-catalog.md](./python-catalog.md).
 
 ### Measured on housekeeping (before → after)
 

@@ -1,0 +1,12 @@
+# Project marker so `hinzu check` routes this fixture to the Python adapter, and a
+# pinned ty target environment so the vendored typeshed stdlib resolves
+# deterministically (the adapter pins the same target in the LSP `initialize`).
+[project]
+name = "hinzu-python-reference-fixture"
+version = "0.0.0"
+description = "Reference-edge (higher-order + module-level SQLAlchemy) fixture for the hinzu Python adapter."
+requires-python = ">=3.11"
+
+[tool.ty.environment]
+python-version = "3.11"
+python-platform = "linux"

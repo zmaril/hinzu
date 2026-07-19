@@ -136,6 +136,19 @@ impl LanguageConfig {
     /// specific row wins over the whole-`<package>` row — so `os::system`
     /// (process) overrides the absence of a bare `os` effect, and most of `os`
     /// stays pure. Keyed on the canonical symbol the extractor reconstructs.
+    ///
+    /// For a language whose effects inherit (`package_effects_inherit`, i.e.
+    /// Python), the lookup also walks UP the dotted package prefixes. This does
+    /// two jobs. First, whole-module inheritance: `urllib.request` inherits
+    /// `urllib`'s net effect. Second — and this is why annotations are authored at
+    /// the PUBLIC-API name — it matches a re-exported symbol resolved to its
+    /// INTERNAL defining module. A type checker resolves `create_engine` to
+    /// `sqlalchemy.engine.create` (its real definition), yielding the symbol
+    /// `sqlalchemy.engine.create::create_engine`, but the annotation is the public
+    /// `sqlalchemy::create_engine`; collapsing the qualname onto each ancestor
+    /// package (`sqlalchemy.engine::create_engine`, then `sqlalchemy::create_engine`)
+    /// recovers the authored `db` root. Latent under call-only (which emitted no
+    /// SQLAlchemy edges at all); the reference rung makes it fire.
     pub fn effect_of(&self, symbol: &str, package: &str) -> Option<Effect> {
         if let Some(e) = self.effect_specific.get(symbol) {
             return Some(*e);
@@ -143,12 +156,18 @@ impl LanguageConfig {
         if let Some(e) = self.effect_package.get(package) {
             return Some(*e);
         }
-        // Submodule inheritance (Python): `urllib.request` inherits `urllib`'s
-        // net effect. Walk up the dotted prefixes, longest already tried above.
         if self.package_effects_inherit {
+            // The qualname is the part after `<package>::` — reattached to each
+            // ancestor package as we walk up the dotted prefixes.
+            let qual = symbol.split_once("::").map(|(_, q)| q);
             let mut pkg = package;
             while let Some(idx) = pkg.rfind(&self.package_separator) {
                 pkg = &pkg[..idx];
+                if let Some(q) = qual {
+                    if let Some(e) = self.effect_specific.get(&format!("{pkg}::{q}")) {
+                        return Some(*e);
+                    }
+                }
                 if let Some(e) = self.effect_package.get(pkg) {
                     return Some(*e);
                 }
@@ -423,6 +442,49 @@ mod tests {
         assert_eq!(cfg.effect_of("yaml::safe_load", "yaml"), None);
         assert_eq!(
             cfg.effect_of("rich.console::Console.print", "rich.console"),
+            None
+        );
+    }
+
+    #[test]
+    fn public_api_annotation_matches_internal_resolution_module() {
+        // A type checker resolves a re-exported public symbol to its INTERNAL
+        // defining module, so the extractor reconstructs a deep package path
+        // (`sqlalchemy.engine.create::create_engine`) — but the annotation is the
+        // public `sqlalchemy::create_engine`. The prefix walk collapses the
+        // qualname onto the ancestor package and recovers the `db` root.
+        let cfg = python_test_config();
+        assert_eq!(
+            cfg.effect_of(
+                "sqlalchemy.engine.create::create_engine",
+                "sqlalchemy.engine.create"
+            ),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            cfg.effect_of(
+                "sqlalchemy.orm.session::sessionmaker",
+                "sqlalchemy.orm.session"
+            ),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            cfg.effect_of(
+                "sqlalchemy.orm.session::Session.execute",
+                "sqlalchemy.orm.session"
+            ),
+            Some(Effect::Db)
+        );
+        // The construction surface stays fail-closed Unknown even via a deep
+        // module — no public `sqlalchemy::Column` row exists to collapse onto.
+        assert_eq!(
+            cfg.effect_of("sqlalchemy.sql.schema::Column", "sqlalchemy.sql.schema"),
+            None
+        );
+        // The prefix walk never fabricates an effect for an unrelated stdlib
+        // submodule symbol.
+        assert_eq!(
+            cfg.effect_of("importlib.util::find_spec", "importlib.util"),
             None
         );
     }

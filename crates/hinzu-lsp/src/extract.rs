@@ -25,14 +25,28 @@
 //!      Unknown-by-default classification fails closed on it — exactly like the
 //!      native adapters.
 //!
-//! Fidelity, stated honestly: this is **call-only**. `callHierarchy/outgoingCalls`
-//! reports only the calls the server resolved, so it does not see higher-order
-//! `reference` edges — a function passed as a value/callback/decorator — an
-//! ambient attribute read, nor a call site the server could not resolve at all.
-//! These need a language body walk; hinzu defers them to a future
-//! language-agnostic tree-sitter rung (also Rust). Unknown-by-default over the
-//! calls it *does* resolve keeps the result sound, never silently pure. See
-//! notes/python-catalog.md.
+//! Fidelity, stated honestly: `callHierarchy/outgoingCalls` is **call-only** — it
+//! reports only the calls the server resolved, missing higher-order `reference`
+//! uses (a function passed as a value/callback/decorator) and module-level
+//! (import-time) usage it never anchors. A second, syntactic rung closes that gap
+//! for Python: [`crate::treesitter`] parses each file with tree-sitter and
+//! enumerates those reference sites; [`Extractor::collect_references`] resolves
+//! each through the same `textDocument/definition` → provenance → effect path and
+//! emits `reference` edges (see step 5 below). The rung is SOUND-ADDITIVE — it
+//! only adds edges/effects — so no violation the call pass found can vanish. What
+//! remains uncovered is an ambient attribute read (`os.environ`) and a call site
+//! the server could not resolve at all; Unknown-by-default over what it does
+//! resolve keeps the result sound, never silently pure. Go and the other LSP-tier
+//! languages reuse the same reference rung once their grammar's node/field table
+//! is added — a documented follow-up. See notes/python-catalog.md.
+//!
+//!   5. reference edges (Python): a tree-sitter pass over each source file
+//!      enumerates non-call reference sites — a name used as a value, plus
+//!      module-scope call callees — attributes each to its enclosing collected
+//!      function (or a synthetic per-file `<module>` definition for import-time /
+//!      class-body code), resolves it via `textDocument/definition`, and emits a
+//!      `reference` edge through the shared classifier, deduped against the call
+//!      edges by position (a callee inside a function is left to step 3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -126,7 +140,7 @@ pub struct Extractor<'c> {
     /// Cached symbol index of an external target file: (lo, hi, qual, kind).
     target_syms: BTreeMap<String, Vec<(u32, u32, String, i64)>>,
     opened_targets: BTreeSet<String>,
-    // metrics
+    // metrics — call edges
     pub n_call_edges: usize,
     pub n_local: usize,
     pub n_effect: usize,
@@ -134,6 +148,14 @@ pub struct Extractor<'c> {
     pub n_unknown: usize,
     pub n_prepare_ok: usize,
     pub n_prepare_empty: usize,
+    // metrics — reference edges (the tree-sitter syntactic rung)
+    pub n_ref_sites: usize,
+    pub n_ref_edges: usize,
+    pub n_ref_local: usize,
+    pub n_ref_effect: usize,
+    pub n_ref_stdlib_pure: usize,
+    pub n_ref_unknown: usize,
+    pub n_module_defs: usize,
 }
 
 impl<'c> Extractor<'c> {
@@ -157,6 +179,13 @@ impl<'c> Extractor<'c> {
             n_unknown: 0,
             n_prepare_ok: 0,
             n_prepare_empty: 0,
+            n_ref_sites: 0,
+            n_ref_edges: 0,
+            n_ref_local: 0,
+            n_ref_effect: 0,
+            n_ref_stdlib_pure: 0,
+            n_ref_unknown: 0,
+            n_module_defs: 0,
         }
     }
 
@@ -213,6 +242,7 @@ impl<'c> Extractor<'c> {
 
         self.collect_definitions(lsp)?;
         self.collect_calls(lsp)?;
+        self.collect_references(lsp)?;
         Ok(())
     }
 
@@ -400,70 +430,104 @@ impl<'c> Extractor<'c> {
     }
 
     fn emit_call(&mut self, lsp: &mut LspClient, caller_id: &str, call: &OutgoingCall) {
-        let callee_path = uri_to_path(&call.to.uri);
         let callee_def_line = call.to.selection_range.start.line + 1;
         let caller_file = caller_id.split('#').next().unwrap_or("").to_string();
-
-        // Local (owned) callee?
-        let local_rel = self.owned_rel(&callee_path);
         let lines: Vec<u32> = if call.from_ranges.is_empty() {
             vec![call.to.selection_range.start.line + 1]
         } else {
             call.from_ranges.iter().map(|r| r.start.line + 1).collect()
         };
+        for line in &lines {
+            self.classify_and_emit(
+                lsp,
+                caller_id,
+                &call.to.uri,
+                callee_def_line,
+                EdgeKind::Call,
+                &caller_file,
+                *line,
+            );
+        }
+    }
 
-        if let Some(rel) = local_rel {
-            let local_id = self.def_at(&rel, callee_def_line);
-            for line in &lines {
-                self.n_call_edges += 1;
-                match &local_id {
-                    Some(id) => {
-                        self.n_local += 1;
-                        let id = id.clone();
-                        self.add_edge(
-                            caller_id,
-                            &id,
-                            EdgeKind::Call,
-                            EdgeResolution::Call,
-                            &caller_file,
-                            *line,
-                        );
-                    }
-                    None => {
-                        // A local target that is not a collected callable: most
-                        // often construction of a local class. Thread to its
-                        // `__init__` so the constructor's own effects propagate;
-                        // a class with no tracked `__init__` (e.g. a dataclass)
-                        // is pure, so no edge — matching the native adapter.
-                        if let Some(init) =
-                            self.local_class_init(lsp, &call.to.uri, &rel, callee_def_line)
-                        {
-                            self.n_local += 1;
-                            self.add_edge(
-                                caller_id,
-                                &init,
-                                EdgeKind::Call,
-                                EdgeResolution::Call,
-                                &caller_file,
-                                *line,
-                            );
-                        }
-                    }
-                }
-            }
-            return;
+    /// Resolve a used symbol (a call target, or a reference site's
+    /// `textDocument/definition` target) to a hinzu edge and emit it. Shared by
+    /// the call resolver and the tree-sitter reference resolver so both treat a
+    /// resolved-vs-unknown target identically: a LOCAL owned callee threads to the
+    /// collected definition (or its `__init__`); an EXTERNAL callee is classified
+    /// by provenance into an effect root, a trusted-pure stdlib baseline (no
+    /// edge), or a fail-closed `Unknown`. `kind` selects call vs reference (edge
+    /// kind, resolution, and which metric counters advance). Returns whether an
+    /// edge was actually added (false for a trusted-pure or dead-end target), so a
+    /// reference caller can tell whether its `<module>` node earned a definition.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_and_emit(
+        &mut self,
+        lsp: &mut LspClient,
+        caller_id: &str,
+        target_uri: &str,
+        target_def_line: u32,
+        kind: EdgeKind,
+        evidence_file: &str,
+        evidence_line: u32,
+    ) -> bool {
+        let is_call = matches!(kind, EdgeKind::Call);
+        let resolution = EdgeResolution::for_kind(kind);
+        let callee_path = uri_to_path(target_uri);
+        if is_call {
+            self.n_call_edges += 1;
+        } else {
+            self.n_ref_edges += 1;
         }
 
-        // External callee: reconstruct its class-qualified name, classify by
+        // Local (owned) target?
+        if let Some(rel) = self.owned_rel(&callee_path) {
+            match self.def_at(&rel, target_def_line) {
+                Some(id) => {
+                    self.bump_local(is_call);
+                    self.add_edge(
+                        caller_id,
+                        &id,
+                        kind,
+                        resolution,
+                        evidence_file,
+                        evidence_line,
+                    );
+                    return true;
+                }
+                None => {
+                    // A local target that is not a collected callable: most often
+                    // construction of a local class. Thread to its `__init__` so the
+                    // constructor's own effects propagate; a class with no tracked
+                    // `__init__` (e.g. a dataclass) is pure, so no edge.
+                    if let Some(init) =
+                        self.local_class_init(lsp, target_uri, &rel, target_def_line)
+                    {
+                        self.bump_local(is_call);
+                        self.add_edge(
+                            caller_id,
+                            &init,
+                            kind,
+                            resolution,
+                            evidence_file,
+                            evidence_line,
+                        );
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+
+        // External target: reconstruct its class-qualified name, classify by
         // provenance, and map to an effect.
         let (pkg, origin) = match self.cfg.package_of(&callee_path) {
             Some((p, o)) => (Some(p), Some(o)),
             None => (None, None),
         };
         let qual = self
-            .qualname_at(lsp, &call.to.uri, callee_def_line)
+            .qualname_at(lsp, target_uri, target_def_line)
             .unwrap_or_else(|| {
-                // Fall back to the file stem tail if the target has no symbol.
                 Path::new(&callee_path)
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -478,45 +542,179 @@ impl<'c> Extractor<'c> {
         let symbol = format!("{base}::{qual}");
         let effect = pkg.as_deref().and_then(|p| self.cfg.effect_of(&symbol, p));
 
-        for line in &lines {
-            self.n_call_edges += 1;
-            match (effect, origin) {
-                (Some(e), _) => {
-                    // An effect root: seed it directly by declaration provenance.
-                    self.add_edge(
-                        caller_id,
-                        &symbol,
-                        EdgeKind::Call,
-                        EdgeResolution::Call,
-                        &caller_file,
-                        *line,
-                    );
-                    self.roots.entry(symbol.clone()).or_insert(e);
-                    self.n_effect += 1;
-                }
-                (None, Some(Origin::Stdlib)) => {
-                    // A pure standard-library call: trusted-pure baseline, so no
-                    // edge — it must never become an Unknown (hinzu-core's pure
-                    // baseline is Rust's std::, which would not clear it).
-                    self.n_stdlib_pure += 1;
-                }
-                (None, _) => {
-                    // A third-party package (or an unmapped foreign file) we
-                    // cannot see through: an edge with no root, so hinzu-core
-                    // marks it Unknown and fails closed until a `[trust]` line
-                    // vouches for it.
-                    self.add_edge(
-                        caller_id,
-                        &symbol,
-                        EdgeKind::Call,
-                        EdgeResolution::Call,
-                        &caller_file,
-                        *line,
-                    );
-                    self.n_unknown += 1;
-                }
+        match (effect, origin) {
+            (Some(e), _) => {
+                // An effect root: seed it directly by declaration provenance.
+                self.add_edge(
+                    caller_id,
+                    &symbol,
+                    kind,
+                    resolution,
+                    evidence_file,
+                    evidence_line,
+                );
+                self.roots.entry(symbol.clone()).or_insert(e);
+                self.bump_effect(is_call);
+                true
+            }
+            (None, Some(Origin::Stdlib)) => {
+                // A pure standard-library target: trusted-pure baseline, so no
+                // edge — it must never become an Unknown (hinzu-core's pure
+                // baseline is Rust's std::, which would not clear it).
+                self.bump_stdlib_pure(is_call);
+                false
+            }
+            (None, _) => {
+                // A third-party package (or an unmapped foreign file) we cannot
+                // see through: an edge with no root, so hinzu-core marks it Unknown
+                // and fails closed until a `[trust]` line vouches for it.
+                self.add_edge(
+                    caller_id,
+                    &symbol,
+                    kind,
+                    resolution,
+                    evidence_file,
+                    evidence_line,
+                );
+                self.bump_unknown(is_call);
+                true
             }
         }
+    }
+
+    fn bump_local(&mut self, is_call: bool) {
+        if is_call {
+            self.n_local += 1;
+        } else {
+            self.n_ref_local += 1;
+        }
+    }
+    fn bump_effect(&mut self, is_call: bool) {
+        if is_call {
+            self.n_effect += 1;
+        } else {
+            self.n_ref_effect += 1;
+        }
+    }
+    fn bump_stdlib_pure(&mut self, is_call: bool) {
+        if is_call {
+            self.n_stdlib_pure += 1;
+        } else {
+            self.n_ref_stdlib_pure += 1;
+        }
+    }
+    fn bump_unknown(&mut self, is_call: bool) {
+        if is_call {
+            self.n_unknown += 1;
+        } else {
+            self.n_ref_unknown += 1;
+        }
+    }
+
+    // ---- reference edges (the tree-sitter syntactic rung) --------------------
+
+    /// The syntactic reference pass: for each owned source file, parse it with
+    /// tree-sitter and enumerate its non-call reference sites (a function/symbol
+    /// used as a value, plus module-scope call callees call hierarchy never
+    /// anchored), then resolve each through the SAME `textDocument/definition` →
+    /// provenance → effect path the call resolver uses and emit a `reference`
+    /// edge. It is SOUND-ADDITIVE: it only adds effects/edges, so no real
+    /// violation the call-only pass found can vanish; what it adds is the
+    /// higher-order and module-level (import-time) effects call hierarchy missed.
+    ///
+    /// Python-only for now — the enumeration in [`crate::treesitter`] is Python's
+    /// grammar. Go and the other LSP-tier languages are the same shape and a
+    /// documented follow-up.
+    fn collect_references(&mut self, lsp: &mut LspClient) -> Result<()> {
+        if self.cfg.language_id != "python" {
+            return Ok(());
+        }
+        for f in &self.files.clone() {
+            let uri = path_to_uri(f);
+            let relpath = self.rel(f);
+            let Ok(source) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            let sites = crate::treesitter::python_reference_sites(&source);
+            let module_id = format!("<module>@{relpath}");
+            let mut module_used = false;
+            for site in sites {
+                self.n_ref_sites += 1;
+                // Attribute the site to its nearest enclosing collected function
+                // by source position (the reference's "caller"); a site with no
+                // enclosing function is import-time / class-body code, attributed
+                // to the file's synthetic `<module>` node.
+                let enclosing = self.def_at(&relpath, site.site_line);
+                // A call callee INSIDE a function is already a call-hierarchy
+                // `call` edge — skip it here (the dedupe, by position). At module
+                // scope there is no such edge, so it is emitted.
+                if site.is_call_callee && enclosing.is_some() {
+                    continue;
+                }
+                let caller_id = enclosing.unwrap_or_else(|| module_id.clone());
+                let is_module = caller_id == module_id;
+                let Some((turi, def_line)) =
+                    self.resolve_definition(lsp, &uri, site.query_line, site.query_char)
+                else {
+                    // Unresolved: the call path likewise never enumerates a target
+                    // it cannot resolve, so this adds nothing rather than guessing.
+                    continue;
+                };
+                let added = self.classify_and_emit(
+                    lsp,
+                    &caller_id,
+                    &turi,
+                    def_line,
+                    EdgeKind::Reference,
+                    &relpath,
+                    site.site_line,
+                );
+                if added && is_module {
+                    module_used = true;
+                }
+            }
+            // Emit the synthetic `<module>` definition only when an import-time
+            // effect/edge actually attached to it, so import-time effects become
+            // visible and policeable without spawning empty nodes everywhere.
+            if module_used {
+                let line_end = source.lines().count().max(1) as u32;
+                self.definitions.insert(
+                    module_id.clone(),
+                    Definition {
+                        id: module_id,
+                        display: "<module>".to_string(),
+                        language: self.cfg.language(),
+                        file: relpath.clone(),
+                        line_start: 1,
+                        line_end,
+                    },
+                );
+                self.n_module_defs += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a reference site's `textDocument/definition`, returning the target
+    /// `(uri, 1-based def line)` — the same pair `emit_call` feeds
+    /// [`Self::classify_and_emit`] from a call-hierarchy callee. Handles the three
+    /// LSP shapes (`Location`, `Location[]`, `LocationLink[]`).
+    fn resolve_definition(
+        &mut self,
+        lsp: &mut LspClient,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<(String, u32)> {
+        let resp = lsp
+            .request(
+                "textDocument/definition",
+                serde_json::json!({"textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character}}),
+                Duration::from_secs(15),
+            )
+            .ok()?;
+        parse_definition_target(&resp)
     }
 
     /// If a local, non-callable call target is a class, the id of its tracked
@@ -727,7 +925,8 @@ impl<'c> Extractor<'c> {
     pub fn summary(&self) -> String {
         format!(
             "files {} | definitions {} | prepareOK {} prepareEmpty {} | call-edges {} \
-             (local {}, effect {}, stdlib-pure {}, unknown {}) | effect roots {}",
+             (local {}, effect {}, stdlib-pure {}, unknown {}) | ref-sites {} ref-edges {} \
+             (local {}, effect {}, stdlib-pure {}, unknown {}) module-defs {} | effect roots {}",
             self.files.len(),
             self.definitions.len(),
             self.n_prepare_ok,
@@ -737,6 +936,13 @@ impl<'c> Extractor<'c> {
             self.n_effect,
             self.n_stdlib_pure,
             self.n_unknown,
+            self.n_ref_sites,
+            self.n_ref_edges,
+            self.n_ref_local,
+            self.n_ref_effect,
+            self.n_ref_stdlib_pure,
+            self.n_ref_unknown,
+            self.n_module_defs,
             self.roots.len(),
         )
     }
@@ -773,4 +979,109 @@ fn first_target_uri(v: &serde_json::Value) -> Option<String> {
         .or_else(|| first.get("uri"))
         .and_then(|u| u.as_str())
         .map(str::to_string)
+}
+
+/// The first target of a `textDocument/definition` response as `(uri, 1-based
+/// def line)`, across the three LSP shapes: a bare `Location` (`uri` + `range`),
+/// a `Location[]`, or a `LocationLink[]` (`targetUri` + `targetSelectionRange` /
+/// `targetRange`). The def line is where the resolved symbol's name sits, which
+/// [`Extractor::qualname_at`] reconstructs the class-qualified name from — exactly
+/// as a call-hierarchy callee's `selectionRange` feeds it.
+fn parse_definition_target(v: &serde_json::Value) -> Option<(String, u32)> {
+    let first = if v.is_array() {
+        v.as_array()?.first()?
+    } else if v.is_null() {
+        return None;
+    } else {
+        v
+    };
+    let uri = first
+        .get("targetUri")
+        .or_else(|| first.get("uri"))
+        .and_then(|u| u.as_str())?;
+    let range = first
+        .get("targetSelectionRange")
+        .or_else(|| first.get("targetRange"))
+        .or_else(|| first.get("range"))?;
+    let line = range.pointer("/start/line").and_then(|l| l.as_u64())? as u32 + 1;
+    Some((uri.to_string(), line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn python_cfg() -> crate::config::LanguageConfig {
+        let mut subst = BTreeMap::new();
+        subst.insert("python_version".to_string(), "3.11".to_string());
+        subst.insert("python_platform".to_string(), "linux".to_string());
+        crate::config::LanguageConfig::from_parts(
+            crate::PYTHON_CONFIG,
+            &[crate::PYTHON_ANNOTATIONS, crate::PYTHON_LIB_ANNOTATIONS],
+            &subst,
+        )
+        .expect("python config parses")
+    }
+
+    /// A reference site inside a collected function attributes to that function;
+    /// one at module scope (no enclosing collected callable) attributes to the
+    /// file's synthetic `<module>` node — the SQLAlchemy / class-body case.
+    #[test]
+    fn module_scope_reference_attributes_to_module_node() {
+        let cfg = python_cfg();
+        let mut ex = Extractor::new(&cfg, Path::new("/proj"));
+        // A collected function `f` spanning lines 10..=20 of `m.py`.
+        ex.def_index
+            .entry("m.py".to_string())
+            .or_default()
+            .push(DefSpan {
+                lo: 10,
+                hi: 20,
+                id: "m.py#f".to_string(),
+            });
+        // Inside the function → attributed to `f`.
+        assert_eq!(ex.def_at("m.py", 15).as_deref(), Some("m.py#f"));
+        // At module scope (line 3, outside every def span) → no enclosing
+        // callable, so the emitter falls back to the `<module>` id.
+        assert_eq!(ex.def_at("m.py", 3), None);
+        let module_id = format!("<module>@{}", "m.py");
+        assert_eq!(module_id, "<module>@m.py");
+    }
+
+    #[test]
+    fn parse_definition_target_across_lsp_shapes() {
+        // LocationLink[] (linkSupport): targetUri + targetSelectionRange.
+        let link = serde_json::json!([{
+            "targetUri": "file:///x/subprocess.pyi",
+            "targetSelectionRange": {"start": {"line": 41, "character": 4},
+                                     "end": {"line": 41, "character": 7}},
+        }]);
+        assert_eq!(
+            parse_definition_target(&link),
+            Some(("file:///x/subprocess.pyi".to_string(), 42))
+        );
+        // Bare Location: uri + range.
+        let loc = serde_json::json!({
+            "uri": "file:///x/mod.py",
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 0, "character": 3}},
+        });
+        assert_eq!(
+            parse_definition_target(&loc),
+            Some(("file:///x/mod.py".to_string(), 1))
+        );
+        // Location[]: array of bare Locations.
+        let arr = serde_json::json!([{
+            "uri": "file:///x/mod.py",
+            "range": {"start": {"line": 9, "character": 0},
+                      "end": {"line": 9, "character": 3}},
+        }]);
+        assert_eq!(
+            parse_definition_target(&arr),
+            Some(("file:///x/mod.py".to_string(), 10))
+        );
+        // An unresolved reference: null / empty → nothing to classify.
+        assert_eq!(parse_definition_target(&serde_json::Value::Null), None);
+        assert_eq!(parse_definition_target(&serde_json::json!([])), None);
+    }
 }

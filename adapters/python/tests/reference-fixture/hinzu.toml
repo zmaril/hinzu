@@ -1,0 +1,22 @@
+# The reference-fixture policy. It exercises the two effects the tree-sitter
+# reference rung recovers that call-only missed:
+#
+#   * a HIGHER-ORDER reference — `core.py`'s `schedule_audit` passes the
+#     filesystem function `write_audit` as a value, so it reaches `fs`.
+#   * a MODULE-LEVEL (import-time) database effect — `models.py` builds a
+#     SQLAlchemy engine at module scope, attributed to that file's `<module>`
+#     node, reaching `db`.
+#
+# Both files are the functional core (they forbid those effects); `effects.py` is
+# the sanctioned adapter carve-out. Under call-only neither violation was visible.
+
+[analysis]
+on_unknown = "fail"
+
+[region.core]
+paths  = ["core.py", "models.py"]
+forbid = ["fs", "net", "db", "process"]
+
+[region.effects]
+paths = ["effects.py"]
+allow = ["fs", "net", "db", "process", "env", "clock", "random"]

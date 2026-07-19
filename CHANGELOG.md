@@ -8,6 +8,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The reference-level rung of the precision ladder, for Python: a tree-sitter
+  syntactic layer resolved through the LSP.** The generic LSP driver builds its
+  graph from `callHierarchy/outgoingCalls`, which is call-only — it misses a
+  function used as a *value* (`register(fs.read_file)`) and any use at **module
+  scope** (SQLAlchemy `Column(...)` / `declarative_base()` in a class body, a
+  decorator), which call hierarchy never anchors. A new second fact source
+  (`crates/hinzu-lsp/src/treesitter.rs`, over `tree-sitter` +
+  `tree-sitter-python`) parses each Python file and enumerates its non-call
+  **reference sites** — a name in a value position (call argument, assignment RHS,
+  default parameter, `return`, collection element, bare decorator) plus
+  module-scope call callees. `extract.rs` resolves each through the *same*
+  `textDocument/definition` → provenance → effect path as calls, attributes it to
+  the enclosing function (or a synthetic per-file `<module>` definition,
+  `<module>@<relpath>`, for import-time / class-body code), and emits a
+  `reference` edge. A call's own callee inside a function is not re-emitted (call
+  hierarchy already covers it — deduped by position). The rung is
+  **sound-additive**: it only adds edges/effects, so no real violation call-only
+  found can vanish; what it adds is the higher-order and import-time effects call
+  hierarchy missed. `effect_of` now also resolves annotations at the public-API
+  package prefix, so an authored `sqlalchemy::create_engine` row matches the
+  symbol a type checker resolves to its internal defining module
+  (`sqlalchemy.engine.create::create_engine`). On **entl-python** — whose
+  SQLAlchemy read-plane is used entirely at module scope — the `db` effect now
+  **surfaces** (0 → 3 roots: `create_engine`, `Session.scalar`, `Session.scalars`)
+  where call-only saw none, and `entl.models`' module-level construction becomes
+  visible/policeable for the first time, closing exactly the loop the SQLAlchemy
+  annotation pack flagged as latent. A committed `reference-fixture` (higher-order
+  callback reach + module-level SQLAlchemy `db`) gives stable-CI coverage with no
+  ty/SQLAlchemy required. Go and the other LSP-tier languages reuse the identical
+  rung once their grammar's node/field table is added — a documented follow-up.
+
 - **Shipped Python library annotation pack — the highest-leverage third-party
   packages a fleet sweep surfaced as Unknown, vouched as built-in Python
   defaults.** A new file `crates/hinzu-core/annotations/python-libs.toml` sits

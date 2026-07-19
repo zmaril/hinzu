@@ -1,0 +1,100 @@
+{
+  "definitions": [
+    {
+      "id": "<module>@models.py",
+      "display": "<module>",
+      "language": "python",
+      "file": "models.py",
+      "line_start": 1,
+      "line_end": 16
+    },
+    {
+      "id": "core.py#pure_total",
+      "display": "pure_total",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 28,
+      "line_end": 29
+    },
+    {
+      "id": "core.py#register",
+      "display": "register",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 17,
+      "line_end": 18
+    },
+    {
+      "id": "core.py#schedule_audit",
+      "display": "schedule_audit",
+      "language": "python",
+      "file": "core.py",
+      "line_start": 21,
+      "line_end": 25
+    },
+    {
+      "id": "effects.py#write_audit",
+      "display": "write_audit",
+      "language": "python",
+      "file": "effects.py",
+      "line_start": 6,
+      "line_end": 10
+    }
+  ],
+  "edges": [
+    {
+      "caller": "core.py#schedule_audit",
+      "callee": "core.py#register",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "core.py",
+      "evidence_line": 25
+    },
+    {
+      "caller": "effects.py#write_audit",
+      "callee": "builtins::open",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "effects.py",
+      "evidence_line": 9
+    },
+    {
+      "caller": "core.py#schedule_audit",
+      "callee": "effects.py#write_audit",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "core.py",
+      "evidence_line": 25
+    },
+    {
+      "caller": "<module>@models.py",
+      "callee": "sqlalchemy.engine.create::create_engine",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "models.py",
+      "evidence_line": 15
+    },
+    {
+      "caller": "<module>@models.py",
+      "callee": "sqlalchemy.orm.session::sessionmaker",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "models.py",
+      "evidence_line": 16
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "builtins::open",
+      "effect": "fs"
+    },
+    {
+      "symbol": "sqlalchemy.engine.create::create_engine",
+      "effect": "db"
+    },
+    {
+      "symbol": "sqlalchemy.orm.session::sessionmaker",
+      "effect": "db"
+    }
+  ]
+}
