@@ -1688,8 +1688,10 @@ dependencies = [
  "hinzu-core",
  "hinzu-dbsp",
  "hinzu-lsp",
+ "serde",
  "serde_json",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
