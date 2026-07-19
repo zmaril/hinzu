@@ -41,6 +41,9 @@ hinzu graph ./my-project --facts facts.json --out graph.json
 # from an existing SQLite fact store
 hinzu graph ./my-project --db facts.db
 
+# scope to the dependency closure of an entry point (repeatable)
+hinzu graph ./my-project --from main --out slice.json
+
 # default output is stdout
 hinzu graph ./my-project
 ```
@@ -50,6 +53,24 @@ Effect roots are seeded best-effort from the language's built-in annotation base
 (`std.toml`, `node.toml`, `python.toml`, `go.toml`), so `effect_roots` fields are
 populated without a `hinzu.toml`; project `[roots]`/`[trust]` overrides are *not*
 applied on this path.
+
+## Rooted graphs (`--from`)
+
+`--from <pattern>` restricts the graph to the **dependency closure** of an entry
+point: the root plus every symbol reachable by following caller→callee
+(dependency-direction) edges — *"everything the root needs, and nothing else"*.
+External callees are kept as leaves (the assumed-available boundary), and every
+derived field (fan-in/out, transitive counts, the file rollup, the SCC
+condensation) is recomputed for the sub-graph, so a rooted graph reads exactly
+like a full one, only smaller. A stderr note reports `scoped to closure of
+<roots>: N symbols across M files (of TOTAL)`.
+
+Patterns resolve in tiers (first non-empty wins): exact symbol id → id-suffix or
+display / leaf name → id substring → a file path (all its symbols). A pattern
+that matches nothing errors with near-misses; one that matches many is unioned
+and reported. The flag is repeatable and the closure is the union of the roots.
+`hinzu plan --from` uses the identical closure and resolution — see
+[plan.md](./plan.md#rooted-plans---from) for the "what does main() need?" framing.
 
 ## Ordering semantics (read this first)
 

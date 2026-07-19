@@ -48,9 +48,67 @@ built-in annotation base so the per-group `effect_roots` are populated.
 | `--facts <file>` | — | pre-extracted facts JSON, in place of a live run |
 | `--db <file>` | — | an existing SQLite fact store to read from |
 | `--graph <file>` | — | a previously emitted `graph.json` — build the plan straight from it, skipping extraction |
+| `--from <pattern>` | none | scope the plan to the dependency closure of an entry point (repeatable); see [Rooted plans](#rooted-plans---from) |
 | `--out <file>` | stdout | where to write the plan JSON |
 | `--group-max-loc <n>` | `200` | the loc ceiling a coalesced group is kept under |
 | `--no-coalesce` | off | disable small-file coalescing (SCC-only grouping) |
+
+## Rooted plans (`--from`)
+
+By default `hinzu plan` schedules the **whole** project. `--from <pattern>`
+restricts it to the **dependency closure** of an entry point — *"everything this
+symbol needs to run, in port order, and nothing else."*
+
+```sh
+# just what main() transitively depends on — the port order for a runnable slice
+hinzu plan ./my-project --from main --out slice.json
+
+# an entry point named by leaf name, or scoped to a file's symbols
+hinzu plan ./my-project --from src/cli.ts
+hinzu plan ./my-project --from loadAndSummarize --from serve   # union of two roots
+```
+
+**What "closure" means here.** The graph's symbol edges point in the
+*dependency* direction: `from` depends on `to` (a caller depends on its callee).
+The closure of a root `R` follows those **out-edges** transitively:
+
+```
+closure(R) = { R } ∪ { every symbol reachable from R by caller→callee edges }
+```
+
+So it is everything **downstream in the dependency sense** — the callees, their
+callees, and so on down to the leaves. It is *not* the callers of `R` (that is
+the effect engine's upward reachability). To make `R` run, every symbol in its
+closure must already exist, which is exactly the slice a plan should cover.
+**External callees are kept** as leaves: they mark the assumed-available library
+boundary the closure bottoms out on. The closure's files are the files of its
+internal symbols, and the plan is rebuilt over just that sub-graph — waves,
+groups, fan-in/out and counts are all recomputed for the slice, so a rooted plan
+reads exactly like a full one, only smaller.
+
+**The "what does the CLI need?" use case.** Point `--from` at `main` (or any
+entry point) and the plan becomes the minimal, correctly-ordered set of files a
+porting agent must land for that entry point to run — leaves first. Anything the
+entry point never reaches is dropped, so a large repo can be ported one runnable
+slice at a time instead of all at once.
+
+**Root resolution.** Each `--from` pattern resolves against the built graph, in
+tiers (first non-empty tier wins):
+
+1. an exact symbol id;
+2. a symbol whose id **ends with** the pattern, or whose display / leaf name
+   equals it (so `loadAndSummarize` finds `src/core#loadAndSummarize`);
+3. a **substring** match on the symbol id;
+4. a **file** match — a path that equals or contains the pattern expands to
+   *every symbol defined in that file*.
+
+A pattern that matches **nothing** is an error listing a few near-misses (never a
+silent empty plan). A pattern that matches **many** symbols is kept as a union
+and reported on stderr, alongside a one-line `scoped to closure of <roots>: N
+symbols across M files (of TOTAL)` note. `--from` is a pure filter — the output
+schema is identical to an unscoped plan.
+
+The same flag and rules apply to [`hinzu graph --from`](./graph.md).
 
 ## Wave semantics (read this first)
 

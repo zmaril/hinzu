@@ -71,6 +71,13 @@ struct GraphArgs {
     /// An existing SQLite fact store to read facts from, in place of a live run.
     #[arg(long)]
     db: Option<PathBuf>,
+    /// Scope the graph to the dependency closure of an entry point: only what
+    /// this symbol (or file) transitively depends on, and nothing else.
+    /// Repeatable — the closure is the union of every root. A pattern resolves
+    /// as: exact symbol id, then id-suffix / display name, then id substring,
+    /// then a file path (all its symbols). Errors if it matches nothing.
+    #[arg(long = "from")]
+    from: Vec<String>,
     /// Where to write the graph JSON. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -90,6 +97,12 @@ struct PlanArgs {
     /// is built straight from it — no facts are extracted.
     #[arg(long)]
     graph: Option<PathBuf>,
+    /// Scope the plan to the dependency closure of an entry point: the plan then
+    /// covers only what this symbol (or file) transitively needs to run, in port
+    /// order — "everything main() depends on, and nothing else". Repeatable (the
+    /// closure is the union). Same pattern rules as `hinzu graph --from`.
+    #[arg(long = "from")]
+    from: Vec<String>,
     /// Where to write the plan JSON. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -197,6 +210,7 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
 /// dependency graph, and writes it as pretty JSON to `--out` or stdout.
 fn graph(args: GraphArgs) -> Result<ExitCode> {
     let graph = build_graph_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?;
+    let graph = scope_to_closure(graph, &args.from)?;
     let json = serde_json::to_string_pretty(&graph).context("serializing the graph to JSON")?;
     write_json(args.out.as_deref(), &json, "graph")
 }
@@ -216,6 +230,7 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
         }
         None => build_graph_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?,
     };
+    let graph = scope_to_closure(graph, &args.from)?;
 
     let plan = hinzu_core::plan::build_plan(
         &graph,
@@ -226,6 +241,34 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
     );
     let json = serde_json::to_string_pretty(&plan).context("serializing the plan to JSON")?;
     write_json(args.out.as_deref(), &json, "plan")
+}
+
+/// Scope a freshly built graph to the transitive dependency closure of the
+/// `--from` roots, printing a one-line stderr note (plus any ambiguous-match
+/// notes) so the operator sees what it resolved to. Returns the graph unchanged
+/// when `from` is empty, so behavior is identical without `--from`.
+fn scope_to_closure(
+    graph: hinzu_core::graph::GraphOutput,
+    from: &[String],
+) -> Result<hinzu_core::graph::GraphOutput> {
+    if from.is_empty() {
+        return Ok(graph);
+    }
+    let resolution =
+        hinzu_core::graph::resolve_roots(&graph, from).map_err(|e| anyhow::anyhow!(e))?;
+    for note in &resolution.notes {
+        eprintln!("{note}");
+    }
+    let total = graph.stats.symbol_count;
+    let scoped = hinzu_core::graph::filter_to_closure(&graph, &resolution.roots);
+    eprintln!(
+        "scoped to closure of {}: {} symbols across {} files (of {})",
+        resolution.roots.join(", "),
+        scoped.stats.symbol_count,
+        scoped.stats.file_count,
+        total
+    );
+    Ok(scoped)
 }
 
 /// Resolve a fact set (from `--facts` JSON, an existing `--db` store, or a live
