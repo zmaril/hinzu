@@ -93,16 +93,28 @@ nonzero with an honest message; it never silently degrades and never fakes a
 resolution. `HINZU_TY` overrides the ty binary path; `HINZU_PY_VERSION` pins ty's
 target Python version (default `3.11`).
 
-### Honest fidelity: call-only
+### Fidelity: call edges plus a tree-sitter reference rung
 
-`callHierarchy/outgoingCalls` reports only the calls ty resolved, so the generic
-extractor is **call-only**: unlike the old AST walk it does not see three things —
-higher-order `reference` edges (a function passed as a value/callback/decorator),
-an ambient attribute read such as `os.environ`, and a call site ty could not
-resolve at all. All three need a language body walk, deferred to a future
-language-agnostic tree-sitter rung (also Rust). Unknown-by-default over the calls
-it *does* resolve keeps the result sound — a resolved call into an unvouched
-third-party package is an `Unknown` that fails closed, never a silent pure.
+`callHierarchy/outgoingCalls` reports only the calls ty resolved, so on its own it
+is **call-only**: it does not see higher-order `reference` uses (a function passed
+as a value/callback/decorator) nor any use at **module scope** (which call
+hierarchy never anchors, since it is not inside a function definition). A second,
+syntactic rung now closes that gap for Python. `crates/hinzu-lsp/src/treesitter.rs`
+parses each source file with **tree-sitter** and enumerates its non-call reference
+sites; `extract.rs` resolves each through the *same* `textDocument/definition` →
+provenance → effect path the call resolver uses and emits a `reference` edge (see
+"The reference rung" below). The rung is **sound-additive** — it only adds
+edges/effects — so no violation the call pass found can vanish; what it adds is the
+higher-order and import-time effects call hierarchy missed. What remains uncovered
+is an ambient *attribute read* such as `os.environ[...]`, and a call site ty could
+not resolve at all. Unknown-by-default over what it *does* resolve keeps the result
+sound — a resolved use into an unvouched third-party package is an `Unknown` that
+fails closed, never a silent pure.
+
+Go and the other LSP-tier languages reuse the identical reference rung once their
+grammar's node/field table is added (a tree-sitter grammar plus the same
+value-position query) — a documented follow-up; the tree-sitter query is Python's
+grammar for now.
 
 ### Measured on housekeeping (before → after)
 
@@ -166,18 +178,91 @@ than by ty's environment inference. These options are passed at the top level of
 as "unknown options." The fixture also carries a `[tool.ty.environment]` section in
 its `pyproject.toml` so a plain `ty check` of it is deterministic too.
 
+### The reference rung: tree-sitter syntax resolved through the LSP
+
+Call hierarchy is call-only, so a function used as a *value* and any use at module
+scope are invisible to it. The reference rung is a second, syntactic fact source
+layered under the same LSP resolution. It is two layers:
+
+1. **Syntax (tree-sitter).** `crates/hinzu-lsp/src/treesitter.rs` parses each
+   Python file with `tree-sitter` + `tree-sitter-python` and enumerates its
+   **non-call reference sites** — a name (identifier or `a.b` attribute) used as a
+   value: a call argument (`f(g)`), an assignment right-hand side (`x = g`), a
+   default parameter (`def h(cb=g)`), a `return`, a collection element, a `pair`
+   value, or a bare decorator (`@deco`). It resolves an `a.b.c` attribute at its
+   trailing member (`c`), so the member — not the receiver — drives resolution.
+   `import` / `from … import` statements are skipped wholesale: importing a name is
+   not using it.
+2. **Resolution (LSP).** For each site, `extract.rs` calls
+   `textDocument/definition` and feeds the target through the *same*
+   `classify_and_emit` the call resolver uses — an owned target threads to the
+   collected definition, an external one is classified by provenance into an effect
+   root, a trusted-pure stdlib baseline (no edge), or a fail-closed `Unknown`. It
+   emits an `Edge { kind: reference, resolution: reference }`.
+
+**Attribution.** Each site is attributed to the collected function whose line span
+encloses it (its "caller"). A site with **no** enclosing collected function — code
+in a class body or at module top level, which runs at *import time* — is attributed
+to a synthetic per-file `<module>` definition (id `<module>@<relpath>`, display
+`<module>`, spanning the whole file), emitted only when an import-time edge actually
+attaches to it. That is what makes SQLAlchemy's declarative models, module-level
+`create_engine(...)`, and decorators visible and policeable.
+
+**Deduped against calls.** A call's own callee (`g` in `g(x)`) is *not* re-emitted
+as a reference **inside a function** — call hierarchy already emits that `call`
+edge — the dedupe done by source position. At **module scope** there is no such
+edge, so a call callee there (`Column(...)`, `create_engine(...)`) *is* emitted, on
+the `<module>` node. Unresolved reference sites are skipped, exactly as the call
+path never enumerates a call it could not resolve.
+
+**Public-API annotation resolution.** A type checker resolves a re-exported public
+symbol to its *internal* defining module — ty resolves `create_engine` to
+`sqlalchemy.engine.create`, so the reconstructed symbol is
+`sqlalchemy.engine.create::create_engine`, but the annotation is the public
+`sqlalchemy::create_engine`. `LanguageConfig::effect_of` therefore walks the dotted
+package prefixes for an inheriting language (Python), collapsing the qualname onto
+each ancestor package until the authored row matches. This is why the SQLAlchemy
+`db` rows — latent under call-only because they never matched a deep resolution —
+fire the moment the rung lands.
+
 ### Sound over what it resolves
 
-Because the extractor is call-only, its `Unknown` set is narrower than the old AST
-adapter's: it flags an `Unknown` for a *resolved* call into a third-party package
-the analyzer cannot see through, but it cannot enumerate a call site ty failed to
-resolve (that needs a body walk — the deferred tree-sitter rung). Over the calls it
-does see, Unknown-by-default holds: a resolved third-party call becomes an edge to a
-`<package>::<member>` symbol with no effect root, so hinzu-core turns it into an
-`Unknown` that propagates up the call graph and fails closed under
-`on_unknown = fail`, with an evidence path down to the exact package. A resolved
-call is never read as false-pure — it reads as "cannot certify" until a `[trust]`
-line vouches for the package.
+Over the calls it sees, Unknown-by-default holds: a resolved third-party call (or
+reference) becomes an edge to a `<package>::<member>` symbol with no effect root, so
+hinzu-core turns it into an `Unknown` that propagates up the call graph and fails
+closed under `on_unknown = fail`, with an evidence path down to the exact package. A
+resolved use is never read as false-pure — it reads as "cannot certify" until a
+`[trust]` line vouches for the package. A call site ty failed to resolve at all is
+still not enumerated (that would need a fuller body walk); the rung adds the
+higher-order and module-level uses, not unresolved sites.
+
+### Measured on entl-python (the flagship)
+
+The fleet sweep flagged that entl's Python read-plane (`entl.models`) uses
+SQLAlchemy **entirely at module scope** — `declarative_base()`, `Column(...)`, and
+`event.listen(...)` in class bodies — so call-only walked none of it, and the
+`db` annotation rows were authored but "latent behind call-only until the reference
+rung lands." Extracting entl-python before (main, call-only) and after (this rung):
+
+| | main (call-only) | this rung (reference edges) |
+| --- | --- | --- |
+| effect roots | 4 | 8 |
+| `db` roots | **0** | **3** — `create_engine`, `Session.scalar`, `Session.scalars` |
+| reference edges | 0 (not emitted) | 507 |
+| `<module>` nodes | 0 | 3 |
+
+The `db` effect now **surfaces** (0 → 3 roots) where main saw none: entl's
+`create_engine` / `Session.scalar` / `.scalars` uses resolved to their internal
+`sqlalchemy.engine.create` / `sqlalchemy.orm.session` modules, which main classified
+as fail-closed `Unknown` (the deep path never matched the public `sqlalchemy::` row)
+— the public-API annotation resolution above flips them to `db`. Separately, the
+reference rung makes `entl.models`' module-level construction (`declarative_base`,
+`Column`, `event.listen`) **visible** for the first time, attributed to
+`<module>@python/entl/models.py`; because that surface is deliberately *not* vouched
+`db` (it is metadata assembly, per the library pack's never-fake-pure rule), it
+surfaces as fail-closed `Unknown` — visible and policeable rather than silently
+absent. The change is additive: main's four `fs`/`process` roots and their evidence
+paths are unchanged, so no real violation vanished.
 
 ### Why ty, and toward a native backend
 
@@ -268,10 +353,13 @@ The first pack ships three packages:
   `relationship`, the `select()` / `text()` builders) is pure metadata assembly
   and is deliberately left fail-closed Unknown rather than cleared with a
   package-wide pure vouch — a substring vouch would wrongly clear the execution
-  rows. Honest caveat: the extractor is call-only, and SQLAlchemy usage is largely
-  module-level (declarative models at class scope) which emits no call edges, so
-  these rows will not reduce Unknowns until the reference-level rung lands; they
-  are authored correctly now so they fire the moment it does.
+  rows. These rows now **fire**: the reference rung emits the module-level and
+  higher-order SQLAlchemy uses call-only missed, and `effect_of`'s public-API
+  prefix resolution matches the authored `sqlalchemy::` rows against ty's
+  deep-resolved `sqlalchemy.engine.create::create_engine` symbols. On entl-python
+  this surfaces the `db` effect where call-only saw none (0 → 3 `db` roots — see
+  "Measured on entl-python" above); the construction surface stays visible-but-
+  fail-closed `Unknown`, as intended.
 
 On `housekeeping` the pack clears every Unknown "cannot-certify" finding (rich 37,
 yaml 20 — 57 → 0) while the real forbidden-effect violation set is unchanged (126

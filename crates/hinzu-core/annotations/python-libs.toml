@@ -45,10 +45,15 @@
 # the engine/session/connection execution API (the same `<qualname>` spelling
 # `python.toml` uses for `pathlib::Path.mkdir`).
 #
-# HONEST CAVEAT: the current extractor is call-only and does not emit edges for
-# SQLAlchemy's largely module-level usage (declarative_base / Column / relationship
-# at class scope), so these rows will not reduce Unknowns until the reference-level
-# rung lands. They are authored correctly now so they fire the moment it does.
+# These rows now FIRE. The tree-sitter reference rung (crates/hinzu-lsp) emits the
+# module-level and higher-order SQLAlchemy uses call-only missed, and the
+# extractor's effect map matches these public `sqlalchemy::` rows against a type
+# checker's deep-resolved symbol (ty resolves `create_engine` to its internal
+# `sqlalchemy.engine.create` module) via effect_of's public-API prefix walk. On
+# entl-python this surfaces the db effect where call-only saw none (0 -> 3 db
+# roots). The declarative/expression CONSTRUCTION surface (declarative_base /
+# Column / relationship) stays deliberately absent below, so it is visible-but-
+# fail-closed Unknown rather than a wrong `db`, honoring the never-fake rule.
 [roots]
 "sqlalchemy::create_engine" = "db"
 "sqlalchemy::Engine.connect" = "db"
