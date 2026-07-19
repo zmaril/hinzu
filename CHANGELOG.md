@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Full reference-level parity for the native TypeScript adapter — higher-order
+  and module-level (import-time) effects in the tsc compiler API.** The adapter
+  already drew `reference` edges for a bare identifier resolving to an owned
+  function used as a value; two flows call-only still missed are now covered,
+  each resolved through the *same* declaration → provenance → effect path as a
+  call. **Higher-order:** a value-position use of an *external* effectful symbol —
+  an ambient global (`register(fetch)`), a node built-in (`register(fs.readFile)`,
+  `register(readFile)` from a named `node:fs` import), or an effectful npm import —
+  now taints its enclosing function, not only owned functions. **Module-level:**
+  code that runs at import time (a top-level `fetch(...)`, an effectful call
+  outside any function, a module-scope initializer like
+  `export const api = treaty(origin)`) has no enclosing function, so call-only
+  dropped it entirely; the adapter now gives each file a synthetic `<module>`
+  definition (`<module>@<relpath>`, whole-file span) and attributes import-time
+  effects to it as `reference` edges, emitting the node only for a file whose
+  import-time code actually reaches an effect — exactly the `<module>` model the
+  Python tree-sitter rung introduced. A call callee is never re-emitted as a
+  reference (deduped by position, now including tagged-template tags), so the rung
+  is **sound-additive**: it only adds the higher-order and import-time effects the
+  call view could not see. On **powdermonkey** (236-file Bun/React app) the rung
+  lifted reference edges 214 → 239, seeded three roots call-only missed
+  (`WebSocket`, `process.argv`, `fs.readdirSync`), gave 101 files a `<module>`
+  node, and — under an illustrative browser-must-not-touch-network policy — added
+  six findings atop the 58 the call view already had (every one preserved): an
+  import-time `treaty(...)` client and five higher-order `WebSocket` references. A
+  committed `adapters/typescript/tests/reference-fixture` (higher-order
+  `node:fs::readFile` reach + a module-level `fetch` on the file's `<module>`
+  node) gives stable-CI coverage with no Node required, plus an `#[ignore]`d live
+  end-to-end test.
+
 - **The reference-level rung of the precision ladder, for Python: a tree-sitter
   syntactic layer resolved through the LSP.** The generic LSP driver builds its
   graph from `callHierarchy/outgoingCalls`, which is call-only — it misses a

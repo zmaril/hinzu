@@ -227,8 +227,20 @@ console.error(`hinzu-ts: definitions ${defs.size}`);
 const edges = []; // {caller, callee, kind, resolution, evidence_file, evidence_line}
 const rootSet = new Map(); // symbol -> effect (deduped effect roots)
 
+// Synthetic per-file `<module>` nodes: the id → {file, line_end} for every owned
+// file, and the set of ids that actually earned an edge. A `<module>` definition
+// is emitted only for a file whose import-time code attached an edge to it, so
+// import-time effects become visible without spawning empty nodes everywhere —
+// the same additive discipline as the Python tree-sitter rung.
+const moduleMeta = new Map(); // moduleId -> { file, line_end }
+const moduleUsed = new Set(); // moduleIds an edge attached to
+function moduleIdFor(rel) {
+  return `<module>@${rel}`;
+}
+
 function addEdge(caller, callee, kind, evFile, evLine) {
   if (!caller || !callee || caller === callee) return;
+  if (moduleMeta.has(caller)) moduleUsed.add(caller);
   edges.push({
     caller,
     callee,
@@ -238,9 +250,15 @@ function addEdge(caller, callee, kind, evFile, evLine) {
     evidence_line: evLine,
   });
 }
-function addEffectLeaf(caller, symbol, effect, evFile, evLine) {
-  addEdge(caller, symbol, "call", evFile, evLine);
+function addEffectLeaf(caller, symbol, effect, evFile, evLine, kind = "call") {
+  addEdge(caller, symbol, kind, evFile, evLine);
   rootSet.set(symbol, effect);
+}
+// A reference-kind effect leaf: a value-position use of an effectful symbol (an
+// import-time call, or a higher-order pass-by-value) that call hierarchy's
+// call-only view never anchored.
+function addRefLeaf(caller, symbol, effect, evFile, evLine) {
+  addEffectLeaf(caller, symbol, effect, evFile, evLine, "reference");
 }
 
 const LIB_RE = /\/lib\.[^/]+\.d\.ts$/;
@@ -376,6 +394,7 @@ function isReferenceUse(id) {
   const p = id.parent;
   if (!p) return false;
   if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === id) return false;
+  if (ts.isTaggedTemplateExpression(p) && p.tag === id) return false; // the call callee, not a value
   if (ts.isPropertyAccessExpression(p) && p.name === id) return false;
   if (ts.isImportSpecifier(p) || ts.isExportSpecifier(p) || ts.isImportClause(p)) return false;
   const isDeclName =
@@ -389,6 +408,57 @@ function isReferenceUse(id) {
   return !isDeclName;
 }
 
+// A property-access node used as a VALUE (`register(fs.readFile)`), not as the
+// callee of a call/new/tagged-template applied to it (`fs.readFile(x)`) and not
+// an inner link of a longer member chain (`fs.promises` inside `fs.promises.x`,
+// where only the outermost access resolves). This is the property-access twin of
+// `isReferenceUse`, for higher-order references to effectful members.
+function isPropertyRefUse(pa) {
+  const p = pa.parent;
+  if (!p) return false;
+  if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === pa) return false;
+  if (ts.isTaggedTemplateExpression(p) && p.tag === pa) return false;
+  if (ts.isPropertyAccessExpression(p) && p.expression === pa) return false; // inner chain link
+  if (ts.isElementAccessExpression(p) && p.expression === pa) return false;
+  return true;
+}
+
+// A bare identifier used as a value that names an effectful symbol: a node
+// built-in named import (`import { readFile } from "node:fs"`) resolved by
+// declaration provenance, an ambient effectful global (`fetch`, `WebSocket`)
+// confirmed against lib/@types, or a symbol imported from a known-effectful npm
+// package. `sym` is the identifier's already-resolved (alias-followed) symbol.
+// Returns { symbol, effect } or null. Mirrors the resolution the call path uses,
+// for a pass-by-value reference rather than a call.
+function classifyIdentifierValue(id, sym, importMap) {
+  const declFile = declFilesOfSymbol(sym)[0];
+  const nb = nodeBuiltinEffect(declFile, id.text);
+  if (nb) return nb;
+  const bare = BARE_CALL_EFFECTS[id.text];
+  if (bare && symFromLibOrNode(id)) return { symbol: globalSymbol(id.text), effect: bare };
+  const im = importMap.get(id.text);
+  if (im && im.effect) return { symbol: npmSymbol(im.pkg, id.text), effect: im.effect };
+  return null;
+}
+
+// A property-access value (`fs.readFile`, `crypto.randomBytes`) whose member
+// resolves, by declaration provenance, to an effectful node built-in. Returns
+// { symbol, effect } or null. The ambient-global members (`process.env`,
+// `Math.random`, …) are handled by `classifyGlobalAccess`, so this is the
+// node-built-in twin, reusing the same `nodeBuiltinEffect` provenance the call
+// path uses.
+function classifyNodeBuiltinValue(node) {
+  if (!ts.isPropertyAccessExpression(node)) return null;
+  let sym = checker.getSymbolAtLocation(node);
+  if (sym && sym.flags & ts.SymbolFlags.Alias) {
+    try {
+      sym = checker.getAliasedSymbol(sym);
+    } catch {}
+  }
+  const declFile = declFilesOfSymbol(sym)[0];
+  return nodeBuiltinEffect(declFile, node.name.text);
+}
+
 let callSites = 0;
 let resolved = 0;
 let refEdges = 0;
@@ -398,40 +468,37 @@ for (const sf of program.getSourceFiles()) {
   const rel = ownedRel(sf.fileName);
   if (!rel) continue;
   const importMap = buildImportMap(sf);
+  // The file's synthetic `<module>` node: caller for anything at module scope
+  // (import-time code call hierarchy never anchors). Registered for every owned
+  // file; a definition is emitted later only if an edge actually attaches to it.
+  const moduleId = moduleIdFor(rel);
+  moduleMeta.set(moduleId, { file: rel, line_end: lineOf(sf, sf.getEnd()) });
   const stack = [];
   const walk = (n) => {
     const isFn = isFunctionLike(n);
     if (isFn) stack.push(defIdByNode.get(n));
-    const enclosing = stack[stack.length - 1];
+    // The caller: the nearest enclosing owned function, or — at module scope —
+    // the file's `<module>` node, so import-time effects are attributed rather
+    // than dropped. `atModule` picks the edge kind: inside a function, calls are
+    // `call` edges (call hierarchy's job, unchanged); at module scope they are
+    // `reference` edges, exactly like the Python rung's module-scope call callees.
+    const enclosing = stack.length ? stack[stack.length - 1] : null;
+    const caller = enclosing ?? moduleId;
+    const atModule = enclosing === null;
+    const line = lineOf(sf, n.getStart());
 
-    if (enclosing) {
-      const line = lineOf(sf, n.getStart());
-
-      // Ambient global effect reached by property access (process.env, Date.now).
+    if (caller) {
+      // Ambient global effect reached by property access (process.env, Date.now),
+      // whether called or used as a value.
       const ga = classifyGlobalAccess(n);
-      if (ga) addEffectLeaf(enclosing, ga.symbol, ga.effect, rel, line);
+      if (ga) addEffectLeaf(caller, ga.symbol, ga.effect, rel, line, atModule ? "reference" : "call");
 
       if (ts.isCallExpression(n) || ts.isNewExpression(n) || ts.isTaggedTemplateExpression(n)) {
         callSites++;
-        handleCall(n, enclosing, rel, line, importMap);
+        handleCall(n, caller, rel, line, importMap, atModule ? "reference" : "call");
       }
 
-      // Reference-level taint: a bare identifier resolving to a local function,
-      // used as a value (callback, default parameter) rather than called.
-      if (ts.isIdentifier(n) && isReferenceUse(n)) {
-        let s = checker.getSymbolAtLocation(n);
-        if (s && s.flags & ts.SymbolFlags.Alias) {
-          try {
-            s = checker.getAliasedSymbol(s);
-          } catch {}
-        }
-        const fnDecl = (s?.getDeclarations?.() || []).find(isFunctionLike);
-        const calleeId = fnDecl && defIdByNode.get(fnDecl);
-        if (calleeId && calleeId !== enclosing) {
-          addEdge(enclosing, calleeId, "reference", rel, line);
-          refEdges++;
-        }
-      }
+      handleReference(n, caller, rel, line, importMap);
     }
 
     ts.forEachChild(n, walk);
@@ -440,15 +507,65 @@ for (const sf of program.getSourceFiles()) {
   ts.forEachChild(sf, walk);
 }
 
-function handleCall(n, enclosing, rel, line, importMap) {
+// Reference-level taint: a value-position use (a bare identifier or an `a.b`
+// member) that is NOT the callee of a call — a function or effectful symbol
+// passed as a value (callback, default parameter, stored, returned, in an
+// array/object literal). Resolved through the SAME declaration → provenance →
+// effect path the call resolver uses, so it is sound-additive: it only adds the
+// higher-order and module-level effects the call-only view missed. The call
+// callee itself is excluded by `isReferenceUse` / `isPropertyRefUse` (dedupe by
+// position), so nothing is emitted as both a call and a reference.
+function handleReference(n, caller, rel, line, importMap) {
+  if (ts.isIdentifier(n) && isReferenceUse(n)) {
+    // 1. A function we own, used as a value — taints through its own body edges.
+    let s = checker.getSymbolAtLocation(n);
+    if (s && s.flags & ts.SymbolFlags.Alias) {
+      try {
+        s = checker.getAliasedSymbol(s);
+      } catch {}
+    }
+    const fnDecl = (s?.getDeclarations?.() || []).find(isFunctionLike);
+    const calleeId = fnDecl && defIdByNode.get(fnDecl);
+    if (calleeId && calleeId !== caller) {
+      addEdge(caller, calleeId, "reference", rel, line);
+      refEdges++;
+      return;
+    }
+    // 2. A node built-in, effectful ambient global, or effectful npm import
+    //    passed as a value (`register(fetch)`, `register(readFile)`) — an effect
+    //    root reached by reference.
+    const ext = classifyIdentifierValue(n, s, importMap);
+    if (ext) {
+      addRefLeaf(caller, ext.symbol, ext.effect, rel, line);
+      refEdges++;
+    }
+    return;
+  }
+  // 3. An effectful node built-in member passed as a value (`register(fs.readFile)`).
+  //    Ambient-global members (`process.env`, `Math.random`) are already handled
+  //    above by `classifyGlobalAccess`; this covers the node-built-in members.
+  if (ts.isPropertyAccessExpression(n) && isPropertyRefUse(n)) {
+    const ext = classifyNodeBuiltinValue(n);
+    if (ext) {
+      addRefLeaf(caller, ext.symbol, ext.effect, rel, line);
+      refEdges++;
+    }
+  }
+}
+
+// `kind` is the edge kind to emit — "call" for a call inside a function (call
+// hierarchy's domain), "reference" for a module-scope call attributed to the
+// file's `<module>` node (call hierarchy never anchors import-time code, so the
+// reference rung picks it up, matching the Python model).
+function handleCall(n, enclosing, rel, line, importMap, kind = "call") {
   const { declNode, declFile } = resolveCallee(n);
 
-  // 1. A call into a function we own: a plain call edge; its effects propagate
-  //    through its own body's edges.
+  // 1. A call into a function we own: its effects propagate through its own
+  //    body's edges.
   const localId = declNode && defIdByNode.get(declNode);
   if (localId) {
     resolved++;
-    addEdge(enclosing, localId, "call", rel, line);
+    addEdge(enclosing, localId, kind, rel, line);
     return;
   }
 
@@ -460,7 +577,7 @@ function handleCall(n, enclosing, rel, line, importMap) {
     (ts.isCallExpression(n) ? classifyBareCall(n) : null);
   if (builtin) {
     resolved++;
-    addEffectLeaf(enclosing, builtin.symbol, builtin.effect, rel, line);
+    addEffectLeaf(enclosing, builtin.symbol, builtin.effect, rel, line, kind);
     return;
   }
 
@@ -477,9 +594,9 @@ function handleCall(n, enclosing, rel, line, importMap) {
   const pkg = packageFromCall(n, declFile, importMap);
   if (pkg) {
     if (pkg.effect) {
-      addEffectLeaf(enclosing, npmSymbol(pkg.name, member), pkg.effect, rel, line);
+      addEffectLeaf(enclosing, npmSymbol(pkg.name, member), pkg.effect, rel, line, kind);
     } else {
-      addEdge(enclosing, npmSymbol(pkg.name, member), "call", rel, line);
+      addEdge(enclosing, npmSymbol(pkg.name, member), kind, rel, line);
       unknownEdges++;
     }
     return;
@@ -503,9 +620,27 @@ function packageFromCall(n, declFile, importMap) {
   return im ? { name: im.pkg, effect: im.effect } : null;
 }
 
+// Emit a synthetic `<module>` definition for every file whose import-time code
+// actually attached an edge to its `<module>` node — whole-file span, so the
+// import-time effect is visible and policeable. Files with no module-scope effect
+// spawn no node.
+for (const id of moduleUsed) {
+  const meta = moduleMeta.get(id);
+  if (!meta) continue;
+  defs.set(id, {
+    id,
+    display: "<module>",
+    language: "typescript",
+    file: meta.file,
+    line_start: 1,
+    line_end: meta.line_end,
+  });
+}
+
 console.error(
   `hinzu-ts: call sites ${callSites} | resolved ${resolved} | edges ${edges.length} ` +
-    `(reference ${refEdges}, unknown ${unknownEdges}) | effect roots ${rootSet.size}`,
+    `(reference ${refEdges}, unknown ${unknownEdges}) | effect roots ${rootSet.size} | ` +
+    `module defs ${moduleUsed.size}`,
 );
 
 // --- emit the FactSet JSON ---------------------------------------------------
