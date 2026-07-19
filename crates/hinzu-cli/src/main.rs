@@ -177,7 +177,21 @@ struct PortDiffArgs {
     /// the single-package form.
     #[arg(long = "from")]
     from: Vec<String>,
-    /// Where to write the report JSON. Defaults to stdout.
+    /// Compare the current report against a saved BASELINE report JSON and emit a
+    /// port-progress DELTA instead of the plain report: which files advanced /
+    /// regressed band, the per-band net movement, the symbol-match delta, and an
+    /// overall verdict (`forward` / `mixed` / `backward` / `no_change`). The
+    /// baseline must be the same report shape as the current mode — a single
+    /// `PortDiffReport`, a `MultiPackageReport` (`--all`), or a
+    /// `RootedCrossPackageReport` (`--all --from`); a mismatched shape is a clear
+    /// error. `--out` then writes the delta JSON, and a concise human summary is
+    /// printed to stderr. Save a baseline with a plain `--out` run at the parent
+    /// commit, then `--compare` it after the commit to check the commit moved the
+    /// port forward. See `notes/port-diff.md`.
+    #[arg(long)]
+    compare: Option<PathBuf>,
+    /// Where to write the report JSON (or, with `--compare`, the delta JSON).
+    /// Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Also write a self-contained HTML dashboard to this file.
@@ -409,6 +423,17 @@ fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
         eprintln!("wrote HTML dashboard to {}", html_path.display());
     }
 
+    if let Some(compare_path) = &args.compare {
+        return emit_delta(
+            compare_path,
+            args.out.as_deref(),
+            "single PortDiffReport",
+            |baseline: &hinzu_core::portdiff::PortDiffReport| {
+                hinzu_core::portdiff::diff_reports(baseline, &report)
+            },
+        );
+    }
+
     let json = serde_json::to_string_pretty(&report)
         .context("serializing the port-diff report to JSON")?;
     write_json(args.out.as_deref(), &json, "port-diff report")
@@ -489,6 +514,17 @@ fn port_diff_all(
             format!("writing combined HTML dashboard to {}", html_path.display())
         })?;
         eprintln!("wrote combined HTML dashboard to {}", html_path.display());
+    }
+
+    if let Some(compare_path) = &args.compare {
+        return emit_delta(
+            compare_path,
+            args.out.as_deref(),
+            "MultiPackageReport (--all)",
+            |baseline: &hinzu_core::portdiff::MultiPackageReport| {
+                hinzu_core::portdiff::diff_multi_reports(baseline, &multi)
+            },
+        );
     }
 
     let json =
@@ -658,6 +694,17 @@ fn port_diff_cross_from(
         eprintln!(
             "wrote cross-package HTML dashboard to {}",
             html_path.display()
+        );
+    }
+
+    if let Some(compare_path) = &args.compare {
+        return emit_delta(
+            compare_path,
+            args.out.as_deref(),
+            "RootedCrossPackageReport (--all --from)",
+            |baseline: &hinzu_core::portdiff::RootedCrossPackageReport| {
+                hinzu_core::portdiff::diff_cross_reports(baseline, &rooted)
+            },
         );
     }
 
@@ -925,6 +972,100 @@ fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
         None => println!("{json}"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Load and deserialize a baseline report JSON of the shape the current
+/// `--compare` mode expects. A parse failure is reported as a shape mismatch,
+/// since the usual cause is comparing against a baseline saved in a different
+/// mode (a single report vs `--all` vs `--all --from`).
+fn load_baseline<T: serde::de::DeserializeOwned>(path: &Path, shape: &str) -> Result<T> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading the --compare baseline report from {}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "parsing the --compare baseline at {} as a {shape} — the baseline must be the same \
+             report shape as the current mode (a single report, --all, or --all --from)",
+            path.display()
+        )
+    })
+}
+
+/// The band's human label, matching the report's serde spelling.
+fn band_label(band: hinzu_core::portdiff::Band) -> &'static str {
+    use hinzu_core::portdiff::Band;
+    match band {
+        Band::Done => "DONE",
+        Band::Ported => "PORTED",
+        Band::Started => "STARTED",
+        Band::NotStarted => "NOT-STARTED",
+    }
+}
+
+/// Print a concise, human-readable one-line delta summary to stderr, e.g.
+/// `port moved FORWARD: 4 files advanced (3 NOT-STARTED→PORTED, 1 STARTED→DONE),
+/// +37 symbols matched, 0 regressions`.
+fn print_delta_summary(delta: &hinzu_core::portdiff::PortDiffDelta) {
+    use hinzu_core::portdiff::Verdict;
+    let t = &delta.totals;
+    let verdict = match delta.verdict {
+        Verdict::Forward => "FORWARD",
+        Verdict::Mixed => "MIXED",
+        Verdict::Backward => "BACKWARD",
+        Verdict::NoChange => "NO CHANGE",
+    };
+    let transitions: Vec<String> = t
+        .transitions
+        .iter()
+        .map(|tr| {
+            format!(
+                "{} {}→{}",
+                tr.count,
+                band_label(tr.band_before),
+                band_label(tr.band_after)
+            )
+        })
+        .collect();
+    let breakdown = if transitions.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", transitions.join(", "))
+    };
+    let sym = t.symbols_matched_delta;
+    let sym_sign = if sym >= 0 { "+" } else { "" };
+    let mut tail = format!(
+        "{} files advanced{breakdown}, {sym_sign}{sym} symbols matched, {} regressions",
+        t.advanced, t.regressed
+    );
+    if t.added > 0 || t.removed > 0 {
+        tail.push_str(&format!(" ({} added, {} removed)", t.added, t.removed));
+    }
+    eprintln!("port moved {verdict}: {tail}");
+}
+
+/// Emit the `--compare` delta: load the baseline of shape `shape`, run `diff`,
+/// print the stderr summary, and write the delta JSON to `--out` (or stdout).
+/// Shared tail of every `--compare` branch so the three report modes emit the
+/// delta identically.
+fn emit_delta<T, F>(
+    compare_path: &Path,
+    out: Option<&Path>,
+    shape: &str,
+    diff: F,
+) -> Result<ExitCode>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(&T) -> hinzu_core::portdiff::PortDiffDelta,
+{
+    let baseline: T = load_baseline(compare_path, shape)?;
+    let delta = diff(&baseline);
+    print_delta_summary(&delta);
+    let json =
+        serde_json::to_string_pretty(&delta).context("serializing the port-progress delta")?;
+    write_json(out, &json, "port-progress delta")
 }
 
 /// Load facts from the `--facts` JSON (the offline path), or extract them live

@@ -57,8 +57,13 @@ use crate::graph::GraphOutput;
 use crate::plan::PlanOutput;
 
 mod config;
+mod delta;
 mod report;
 pub use config::{ConformanceConfig, NamingRules, PortDiffConfig};
+pub use delta::{
+    band_rank, diff_cross_reports, diff_multi_reports, diff_reports, BandNetMovement,
+    BandTransition, DeltaTotals, Direction, FileDelta, PortDiffDelta, Verdict,
+};
 pub use report::{
     Band, BandCounts, ConformanceCrosscheck, Fidelity, FileEntry, FileMapSummary,
     FileTierBreakdown, FrontierEntry, GraphConfirmSummary, MultiPackageReport, NaiveVsGraph,

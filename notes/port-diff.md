@@ -215,6 +215,79 @@ rollup (an overall completion bar + per-package band bars + a summary table with
 a TOTAL row) followed by a per-package section reusing the single-package band /
 wave view.
 
+## `--compare <baseline.json>` — did this commit move the port forward?
+
+The report answers "how much is ported *right now*". `--compare` answers the
+question you ask *of a commit*: **did this diff actually move the port forward?**
+It computes the current report as normal, loads a **saved baseline report** from
+`<baseline.json>`, and emits a **port-progress DELTA** — the signed difference
+between the two snapshots — instead of the plain report.
+
+```sh
+# 1. save a baseline BEFORE the change (e.g. at the parent commit)
+hinzu port-diff --config notes/port-pi-atilla.toml --package ai \
+  --source-graph pi-ai-graph.json --target-graph atilla-ai-before.json \
+  --out baseline.json
+
+# 2. AFTER the change, diff the new report against that baseline
+hinzu port-diff --config notes/port-pi-atilla.toml --package ai \
+  --source-graph pi-ai-graph.json --target-graph atilla-ai-after.json \
+  --compare baseline.json --out delta.json
+# stderr:  port moved FORWARD: 1 files advanced (1 STARTED→PORTED), +3 symbols matched, 0 regressions
+```
+
+Hold the **source** graph/plan fixed across the two runs and re-extract only the
+**target** at each commit: the delta then isolates exactly the port movement that
+commit's target changes caused.
+
+The baseline must be the **same report shape** as the current mode — a single
+`PortDiffReport` (default), a `MultiPackageReport` (`--all`), or a
+`RootedCrossPackageReport` (`--all --from`). A shape mismatch (e.g. comparing an
+`--all` run against a single-package baseline) is a clear error, not a silent
+misread. `--compare` works in all three modes; files are matched by path, and for
+`--all` / `--all --from` the match is **within the same package**.
+
+### Band ordering
+
+"Forward" is defined by the band rank
+
+```
+NOT-STARTED (0)  <  STARTED (1)  <  PORTED (2)  <  DONE (3)
+```
+
+A file whose band rank **rose** between baseline and current has **advanced**;
+one whose rank **fell** has **regressed**; an equal rank is **unchanged** (its
+symbol coverage may still have moved, and the delta reports that). A file only in
+the current report is **added**; one only in the baseline is **removed**.
+
+### The delta JSON shape
+
+`--compare --out` writes a `PortDiffDelta` (snake_case):
+
+| field | meaning |
+| --- | --- |
+| `verdict` | `forward` (advanced > 0, regressed == 0), `mixed` (both), `backward` (regressed > 0, advanced == 0), or `no_change` |
+| `totals` | the rolled-up counts (below) |
+| `files[]` | per-file movement, sorted by `(package, path)` |
+
+Each `files[]` entry: `path`, `package` (`null` for a single-package delta),
+`band_before` / `band_after` (one is `null` for an added / removed file),
+`direction` (`advanced` / `regressed` / `unchanged` / `added` / `removed`),
+`coverage_before` / `coverage_after`, and `coverage_delta` (rounded to 3 dp, when
+both coverages are present).
+
+`totals` carries: `advanced` / `regressed` / `unchanged` / `added` / `removed`
+file counts; `transitions[]` — the band-transition tally for the advanced /
+regressed files (`{ band_before, band_after, count }`, e.g. `3 NOT-STARTED →
+PORTED`), which drives the stderr summary; `band_net_movement` — the signed
+per-band file-count change (`after - before`); and `symbols_matched_before` /
+`symbols_matched_after` / `symbols_matched_delta`, the overall matched-symbol
+totals and their signed difference.
+
+Alongside the JSON, a concise one-line human summary is printed to **stderr** so
+a CI step or a commit hook can read the verdict at a glance without parsing JSON.
+`--compare` emits JSON + the stderr summary only (no HTML delta view).
+
 ## The config file
 
 One toml describes several same-shape package ports with a single shared naming
