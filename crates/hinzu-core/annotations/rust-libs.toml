@@ -1,0 +1,232 @@
+# hinzu's built-in Rust *library* effect annotations — the common-crate
+# counterpart to `std.toml`. `std.toml` covers the standard library; this file
+# covers the third-party crates the fleet reaches most often, so a plain
+# functional-core check stops reporting them as `Unknown` ("cannot certify")
+# without a project having to write a `[trust]` line for each one.
+#
+# It is merged onto `std.toml` for the Rust language base (see
+# `crates/hinzu-core/src/roots.rs`), and a project's own `hinzu.toml`
+# `[roots]` / `[trust]` still overrides anything here — a rule with the same
+# prefix wins, a new prefix is added.
+#
+# The matcher is the same one `std.toml` uses: a callee's monomorphized path is
+# stripped of its generic arguments and matched on whole `::`-delimited
+# segments, most-specific rule wins. `[roots]` maps a path prefix to one effect;
+# `[trust] "x" = "pure"` vouches a crate effect-free (it clears `Unknown`).
+#
+# THE HARD RULE, applied to every entry below: a crate (or a call within it) that
+# performs I/O is NEVER marked pure. A false "pure" is a silent hole in a
+# functional-core gate, so a *mixed* crate is annotated at its effectful entry
+# points and only its genuinely-pure remainder is vouched pure. `[trust] "x" =
+# "pure"` is consulted BEFORE the effect table, so a pure vouch is scoped to
+# never cover an effectful path in the same crate (for example `chrono` is not
+# blanket-pure, because `chrono::Utc::now` reads the clock).
+#
+# `alloc` is deliberately absent here: these crates allocate like all Rust code,
+# and `std.toml` already carries the standard library's allocation surface. A
+# performance region that forbids `alloc` is served by that table, not by
+# flagging every library call.
+
+# =============================================================================
+#  Pure crates — in-memory only, no I/O. Safe to vouch pure wholesale.
+# =============================================================================
+
+[trust]
+
+# --- serialization: data model in, data model out (a Writer's I/O, if any, is a
+# --- separate std edge the analyzer already sees) ----------------------------
+"serde" = "pure"
+"serde_json" = "pure"
+"serde_yaml" = "pure"
+"serde_derive" = "pure"
+"toml" = "pure"
+"toml_edit" = "pure"
+
+# --- text / parsing / hashing (all compute over in-memory buffers) -----------
+"regex" = "pure"
+"regex_syntax" = "pure"
+"regex_automata" = "pure"
+"sha1" = "pure"
+"sha2" = "pure"
+"digest" = "pure"
+"itertools" = "pure"
+
+# --- errors: construction, context, and formatting — no I/O ------------------
+"anyhow" = "pure"
+"thiserror" = "pure"
+
+# --- code generation: genco builds token trees in memory. Writing them out is
+# --- done through a caller-supplied Writer, whose effect is its own edge. -----
+"genco" = "pure"
+
+# --- in-memory channels: message passing, not OS I/O -------------------------
+"crossbeam_channel" = "pure"
+"crossbeam_deque" = "pure"
+
+# --- oxc: JavaScript/TypeScript AST, parser, and semantic analysis. Arena
+# --- allocation and tree walking, entirely in memory. ------------------------
+"oxc_allocator" = "pure"
+"oxc_ast" = "pure"
+"oxc_ast_visit" = "pure"
+"oxc_parser" = "pure"
+"oxc_semantic" = "pure"
+"oxc_span" = "pure"
+"oxc_syntax" = "pure"
+"oxc_str" = "pure"
+
+# --- clap: the argument *builder* and the parsed-match *accessors* are pure.
+# --- The entry points that read the process's argv/env are effectful and live
+# --- in the [roots] table below — kept out of these pure prefixes so the pure
+# --- vouch never shadows them (`clap::Command::new` is pure, but
+# --- `clap::Command::get_matches`, which reads argv, is `env`). --------------
+"clap::Arg" = "pure"
+"clap::builder" = "pure"
+"clap::parser::MatchesError" = "pure"
+"clap::Command::new" = "pure"
+"clap::Id" = "pure"
+
+# --- arrow: the in-memory columnar surface (arrays, buffers, schema, compute)
+# --- is pure. The file/stream readers and writers (arrow-ipc / Feather / CSV /
+# --- JSON) touch the filesystem and are `fs` roots below. These per-module
+# --- prefixes are scoped so they never cover `arrow::ipc` / `arrow::csv`. -----
+"arrow_array" = "pure"
+"arrow_buffer" = "pure"
+"arrow_schema" = "pure"
+"arrow_data" = "pure"
+"arrow_select" = "pure"
+"arrow_cast" = "pure"
+"arrow_arith" = "pure"
+"arrow_ord" = "pure"
+"arrow_string" = "pure"
+"arrow_row" = "pure"
+"arrow::array" = "pure"
+"arrow::buffer" = "pure"
+"arrow::compute" = "pure"
+"arrow::datatypes" = "pure"
+"arrow::record_batch" = "pure"
+
+# --- chrono / uuid: only the pure value types are vouched here. Their
+# --- nondeterministic entry points (`Utc::now`, `Uuid::new_v4`) are clock /
+# --- random roots below, and are excluded from these prefixes so the vouch
+# --- cannot hide them. -------------------------------------------------------
+"chrono::NaiveDate" = "pure"
+"chrono::NaiveDateTime" = "pure"
+"chrono::NaiveTime" = "pure"
+"chrono::DateTime" = "pure"
+"chrono::Duration" = "pure"
+"chrono::TimeDelta" = "pure"
+"chrono::format" = "pure"
+"chrono::Month" = "pure"
+"chrono::Weekday" = "pure"
+"uuid::Builder" = "pure"
+"uuid::fmt" = "pure"
+"uuid::Uuid::parse_str" = "pure"
+"uuid::Uuid::from_u128" = "pure"
+"uuid::Uuid::from_bytes" = "pure"
+"uuid::Uuid::from_slice" = "pure"
+"uuid::Uuid::as_bytes" = "pure"
+"uuid::Uuid::hyphenated" = "pure"
+
+# --- tokio's runtime, task, and synchronization primitives carry no effect of
+# --- their own — a future's effects are the future's own edges. tokio's I/O
+# --- submodules (fs / net / process / time) are effect roots below. These
+# --- prefixes are scoped so the vouch never covers those submodules. ---------
+"tokio::runtime" = "pure"
+"tokio::task" = "pure"
+"tokio::sync" = "pure"
+"tokio::select" = "pure"
+
+# =============================================================================
+#  Effectful and mixed crates — annotated at their effect roots.
+# =============================================================================
+
+[roots]
+
+# --- filesystem --------------------------------------------------------------
+# `ignore` walks the filesystem (gitignore-aware directory traversal); the whole
+# crate is an `fs` surface.
+"ignore::" = "fs"
+
+# gix reads a repository's objects, refs, and config from the `.git` directory
+# on disk. The umbrella crate and its disk-backed component crates are `fs`; its
+# transport/protocol crates are `net` (below). This is an honest
+# over-approximation — gix's in-memory parsing rides the same prefixes — that a
+# project can narrow with its own `[trust]` line.
+"gix::" = "fs"
+"gix_odb::" = "fs"
+"gix_ref::" = "fs"
+"gix_index::" = "fs"
+"gix_config::" = "fs"
+"gix_discover::" = "fs"
+"gix_worktree::" = "fs"
+"gix_dir::" = "fs"
+"gix_pack::" = "fs"
+"gix_object::" = "fs"
+
+# arrow's file and stream I/O: the Arrow-IPC/Feather readers and writers and the
+# CSV/JSON file codecs. The in-memory columnar surface is pure (above).
+"arrow_ipc::" = "fs"
+"arrow_csv::" = "fs"
+"arrow_json::" = "fs"
+"arrow::ipc" = "fs"
+"arrow::csv" = "fs"
+"arrow::json" = "fs"
+
+# --- network -----------------------------------------------------------------
+# gix's fetch/push transport and the smart-protocol layer open sockets.
+"gix_transport::" = "net"
+"gix_protocol::" = "net"
+# TLS session libraries. sans-I/O in the strict sense, but they exist to secure
+# network connections, so they are marked `net` (the safe over-approximation).
+"native_tls::" = "net"
+"rustls::" = "net"
+
+# --- database ----------------------------------------------------------------
+# duckdb is wholly a database binding: connection, query, execute, appender.
+"duckdb::" = "db"
+# postgres / tokio-postgres: the query surface is `db`; establishing the
+# connection additionally opens a socket, so the connect entry points are `net`
+# (a more specific rule, so it wins for those callees). A function that connects
+# and queries collects both effects.
+"postgres::" = "db"
+"postgres::Client::connect" = "net"
+"postgres::Config::connect" = "net"
+"tokio_postgres::" = "db"
+"tokio_postgres::connect" = "net"
+
+# --- clock -------------------------------------------------------------------
+# chrono's wall-clock reads. Everything else in chrono (parsing, formatting,
+# date arithmetic) is pure and vouched above.
+"chrono::Utc::now" = "clock"
+"chrono::Local::now" = "clock"
+"chrono::offset::Utc::now" = "clock"
+"chrono::offset::Local::now" = "clock"
+
+# --- process -----------------------------------------------------------------
+# tokio's async subprocess API.
+"tokio::process" = "process"
+
+# --- ambient environment -----------------------------------------------------
+# clap's argv/env readers: the derive `Parser::parse` family and the builder
+# `Command::get_matches` family read the process's arguments (and, with clap's
+# `env` feature, environment variables). The builders and match accessors that
+# do not read argv are pure (above).
+"clap::Parser::parse" = "env"
+"clap::Parser::parse_from" = "env"
+"clap::Parser::try_parse" = "env"
+"clap::Command::get_matches" = "env"
+"clap::Command::get_matches_from" = "env"
+"clap::Command::try_get_matches" = "env"
+
+# --- randomness --------------------------------------------------------------
+# uuid's entropy- and time-based constructors draw randomness; parsing and
+# formatting a UUID is pure (vouched above). (`rand` / `rand_core` are already
+# `random` in std.toml.)
+"uuid::Uuid::new_v4" = "random"
+"uuid::Uuid::new_v7" = "random"
+"uuid::Uuid::now_v7" = "random"
+"uuid::Uuid::from_entropy" = "random"
+
+# --- io / time submodules of tokio -------------------------------------------
+"tokio::fs" = "fs"
+"tokio::time" = "clock"

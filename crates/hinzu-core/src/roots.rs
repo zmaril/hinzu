@@ -83,6 +83,16 @@ const TRUSTED_PATH_PREFIXES: &[&str] = &["std::", "core::", "alloc::"];
 /// not this module.
 const STD_ANNOTATIONS: &str = include_str!("../annotations/std.toml");
 
+/// hinzu's shipped Rust *library* effect-annotation defaults: the common
+/// third-party crates the fleet reaches most often (serde/serde_json, anyhow,
+/// clap, gix, arrow, duckdb, postgres, ignore, genco, oxc, chrono, regex, …),
+/// merged onto `std.toml` for the Rust base. It is the same data format —
+/// `[roots]` effect rules plus `[trust]` pure vouches — so a pure crate stops
+/// coming back `Unknown` and a mixed crate is graded at its effectful entry
+/// points. Editing the library trust table means editing that file, not this
+/// module; a project's own `hinzu.toml` still overrides it.
+const RUST_LIBS_ANNOTATIONS: &str = include_str!("../annotations/rust-libs.toml");
+
 /// hinzu's shipped TypeScript / Node effect-annotation defaults: the Node
 /// runtime's built-in effect surface, mapped to the same shared vocabulary. The
 /// counterpart to `std.toml` for the TypeScript adapter's canonical external
@@ -121,11 +131,23 @@ impl Default for RootSeeds {
     /// vouches pure — the genuinely-pure rest of the standard library is the
     /// trusted-pure baseline, applied after the effect table, not a prefix rule.
     fn default() -> Self {
-        Self::with_base(STD_ANNOTATIONS)
+        Self::rust_base()
     }
 }
 
 impl RootSeeds {
+    /// The shipped Rust base: the standard-library surface (`std.toml`) plus the
+    /// common-crate library pack (`rust-libs.toml`), merged. Both are built-in
+    /// Rust defaults; a project's own `[trust]` / `[roots]` still overrides
+    /// either (merged later).
+    fn rust_base() -> Self {
+        let mut seeds = Self::with_base(STD_ANNOTATIONS);
+        seeds
+            .merge_toml(RUST_LIBS_ANNOTATIONS)
+            .expect("built-in rust library pack is valid");
+        seeds
+    }
+
     /// A fresh table built from one built-in annotation file (`std.toml` or
     /// `node.toml`), before any policy overrides.
     fn with_base(base: &str) -> Self {
@@ -145,7 +167,7 @@ impl RootSeeds {
     /// one — so each language starts from its own base.
     pub fn for_language(language: Language) -> Self {
         match language {
-            Language::Rust => Self::with_base(STD_ANNOTATIONS),
+            Language::Rust => Self::rust_base(),
             Language::TypeScript => Self::with_base(NODE_ANNOTATIONS),
             Language::Python => {
                 // The stdlib base plus the shipped third-party library pack,
@@ -713,9 +735,10 @@ mod tests {
             seeds.classify_foreign("std::cmp::max::<usize>"),
             Resolution::Pure
         );
-        // Nothing resolves it: Unknown.
+        // Nothing resolves it: Unknown. (An unvouched crate outside both the
+        // std and the shipped library packs.)
         assert_eq!(
-            seeds.classify_foreign("toml::from_str::<T>"),
+            seeds.classify_foreign("widget_lib::render::<T>"),
             Resolution::Unknown
         );
     }
@@ -731,10 +754,11 @@ mod tests {
             line_start: 1,
             line_end: 3,
         });
-        // A foreign no-body call nobody vouched for -> Unknown.
+        // A foreign no-body call nobody vouched for -> Unknown. (Outside both
+        // the std and the shipped library packs.)
         facts.add_edge(Edge::call(
             "app::run",
-            "toml::from_str::<Cfg>",
+            "widget_lib::render::<Cfg>",
             "src/lib.rs",
             2,
         ));
@@ -761,7 +785,7 @@ mod tests {
             .filter(|r| r.effect == Effect::Unknown)
             .map(|r| r.symbol.as_str())
             .collect();
-        assert_eq!(unknowns, BTreeSet::from(["toml::from_str::<Cfg>"]));
+        assert_eq!(unknowns, BTreeSet::from(["widget_lib::render::<Cfg>"]));
         assert!(facts
             .roots
             .iter()
@@ -820,14 +844,143 @@ mod tests {
 
     #[test]
     fn trust_pure_clears_an_unknown() {
-        let src = "[trust]\n\"toml\" = \"pure\"\n\"serde_json\" = \"pure\"\n";
+        // A project vouches two otherwise-unvouched crates pure; both then clear.
+        let src = "[trust]\n\"widget_lib\" = \"pure\"\n\"gadget\" = \"pure\"\n";
         let seeds = RootSeeds::from_toml(src).unwrap();
         assert_eq!(
-            seeds.classify_foreign("toml::from_str::<T>"),
+            seeds.classify_foreign("widget_lib::render::<T>"),
             Resolution::Pure
         );
         assert_eq!(
-            seeds.classify_foreign("serde_json::from_str::<T>"),
+            seeds.classify_foreign("gadget::build::<T>"),
+            Resolution::Pure
+        );
+    }
+
+    #[test]
+    fn rust_library_pack_vouches_pure_crates() {
+        // The shipped library pack (`rust-libs.toml`) is merged onto the std base
+        // for Rust: serde_json / genco / sha2 / anyhow / regex / oxc resolve to
+        // `Pure` instead of failing closed on `Unknown`.
+        let seeds = RootSeeds::for_language(Language::Rust);
+        for callee in [
+            "serde_json::from_str::<'_, widget_lib::Cfg>",
+            "serde_json::Map::<std::string::String, serde_json::Value>::insert",
+            "genco::Tokens::<genco::lang::Rust>::append::<&genco::Tokens<genco::lang::Rust>>",
+            "<sha2::Sha256 as sha2::Digest>::finalize",
+            "anyhow::__private::format_err",
+            "regex::Regex::new",
+            "<oxc_ast::AstKind<'_> as oxc_span::GetSpan>::span",
+            "itertools::Itertools::collect_vec",
+        ] {
+            assert_eq!(
+                seeds.classify_foreign(callee),
+                Resolution::Pure,
+                "expected {callee} to be vouched pure by the library pack"
+            );
+            // A pure crate carries no effect root.
+            assert_eq!(seeds.effect_of(callee), None, "{callee} seeded an effect");
+        }
+        // `RootSeeds::default()` is the same Rust base, so it agrees.
+        assert_eq!(
+            RootSeeds::default()
+                .classify_foreign("serde_json::to_string_pretty::<serde_json::Value>"),
+            Resolution::Pure
+        );
+    }
+
+    #[test]
+    fn rust_library_pack_grades_effectful_crates() {
+        // Mixed and effectful library crates are graded at their effect roots.
+        let seeds = RootSeeds::for_language(Language::Rust);
+        // duckdb / postgres -> db; a database binding is never pure.
+        assert_eq!(
+            seeds.effect_of("duckdb::Connection::execute::<&str>"),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            seeds.effect_of("postgres::Client::query::<&str>"),
+            Some(Effect::Db)
+        );
+        // A postgres connect additionally opens a socket: the more specific rule
+        // wins for that callee.
+        assert_eq!(
+            seeds.effect_of("postgres::Client::connect::<postgres::NoTls>"),
+            Some(Effect::Net)
+        );
+        // gix reads `.git` from disk -> fs; its transport opens sockets -> net.
+        assert_eq!(
+            seeds.effect_of("gix::open::<&std::path::Path>"),
+            Some(Effect::Fs)
+        );
+        assert_eq!(
+            seeds.effect_of("gix_transport::client::connect"),
+            Some(Effect::Net)
+        );
+        // ignore walks the filesystem -> fs.
+        assert_eq!(
+            seeds.effect_of("ignore::WalkBuilder::build"),
+            Some(Effect::Fs)
+        );
+        // arrow: in-memory columnar is pure, but the IPC/CSV file codecs are fs.
+        assert_eq!(seeds.effect_of("arrow_array::RecordBatch::num_rows"), None);
+        assert_eq!(
+            seeds.classify_foreign("arrow_array::RecordBatch::num_rows"),
+            Resolution::Pure
+        );
+        assert_eq!(
+            seeds.effect_of("arrow_ipc::reader::FileReader::<std::fs::File>::try_new"),
+            Some(Effect::Fs)
+        );
+    }
+
+    #[test]
+    fn rust_library_pack_splits_clap_builders_from_argv_readers() {
+        // clap's builders and match accessors are pure; only the entry points
+        // that read the process's argv are `env`. The pure vouch is scoped so it
+        // never shadows the argv readers.
+        let seeds = RootSeeds::for_language(Language::Rust);
+        // Builders / accessors: pure, no effect.
+        assert_eq!(seeds.effect_of("clap::Command::new::<&str>"), None);
+        assert_eq!(
+            seeds.classify_foreign("clap::Command::new::<&str>"),
+            Resolution::Pure
+        );
+        assert_eq!(
+            seeds.classify_foreign("clap::ArgMatches::remove_many::<std::path::PathBuf>"),
+            Resolution::Pure
+        );
+        // argv readers: `env`, and NOT cleared by the pure vouch.
+        assert_eq!(
+            seeds.effect_of("clap::Command::get_matches"),
+            Some(Effect::Env)
+        );
+        assert_eq!(
+            seeds.classify_foreign("clap::Command::get_matches"),
+            Resolution::Effect(Effect::Env)
+        );
+        assert_eq!(seeds.effect_of("clap::Parser::parse"), Some(Effect::Env));
+    }
+
+    #[test]
+    fn rust_library_pack_splits_chrono_clock_from_pure_arithmetic() {
+        // chrono's wall-clock reads are `clock`; its date value types are pure —
+        // and the pure vouch never shadows `now`.
+        let seeds = RootSeeds::for_language(Language::Rust);
+        assert_eq!(seeds.effect_of("chrono::Utc::now"), Some(Effect::Clock));
+        assert_eq!(
+            seeds.classify_foreign("chrono::Utc::now"),
+            Resolution::Effect(Effect::Clock)
+        );
+        assert_eq!(seeds.effect_of("chrono::NaiveDate::from_ymd_opt"), None);
+        assert_eq!(
+            seeds.classify_foreign("chrono::NaiveDate::from_ymd_opt"),
+            Resolution::Pure
+        );
+        // uuid: entropy constructors are random, parsing is pure.
+        assert_eq!(seeds.effect_of("uuid::Uuid::new_v4"), Some(Effect::Random));
+        assert_eq!(
+            seeds.classify_foreign("uuid::Uuid::parse_str::<&str>"),
             Resolution::Pure
         );
     }

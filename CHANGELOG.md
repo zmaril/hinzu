@@ -28,6 +28,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the reference-level rung lands, because the call-only extractor emits no edges
   for SQLAlchemy's largely module-level (class-scope) usage.
 
+- **A shipped Rust library annotation pack — the common crates stop coming back
+  "cannot certify."** `crates/hinzu-core/annotations/rust-libs.toml` is a built-in
+  default, merged onto `std.toml` for the Rust base the same way the Python and
+  Node packs work, so a project inherits honest effect labels for the crates the
+  fleet reaches most often without writing a `[trust]` line for each one. It
+  follows the resolution order already in `roots.rs`: a pure crate is vouched pure
+  (`serde`, `serde_json`, `serde_yaml`, `toml`, `regex`, `sha2`, `sha1`, `digest`,
+  `anyhow`, `thiserror`, `genco`, `crossbeam_channel`, `itertools`, and the `oxc`
+  parser/AST/semantic crates — in-memory compute with no I/O), while a mixed or
+  effectful crate is graded at its effect roots and never blanket-pured: `gix` is
+  `fs` (its transport and protocol crates `net`), `ignore` is `fs`, `duckdb` and
+  `postgres` / `tokio-postgres` are `db` (a `postgres` connect additionally opens
+  a socket, so the connect entry points are `net`), the `arrow` file and stream
+  codecs (`arrow-ipc`, CSV, JSON) are `fs` while the in-memory columnar surface
+  stays pure, `clap`'s argv/env readers (`Parser::parse`, `Command::get_matches`)
+  are `env` while its builders and match accessors stay pure, `chrono`'s
+  `Utc::now` / `Local::now` are `clock` while its date types stay pure, `uuid`'s
+  entropy constructors (`new_v4`, `new_v7`) are `random` while parsing stays pure,
+  `tokio`'s `fs` / `net` / `process` / `time` submodules carry their effects while
+  the runtime, task, and sync primitives stay pure, and the TLS crates
+  (`native_tls`, `rustls`) are `net`. The hard rule throughout: a crate that does
+  I/O is never marked pure, because a false "pure" is a silent hole in a
+  functional-core gate. A project's own `hinzu.toml` still overrides any of it. On
+  the [Straitjacket](https://github.com/zmaril/straitjacket) reference crate under
+  a functional-core policy the pack drops the "cannot certify" count sharply while
+  leaving the forbidden-effect count unchanged — no real leak appears or vanishes.
+  See [`notes/rust-libs-catalog.md`](./notes/rust-libs-catalog.md).
+
 - **Go is a first-class language, over gopls — the proof that a new language is a
   new config, not new extractor code.** `hinzu check` routes a `go.mod` module to
   the same generic Rust LSP extractor Python uses, driving gopls (the Go team's
