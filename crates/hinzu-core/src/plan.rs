@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::graph::GraphOutput;
 
@@ -60,7 +60,7 @@ impl Default for PlanOpts {
 }
 
 /// A group of files ported together as one unit (a PR / an agent thread).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlanGroup {
     /// The group id (`"group:N"`, numbered in wave-then-path order).
     pub id: String,
@@ -90,7 +90,7 @@ pub struct PlanGroup {
 }
 
 /// A topological layer of groups that can be ported fully in parallel.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Wave {
     /// The wave number (`0` = first).
     pub wave: u32,
@@ -105,7 +105,7 @@ pub struct Wave {
 }
 
 /// The grouping knobs echoed back into the output.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Grouping {
     /// The loc ceiling coalescing respected.
     pub max_group_loc: usize,
@@ -114,7 +114,7 @@ pub struct Grouping {
 }
 
 /// The call-only fidelity of the plan, carried next to the data.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fidelity {
     /// Always true: the plan is built over the call-only dependency graph.
     pub call_only: bool,
@@ -123,7 +123,7 @@ pub struct Fidelity {
 }
 
 /// Aggregate counts for the whole plan.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stats {
     /// Distinct files scheduled.
     pub file_count: usize,
@@ -145,7 +145,7 @@ pub struct Stats {
 }
 
 /// The complete plan document, ready to serialize as JSON.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlanOutput {
     /// The schema version ([`HINZU_PLAN_VERSION`]).
     pub hinzu_plan_version: u32,
