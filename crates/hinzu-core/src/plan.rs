@@ -501,8 +501,8 @@ pub fn build_plan(graph: &GraphOutput, opts: PlanOpts) -> PlanOutput {
             coalesce_small: opts.coalesce_small,
         },
         fidelity: Fidelity {
-            call_only: true,
-            notes: fidelity_notes(),
+            call_only: graph.fidelity.call_only,
+            notes: fidelity_notes(graph.fidelity.includes_type_edges),
         },
         stats,
         groups: out_groups,
@@ -580,15 +580,26 @@ fn coalesce(
     }
 }
 
-/// The plan's honest caveats — the graph's call-only limits, plus the grouping
-/// and coalescing heuristics layered on top.
-fn fidelity_notes() -> Vec<String> {
-    vec![
+/// The plan's honest caveats — the graph's dependency-edge limits, plus the
+/// grouping and coalescing heuristics layered on top. `includes_type_edges`
+/// reflects whether the underlying graph captured signature-type dependencies.
+fn fidelity_notes(includes_type_edges: bool) -> Vec<String> {
+    let dependency_note = if includes_type_edges {
+        "Built over the dependency graph: an edge means a caller calls or references \
+         a callee, or (kind=\"type\") depends on a type in its signature. Signature-type \
+         dependencies are captured for TypeScript and Rust, so file dependencies that flow \
+         only through a type are represented; the LSP/tree-sitter (Python) rung is still \
+         call-only — a follow-up."
+            .to_string()
+    } else {
         "Built over the call-only dependency graph: an edge means a caller calls or \
          references a callee, so file dependencies that flow only through types or \
          imports (never a call) are not represented."
-            .to_string(),
-        "File edges are inferred by projecting symbol call edges onto their files; \
+            .to_string()
+    };
+    vec![
+        dependency_note,
+        "File edges are inferred by projecting symbol edges onto their files; \
          there is no imports/implementation table."
             .to_string(),
         "Higher-order calls, dynamic dispatch, and unresolved callbacks are \

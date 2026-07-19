@@ -28,7 +28,9 @@ pub trait EffectEngine {
 /// effect root.
 pub fn forward_adjacency(facts: &FactSet) -> BTreeMap<SymbolId, Vec<SymbolId>> {
     let mut uses_of: BTreeMap<SymbolId, Vec<SymbolId>> = BTreeMap::new();
-    for edge in &facts.edges {
+    // Type edges are signature-type dependencies (for porting closures), not
+    // calls — they must not carry effects, so they are excluded here.
+    for edge in facts.edges.iter().filter(|e| e.kind.carries_effects()) {
         uses_of
             .entry(edge.caller.clone())
             .or_default()
@@ -116,9 +118,11 @@ impl EffectEngine for NaiveEngine {
 /// function is the body of [`NaiveEngine::propagate`]; callers that want the
 /// engine seam should depend on the [`EffectEngine`] trait instead.
 pub fn propagate(facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary> {
-    // Reverse adjacency: callee -> the symbols that use it.
+    // Reverse adjacency: callee -> the symbols that use it. Type edges are
+    // signature-type dependencies, not calls, so they are excluded — a `Type`
+    // edge must never propagate a runtime effect.
     let mut callers_of: BTreeMap<SymbolId, Vec<SymbolId>> = BTreeMap::new();
-    for edge in &facts.edges {
+    for edge in facts.edges.iter().filter(|e| e.kind.carries_effects()) {
         callers_of
             .entry(edge.callee.clone())
             .or_default()
@@ -182,7 +186,7 @@ pub fn propagate(facts: &FactSet) -> BTreeMap<SymbolId, EffectSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::EffectRoot;
+    use crate::facts::{Edge, EffectRoot};
     use crate::test_support::edge;
 
     fn fs_root(sym: &str) -> EffectRoot {
@@ -226,6 +230,31 @@ mod tests {
 
         assert!(summaries["a"].effects.contains(&Effect::Fs));
         assert!(summaries["b"].effects.contains(&Effect::Fs));
+    }
+
+    #[test]
+    fn type_edges_do_not_propagate_effects() {
+        // `foo` depends on the TYPE `File` (a signature dependency), and `File`
+        // is (contrived) an effect root. A type edge is not a call, so `foo`
+        // must NOT inherit the effect through it.
+        let mut facts = FactSet::default();
+        facts.add_edge(Edge::type_dep("foo", "File", "foo.rs", 1));
+        facts.add_root(fs_root("File"));
+        // A genuine call edge into a real fs root, to prove propagation itself
+        // still works and only the type edge is excluded.
+        facts.add_edge(edge("bar", "open"));
+        facts.add_root(fs_root("open"));
+
+        let summaries = propagate(&facts);
+
+        // `foo` reaches nothing through its type edge.
+        let foo = summaries.get("foo").cloned().unwrap_or_default();
+        assert!(
+            foo.effects.is_empty(),
+            "type edge leaked an effect into foo"
+        );
+        // `bar` still carries fs through its call edge.
+        assert!(summaries["bar"].effects.contains(&Effect::Fs));
     }
 
     #[test]

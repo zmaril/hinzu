@@ -16,15 +16,25 @@
 //!
 //! ## Fidelity, stated honestly
 //!
-//! The graph is **call-only**: an edge means "caller calls or references
-//! callee", derived from the same call/use facts the effect engine consumes.
+//! An edge means "`from` depends on `to`". Most edges are call/use edges —
+//! `from` calls or references `to` — derived from the same call/use facts the
+//! effect engine consumes. On top of those, adapters that resolve types (the
+//! TypeScript and Rust drivers) contribute **signature-type edges**
+//! (`kind = "type"`): a function → the types named in its parameters, return, or
+//! a class's `extends`/`implements` bases. These are genuine port dependencies —
+//! a function cannot be ported before the types in its signature — so `--from`
+//! closures follow them, and they project onto file edges like any other edge.
+//! Whether a given graph carries them is reported in [`Fidelity`]
+//! (`includes_type_edges`); the LSP/tree-sitter (Python) rung is still
+//! call-only, a follow-up.
+//!
 //! Higher-order calls, dynamic dispatch, and callbacks the adapter could not
-//! resolve are approximated or missed; an unresolved target is marked
+//! resolve are still approximated or missed; an unresolved target is marked
 //! `provenance = "unknown"` rather than silently dropped. File-level edges are
-//! *inferred* by projecting symbol call edges onto their files — there is no
-//! separate imports/implementation table — so a file dependency that flows only
-//! through types (never a call) is not represented. These caveats are carried
-//! in [`Fidelity`] so a consumer sees them next to the data.
+//! *inferred* by projecting symbol edges onto their files — there is no separate
+//! imports/implementation table — so a file dependency that flows only through
+//! an import the adapter emitted no edge for is still not represented. These
+//! caveats are carried in [`Fidelity`] so a consumer sees them next to the data.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,7 +96,8 @@ pub struct SymbolEdge {
     pub from: String,
     /// The callee symbol id.
     pub to: String,
-    /// The edge kind (`"call"` or `"reference"`).
+    /// The edge kind (`"call"`, `"reference"`, or `"type"` — a signature-type
+    /// dependency).
     pub kind: String,
     /// The adapter's resolution provenance (`"call"`, `"reference"`,
     /// `"value-flow"`, `"unresolved"`).
@@ -172,12 +183,21 @@ pub struct Condensation {
     pub file_leaves: Vec<String>,
 }
 
-/// The call-only fidelity of this graph, stated so a consumer sees the caveats
-/// next to the data.
+/// The fidelity of this graph, stated so a consumer sees the caveats next to the
+/// data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fidelity {
-    /// Always true: edges are derived from the call/use graph only.
+    /// Whether edges come from the call/use graph *only*. False once an adapter
+    /// contributes signature-type edges (see `includes_type_edges`): the graph
+    /// then captures type dependencies as well as calls/references.
     pub call_only: bool,
+    /// Whether the graph includes signature-type dependency edges (`kind =
+    /// "type"`): a function → the types named in its parameters, return, or a
+    /// class's `extends`/`implements`. Emitted by the TypeScript and Rust
+    /// adapters; the LSP/tree-sitter (Python) rung is still call-only — a
+    /// follow-up. When true, `--from` closures pull in the types a symbol needs
+    /// ported, not just what it calls.
+    pub includes_type_edges: bool,
     /// Human-readable caveats about what the graph does and does not capture.
     pub notes: Vec<String>,
     /// How many symbol edges resolve to an unknown/unresolved target.
@@ -369,13 +389,31 @@ fn condense(adj: &BTreeMap<String, BTreeSet<String>>) -> SccCondensation {
 }
 
 /// Per-node metadata for a local definition, carried into [`assemble_graph`].
-/// External nodes have no metadata (`None`).
-struct NodeMeta {
+/// External nodes have no metadata (`None`). Visible to the `merge` submodule,
+/// which reassembles graphs from existing [`SymbolNode`]s.
+pub(super) struct NodeMeta {
     display: String,
     file: String,
     language: String,
     line_start: u32,
     line_end: u32,
+}
+
+/// The [`NodeMeta`] for an existing symbol node, or `None` for an external leaf
+/// (no defining file). Shared by [`filter_to_closure`] and the `merge` submodule
+/// so a graph rebuilt from [`SymbolNode`]s recovers the same metadata everywhere.
+pub(super) fn node_meta_of(sym: &SymbolNode) -> Option<NodeMeta> {
+    if sym.external {
+        None
+    } else {
+        Some(NodeMeta {
+            display: sym.display.clone(),
+            file: sym.file.clone().unwrap_or_default(),
+            language: sym.language.clone().unwrap_or_default(),
+            line_start: sym.line_start.unwrap_or(0),
+            line_end: sym.line_end.unwrap_or(0),
+        })
+    }
 }
 
 /// Build the porting dependency graph from a fact set.
@@ -511,18 +549,10 @@ pub fn filter_to_closure(graph: &GraphOutput, roots: &[SymbolId]) -> GraphOutput
         if !closure.contains(&sym.id) {
             continue;
         }
-        let meta = if sym.external {
-            None
-        } else {
+        let meta = node_meta_of(sym);
+        if meta.is_some() {
             effect_roots.insert(sym.id.clone(), sym.effect_roots.clone());
-            Some(NodeMeta {
-                display: sym.display.clone(),
-                file: sym.file.clone().unwrap_or_default(),
-                language: sym.language.clone().unwrap_or_default(),
-                line_start: sym.line_start.unwrap_or(0),
-                line_end: sym.line_end.unwrap_or(0),
-            })
-        };
+        }
         nodes.insert(sym.id.clone(), meta);
     }
 
@@ -542,6 +572,13 @@ pub fn filter_to_closure(graph: &GraphOutput, roots: &[SymbolId]) -> GraphOutput
         &effect_roots,
     )
 }
+
+/// Cross-package graph union + per-package slicing: [`merge_graphs`] and
+/// [`reroot_subgraph`], used to build and partition a `--from` closure that
+/// spans package boundaries. Kept in a submodule so this file stays focused on
+/// building a single graph; they reuse `assemble_graph` and `node_meta_of`.
+mod merge;
+pub use merge::{merge_graphs, reroot_subgraph};
 
 /// A single `--from` pattern resolving to more than this many symbols is called
 /// out in [`RootResolution::notes`], so the operator sees a broad match.
@@ -703,7 +740,7 @@ pub fn resolve_roots(graph: &GraphOutput, patterns: &[String]) -> Result<RootRes
 /// `None` for an external target. Every endpoint of every edge in `edges` must
 /// be a key in `nodes`. `effect_roots` gives each internal node its reachable
 /// effect categories (external nodes always report none).
-fn assemble_graph(
+pub(super) fn assemble_graph(
     root: &str,
     language: Option<&str>,
     nodes: &BTreeMap<String, Option<NodeMeta>>,
@@ -937,27 +974,44 @@ fn assemble_graph(
         .map(|l| l.to_string())
         .or_else(|| nodes.values().flatten().next().map(|m| m.language.clone()));
 
+    let includes_type_edges = edges.iter().any(|e| e.kind == "type");
+    let mut notes = vec![
+        "Edges come from the call/use graph (call-hierarchy style): `from` \
+         depends on `to` when it calls or references it."
+            .to_string(),
+        "Higher-order calls, dynamic dispatch through trait objects or function \
+         pointers, and unresolved callbacks are approximated or missed. An edge \
+         the adapter could not resolve is marked provenance=\"unknown\"."
+            .to_string(),
+        "External callees (no local definition) are emitted as leaf nodes \
+         with provenance external/unknown; treat them as already-available \
+         library calls, not port targets."
+            .to_string(),
+    ];
+    if includes_type_edges {
+        notes.push(
+            "Signature-type dependencies are captured (kind=\"type\"): a \
+             function depends on the types named in its parameters and return, \
+             and a class on its extends/implements bases. These are real port \
+             dependencies — `--from` closures follow them — and they project \
+             onto file edges too, so a module dependency that flows only \
+             through a type (never a call) is now represented. Emitted for \
+             TypeScript and Rust; the LSP/tree-sitter (Python) rung is still \
+             call-only — a follow-up."
+                .to_string(),
+        );
+    } else {
+        notes.push(
+            "Call-only: this adapter emits no signature-type edges, so a file \
+             or symbol dependency that flows only through a type (never a call) \
+             is not represented. Type edges are emitted for TypeScript and Rust."
+                .to_string(),
+        );
+    }
     let fidelity = Fidelity {
-        call_only: true,
-        notes: vec![
-            "Edges come from the call/use graph (call-hierarchy style): `from` \
-             depends on `to` when it calls or references it."
-                .to_string(),
-            "Call-only fidelity — higher-order calls, dynamic dispatch through \
-             trait objects or function pointers, and unresolved callbacks are \
-             approximated or missed. An edge the adapter could not resolve is \
-             marked provenance=\"unknown\"."
-                .to_string(),
-            "There is no textDocument/implementation or explicit imports table; \
-             file edges are inferred by projecting symbol call edges onto their \
-             files, so a file dependency that flows only through types or \
-             imports (never a call) is not represented."
-                .to_string(),
-            "External callees (no local definition) are emitted as leaf nodes \
-             with provenance external/unknown; treat them as already-available \
-             library calls, not port targets."
-                .to_string(),
-        ],
+        call_only: !includes_type_edges,
+        includes_type_edges,
+        notes,
         unknown_edge_count,
         external_node_count: external_count,
     };
@@ -1266,6 +1320,73 @@ mod tests {
             node(&scoped, "app::run").external_packages,
             vec!["pkg".to_string()]
         );
+    }
+
+    #[test]
+    fn closure_follows_type_edges_and_they_carry_no_effects() {
+        // `foo` has a Type edge to `Widget` (a signature dependency) and NO call
+        // edge; `Widget` is a leaf type def with a seeded fs effect on a helper
+        // it does not reach. The closure of `foo` must include `Widget` (a real
+        // port dependency), and the Type edge must not carry any effect to `foo`.
+        let mut facts = FactSet::default();
+        facts.add_def(def("app::foo", "foo.rs", 1, 5));
+        facts.add_def(def("app::Widget", "widget.rs", 1, 3));
+        facts.add_def(def("app::helper", "helper.rs", 1, 3));
+        facts.add_edge(Edge::type_dep("app::foo", "app::Widget", "foo.rs", 2));
+        // A real call edge elsewhere with an fs root, to prove propagation still
+        // works for calls and that the type edge does not smuggle it into foo.
+        facts.add_edge(Edge::call("app::helper", "pkg::open", "helper.rs", 2));
+        facts.add_root(EffectRoot {
+            symbol: "pkg::open".to_string(),
+            effect: Effect::Fs,
+        });
+
+        let out = build_graph(&facts, "types", Some("rust"));
+
+        // The graph reports it captures type edges.
+        assert!(!out.fidelity.call_only);
+        assert!(out.fidelity.includes_type_edges);
+        // The foo->Widget edge is a resolved type edge.
+        let type_edge = out.edges.iter().find(|e| e.to == "app::Widget").unwrap();
+        assert_eq!(type_edge.kind, "type");
+        assert_eq!(type_edge.provenance, "resolved");
+
+        // Closure of foo pulls in the type it names in its signature (the
+        // closure set is sorted).
+        assert_eq!(
+            closure_of(&out, &["app::foo"]),
+            vec!["app::Widget".to_string(), "app::foo".to_string()]
+        );
+        // The filtered sub-graph keeps Widget as an internal port target.
+        let scoped = filter_to_closure(&out, &["app::foo".to_string()]);
+        assert!(scoped
+            .symbols
+            .iter()
+            .any(|s| s.id == "app::Widget" && !s.external));
+
+        // The type edge carries NO effect: foo reaches no fs (helper does).
+        assert!(node(&out, "app::foo").effect_roots.is_empty());
+        assert_eq!(
+            node(&out, "app::helper").effect_roots,
+            vec!["fs".to_string()]
+        );
+
+        // A type edge across files is a genuine file dependency too.
+        let fe = out
+            .file_edges
+            .iter()
+            .find(|e| e.from == "foo.rs" && e.to == "widget.rs")
+            .expect("type edge projects onto a file edge");
+        assert_eq!(fe.call_edge_count, 1);
+    }
+
+    #[test]
+    fn full_call_only_graph_reports_call_only_fidelity() {
+        // No type edges → the fidelity block stays call-only.
+        let facts = abc_facts(); // only a call edge a->b
+        let out = build_graph(&facts, "callonly", Some("rust"));
+        assert!(out.fidelity.call_only);
+        assert!(!out.fidelity.includes_type_edges);
     }
 
     #[test]

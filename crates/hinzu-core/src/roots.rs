@@ -310,7 +310,9 @@ impl RootSeeds {
             .collect();
 
         let mut new_roots = Vec::new();
-        for edge in &facts.edges {
+        // Type edges are signature-type dependencies, not calls; they never seed
+        // an effect root.
+        for edge in facts.edges.iter().filter(|e| e.kind.carries_effects()) {
             if let Some(effect) = self.effect_of(&edge.callee) {
                 if present.insert((edge.callee.clone(), effect)) {
                     new_roots.push(EffectRoot {
@@ -357,7 +359,9 @@ impl RootSeeds {
             .collect();
 
         let mut new_roots = Vec::new();
-        for edge in &facts.edges {
+        // Type edges are signature-type dependencies, not calls; they never seed
+        // an `Unknown` — uncertainty is a property of unresolved calls only.
+        for edge in facts.edges.iter().filter(|e| e.kind.carries_effects()) {
             // An indirect call the driver could not resolve: unknown *target*.
             let unknown = if edge.resolution == EdgeResolution::Unresolved {
                 true

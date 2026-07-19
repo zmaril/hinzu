@@ -115,7 +115,8 @@ Top level (`hinzu_graph_version: 1`):
 
 | field | type | meaning |
 | --- | --- | --- |
-| `call_only` | bool | always `true`: edges are call/use only |
+| `call_only` | bool | `true` when edges are call/use only; `false` once signature-type edges are present |
+| `includes_type_edges` | bool | `true` when the graph carries signature-type dependency edges (`kind: "type"`) — TypeScript and Rust today; the LSP/tree-sitter (Python) rung is still call-only, a follow-up |
 | `notes` | string[] | human-readable caveats about what the graph misses |
 | `unknown_edge_count` | int | edges resolving to an unknown/unresolved target |
 | `external_node_count` | int | external (no-local-definition) target nodes |
@@ -157,9 +158,17 @@ estimate for "porting this pulls in N things".
 
 ### `edges[]` — a symbol edge
 
-`from`, `to`, `kind` (`call`/`reference`), `resolution`
+`from`, `to`, `kind` (`call`/`reference`/`type`), `resolution`
 (`call`/`reference`/`value-flow`/`unresolved`), `evidence_file`,
 `evidence_line`, and:
+
+A `type` edge is a **signature-type dependency**: `from` (a function, or a class)
+depends on `to` (a type) because it names it in a parameter, the return, or an
+`extends`/`implements` bound. It is a real port dependency — `--from` closures
+follow it — but it is *not* a call, so it carries no effect and is excluded from
+effect propagation (a function taking a `File` parameter performs no fs). It
+resolves statically to the type's declaration, so its `resolution` is
+`reference`.
 
 | `provenance` | meaning |
 | --- | --- |
@@ -176,10 +185,11 @@ the file-dependency graph.
 
 ### `file_edges[]` — a file-rollup edge
 
-Derived by projecting each internal symbol call edge onto `(caller.file →
-callee.file)`, dropping self-loops. `call_edge_count` is how many symbol edges
-project onto the pair; `has_unknown` is true if any contributing symbol edge was
-itself unresolved.
+Derived by projecting each internal symbol edge onto `(caller.file →
+callee.file)`, dropping self-loops. Signature-type edges project too, so a module
+dependency that flows only through a type (never a call) is now represented.
+`call_edge_count` is how many symbol edges project onto the pair; `has_unknown`
+is true if any contributing symbol edge was itself unresolved.
 
 ### `condensation` — the acyclic view + port-order utilities
 
@@ -200,17 +210,31 @@ sort its condensation.
 
 ## Fidelity limits (stated honestly)
 
-The graph is **call-only**. An edge means "caller calls or references callee",
-from the same facts the effect engine uses. Consequently:
+Most edges are **call/use** edges — "caller calls or references callee", from the
+same facts the effect engine uses. On top of those, the TypeScript and Rust
+adapters contribute **signature-type** edges (`kind: "type"`): a function → the
+types named in its parameters/return, and a class → its `extends`/`implements`
+bases. `fidelity.call_only` / `fidelity.includes_type_edges` report which the
+graph carries. Consequently:
 
+- **Signature-type dependencies are captured for TypeScript and Rust.** A
+  function cannot be ported before the types in its signature, so `--from`
+  closures follow `type` edges and they project onto file edges. The
+  LSP/tree-sitter (**Python**) rung does not yet resolve types — it stays
+  call-only until a follow-up teaches it to walk `textDocument/typeDefinition`
+  (or tree-sitter type annotations) and emit the same `type` edge kind. The
+  schema is already shared, so that rung is purely additive.
+- **A `type` edge carries no effect.** It is a porting dependency, not a call, so
+  it is excluded from effect propagation and the reverse call graph `hinzu check`
+  walks — adding type edges never changes an effect result.
 - **Higher-order calls, dynamic dispatch (trait objects / function pointers), and
   unresolved callbacks** are approximated or missed. An edge the adapter could
   not resolve is marked `provenance: "unknown"` and counted in
   `fidelity.unknown_edge_count` — never silently dropped.
 - **There is no `textDocument/implementation` or explicit imports table.** File
-  edges are *inferred* by projecting symbol call edges onto files, so a file
-  dependency that flows only through types or imports (never a call) is not
-  represented.
+  edges are *inferred* by projecting symbol edges onto files, so a module
+  dependency that flows only through an import the adapter emitted no edge for
+  (not a call, not a resolved type) is still not represented.
 - **External callees** (no local definition) are library boundaries, emitted as
   leaf nodes, not port targets.
 
