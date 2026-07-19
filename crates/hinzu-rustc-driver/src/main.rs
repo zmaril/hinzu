@@ -175,15 +175,24 @@ impl CallCollector<'_> {
         }
     }
 
-    /// Record a resolved direct call to `callee`, seeding an effect root when
-    /// the callee's path is a known effectful operation.
-    fn push_direct(&mut self, callee: String, resolved: bool, file: String, line: u32) {
+    /// Record a direct call to a **named** callee, seeding an effect root when the
+    /// callee's path is a known effectful operation. The callee is a statically
+    /// named function item, so the edge is `resolution: call` even when
+    /// `Instance::resolve` could not *monomorphize* it — a generic/trait call in a
+    /// polymorphic body (a closure or `static`/`const` initializer walked from its
+    /// own generic MIR) keeps the trait-method name (`std::convert::AsRef::as_ref`),
+    /// which the engine's name-based resolution order classifies soundly (a std
+    /// name clears to trusted-pure; an unresolvable user name still degrades to
+    /// `Unknown`). `resolution: unresolved` is reserved for a genuinely *anonymous*
+    /// target — a fn-pointer / `dyn` call — emitted by [`Self::push_indirect`]; a
+    /// named target is never that gap.
+    fn push_direct(&mut self, callee: String, file: String, line: u32) {
         self.seed_root(&callee);
         self.edges.push(Edge {
             caller: self.caller.clone(),
             callee,
             kind: "call".to_string(),
-            resolution: if resolved { "call" } else { "unresolved" }.to_string(),
+            resolution: "call".to_string(),
             evidence_file: file,
             evidence_line: line,
         });
@@ -258,14 +267,17 @@ impl MirVisitor for CallCollector<'_> {
         if let TerminatorKind::Call { func, args, .. } = &term.kind {
             let (file, line) = span_file_line(loc.span());
             match func.ty(self.locals).map(|fty| fty.kind()) {
-                // Direct, statically known callee. Resolve to a monomorphic
-                // Instance for the precise callee name.
+                // Direct, statically named callee. Resolve to a monomorphic
+                // Instance for the precise name; if it cannot be monomorphized
+                // (a generic/trait call in a polymorphic body), keep the
+                // trait-method name — it is still a named `call`, classified by
+                // name downstream, not an anonymous unresolved target.
                 Ok(TyKind::RigidTy(RigidTy::FnDef(def, args))) => {
-                    let (callee, resolved) = match Instance::resolve(def, &args) {
-                        Ok(inst) => (inst.name(), true),
-                        Err(_) => (def.name(), false),
+                    let callee = match Instance::resolve(def, &args) {
+                        Ok(inst) => inst.name(),
+                        Err(_) => def.name(),
                     };
-                    self.push_direct(callee, resolved, file.clone(), line);
+                    self.push_direct(callee, file.clone(), line);
                 }
                 // A fn-pointer / dyn value, or an operand whose type is
                 // unavailable: unresolved either way.

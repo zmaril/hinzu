@@ -71,7 +71,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`adapters/rust/tests/reference-fixture/`, with its driver-produced
   `reference-fixture-facts.json`) gives stable-CI coverage of the higher-order
   callback, the handed-off closure, and the lazy import-time initializer with no
-  nightly toolchain required (`crates/hinzu-cli/tests/rust_check.rs`).
+  nightly toolchain required (`crates/hinzu-cli/tests/rust_check.rs`). Walking
+  closure and `static`/`const` bodies also refined the driver's edge resolution:
+  a **named** `FnDef` call target the driver could not *monomorphize* (a
+  generic/trait call in a polymorphic body — `<P as AsRef<Path>>::as_ref`) is now
+  labeled `resolution: call`, keeping its trait-method name for the engine's
+  name-based resolution order (a std name clears to trusted-pure; an unresolvable
+  user name still degrades to `Unknown`) rather than `resolution: unresolved`,
+  which is reserved for a genuinely *anonymous* fn-pointer / `dyn` target
+  (`<indirect>`). This keeps the `self-check` functional-core guard green — its
+  dogfood run over hinzu-core surfaced `Store::open`'s `impl AsRef<Path>`
+  `with_context` closure, whose `path.as_ref()` was a benign, pure, unmonomorphized
+  std trait call, not a real effect.
 
 - **The reference-level rung of the precision ladder, for Python: a tree-sitter
   syntactic layer resolved through the LSP.** The generic LSP driver builds its
