@@ -704,17 +704,10 @@ pub fn build_dag(facts: &FactSet, root: &str, language: Option<&str>) -> DagOutp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::{Definition, Edge, Effect, EffectRoot, Language};
+    use crate::facts::{make_def, Definition, Edge, Effect, EffectRoot};
 
     fn def(id: &str, file: &str, line_start: u32, line_end: u32) -> Definition {
-        Definition {
-            id: id.to_string(),
-            display: id.rsplit("::").next().unwrap_or(id).to_string(),
-            language: Language::Rust,
-            file: file.to_string(),
-            line_start,
-            line_end,
-        }
+        make_def(id, file, line_start, line_end)
     }
 
     fn node<'a>(out: &'a DagOutput, id: &str) -> &'a SymbolNode {
@@ -724,14 +717,22 @@ mod tests {
             .expect("node present")
     }
 
-    #[test]
-    fn simple_chain_orders_dependencies_first() {
-        // a -> b -> c
+    /// Three defs `a`/`b`/`c` in their own files, wired `a -> b`. The two
+    /// ordering tests share this base and each adds the edge(s) that make it a
+    /// chain or a cycle.
+    fn abc_facts() -> FactSet {
         let mut facts = FactSet::default();
         facts.add_def(def("a", "a.rs", 1, 3));
         facts.add_def(def("b", "b.rs", 1, 3));
         facts.add_def(def("c", "c.rs", 1, 3));
         facts.add_edge(Edge::call("a", "b", "a.rs", 2));
+        facts
+    }
+
+    #[test]
+    fn simple_chain_orders_dependencies_first() {
+        // a -> b -> c
+        let mut facts = abc_facts();
         facts.add_edge(Edge::call("b", "c", "b.rs", 2));
 
         let out = build_dag(&facts, "chain", Some("rust"));
@@ -756,11 +757,7 @@ mod tests {
     #[test]
     fn cycle_is_condensed_and_ordered_before_its_dependent() {
         // a <-> b, and c -> a. The SCC {a,b} must be ported before c.
-        let mut facts = FactSet::default();
-        facts.add_def(def("a", "a.rs", 1, 3));
-        facts.add_def(def("b", "b.rs", 1, 3));
-        facts.add_def(def("c", "c.rs", 1, 3));
-        facts.add_edge(Edge::call("a", "b", "a.rs", 2));
+        let mut facts = abc_facts();
         facts.add_edge(Edge::call("b", "a", "b.rs", 2));
         facts.add_edge(Edge::call("c", "a", "c.rs", 2));
 

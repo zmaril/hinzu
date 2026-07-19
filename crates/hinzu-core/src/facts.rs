@@ -150,6 +150,21 @@ pub struct Definition {
     pub line_end: u32,
 }
 
+/// Build a [`Definition`] for tests. The `display` is the last `::`-segment of
+/// `id`, matching the extractor's convention. Shared across the crate's test
+/// modules so each one doesn't hand-roll the same struct literal.
+#[cfg(test)]
+pub(crate) fn make_def(id: &str, file: &str, line_start: u32, line_end: u32) -> Definition {
+    Definition {
+        id: id.to_string(),
+        display: id.rsplit("::").next().unwrap_or(id).to_string(),
+        language: Language::Rust,
+        file: file.to_string(),
+        line_start,
+        line_end,
+    }
+}
+
 /// Whether an edge is a resolved call or a bare reference to a symbol (for
 /// example, passing a function as a callback). Both carry effects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
