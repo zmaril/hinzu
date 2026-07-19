@@ -1,17 +1,17 @@
 # `hinzu plan` — a wave/group porting plan for AI-assisted porting
 
-`hinzu plan <project>` takes the dependency [DAG](./dag.md) and turns it into an
-**operational schedule**: it organizes files into **groups** (a PR / an agent
+`hinzu plan <project>` takes the dependency [graph](./graph.md) and turns it into
+an **operational schedule**: it organizes files into **groups** (a PR / an agent
 thread per group) and lays those groups out into **waves** (batches that can be
-ported fully in parallel). Where `hinzu dag` answers *"in what order can a symbol
-be ported so its dependencies come first?"*, `hinzu plan` answers the question a
-porting *orchestrator* asks:
+ported fully in parallel). Where `hinzu graph` answers *"in what order can a
+symbol be ported so its dependencies come first?"*, `hinzu plan` answers the
+question a porting *orchestrator* asks:
 
 > Which files can I hand to parallel threads/PRs **right now**, and what does
 > finishing them **unlock**?
 
-Porting happens file-by-file (a PR per group), so the plan works over the DAG's
-**file rollup** — it reuses the exact `files` / `file_edges` the DAG already
+Porting happens file-by-file (a PR per group), so the plan works over the graph's
+**file rollup** — it reuses the exact `files` / `file_edges` the graph already
 computed and never re-walks the raw facts.
 
 ## Usage
@@ -24,9 +24,9 @@ hinzu plan ./my-project --out plan.json
 hinzu plan ./my-project --facts facts.json --out plan.json
 hinzu plan ./my-project --db facts.db
 
-# compose off a DAG you already emitted (no re-extraction)
-hinzu dag  ./my-project --out dag.json
-hinzu plan ./my-project --dag dag.json --out plan.json
+# compose off a graph you already emitted (no re-extraction)
+hinzu graph ./my-project --out graph.json
+hinzu plan  ./my-project --graph graph.json --out plan.json
 
 # grouping knobs
 hinzu plan ./my-project --group-max-loc 300   # raise the coalescing ceiling
@@ -36,7 +36,7 @@ hinzu plan ./my-project --no-coalesce         # cycle-SCCs + singletons only
 hinzu plan ./my-project
 ```
 
-No policy file is required — like `hinzu dag`, the plan does not run the
+No policy file is required — like `hinzu graph`, the plan does not run the
 effect-propagation gate; effect roots are seeded best-effort from the language's
 built-in annotation base so the per-group `effect_roots` are populated.
 
@@ -47,7 +47,7 @@ built-in annotation base so the per-group `effect_roots` are populated.
 | `<path>` | — | the project to analyze (positional) |
 | `--facts <file>` | — | pre-extracted facts JSON, in place of a live run |
 | `--db <file>` | — | an existing SQLite fact store to read from |
-| `--dag <file>` | — | a previously emitted `dag.json` — build the plan straight from it, skipping extraction |
+| `--graph <file>` | — | a previously emitted `graph.json` — build the plan straight from it, skipping extraction |
 | `--out <file>` | stdout | where to write the plan JSON |
 | `--group-max-loc <n>` | `200` | the loc ceiling a coalesced group is kept under |
 | `--no-coalesce` | off | disable small-file coalescing (SCC-only grouping) |
@@ -85,8 +85,8 @@ reasons:
 
 - **`cycle` (mandatory).** Files in the same file-level dependency cycle (a
   file-graph SCC of size > 1) *must* be one group — none is independently
-  complete, so they are ported together in one thread. Derived from the DAG's
-  `file_sccs`.
+  complete, so they are ported together in one thread. Derived from the graph's
+  `condensation.file_sccs`.
 - **`coalesced-small` (heuristic, tunable).** With coalescing on (the default),
   small groups (total loc `< --group-max-loc`) are greedily merged with an
   **adjacent** group (one connected by a file dependency edge) as long as (a) the
@@ -132,8 +132,8 @@ Top level (`hinzu_plan_version: 1`):
 
 | field | type | meaning |
 | --- | --- | --- |
-| `call_only` | bool | always `true`: the plan is built over the call-only DAG |
-| `notes` | string[] | caveats — the DAG's call-only limits, plus the grouping/coalescing heuristics |
+| `call_only` | bool | always `true`: the plan is built over the call-only dependency graph |
+| `notes` | string[] | caveats — the graph's call-only limits, plus the grouping/coalescing heuristics |
 
 ### `stats`
 
@@ -176,8 +176,8 @@ Top level (`hinzu_plan_version: 1`):
 
 ## Fidelity limits (stated honestly)
 
-The plan is built over the **call-only** DAG and inherits every one of its
-caveats — an edge means "caller calls or references callee"; file edges are
+The plan is built over the **call-only** dependency graph and inherits every one
+of its caveats — an edge means "caller calls or references callee"; file edges are
 *inferred* by projecting symbol call edges onto files (there is no imports /
 implementation table), so a file dependency that flows only through types or
 imports is not represented; higher-order calls, dynamic dispatch, and unresolved

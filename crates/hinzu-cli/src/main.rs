@@ -30,14 +30,16 @@ enum Cmd {
     Run,
     /// Check a project's effect usage against a `hinzu.toml` policy.
     Check(CheckArgs),
-    /// Emit a JSON dependency DAG of a project, for AI-assisted porting: port
+    /// Emit a JSON dependency graph of a project, for AI-assisted porting: call
+    /// edges at the symbol level, module-dependency edges at the file level. Port
     /// leaves (no dependencies) first, then symbols whose dependencies are all
-    /// ported. No policy is needed — a DAG does not run the propagation gate.
-    Dag(DagArgs),
-    /// Emit a JSON porting plan: the dependency DAG organized into file-level
+    /// ported. The graph may contain cycles; the acyclic SCC-condensation gives
+    /// the port order. No policy is needed — it does not run the propagation gate.
+    Graph(GraphArgs),
+    /// Emit a JSON porting plan: the dependency graph organized into file-level
     /// groups (a PR per group; cycles ported together) and topological waves (a
     /// wave is a batch of groups with no dependency between them, portable in
-    /// parallel). Reuses `hinzu dag`, or loads a previously emitted dag.json.
+    /// parallel). Reuses `hinzu graph`, or loads a previously emitted graph.json.
     Plan(PlanArgs),
 }
 
@@ -60,7 +62,7 @@ struct CheckArgs {
 }
 
 #[derive(Parser)]
-struct DagArgs {
+struct GraphArgs {
     /// The project to analyze.
     path: PathBuf,
     /// Pre-extracted facts as JSON, in place of a live adapter run.
@@ -69,7 +71,7 @@ struct DagArgs {
     /// An existing SQLite fact store to read facts from, in place of a live run.
     #[arg(long)]
     db: Option<PathBuf>,
-    /// Where to write the DAG JSON. Defaults to stdout.
+    /// Where to write the graph JSON. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -84,10 +86,10 @@ struct PlanArgs {
     /// An existing SQLite fact store to read facts from, in place of a live run.
     #[arg(long)]
     db: Option<PathBuf>,
-    /// A previously emitted DAG JSON (`hinzu dag --out`). When given, the plan is
-    /// built straight from it — no facts are extracted.
+    /// A previously emitted graph JSON (`hinzu graph --out`). When given, the plan
+    /// is built straight from it — no facts are extracted.
     #[arg(long)]
-    dag: Option<PathBuf>,
+    graph: Option<PathBuf>,
     /// Where to write the plan JSON. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -136,7 +138,7 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
-        Cmd::Dag(args) => match dag(args) {
+        Cmd::Graph(args) => match graph(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -189,33 +191,34 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
     }
 }
 
-/// The `hinzu dag` flow. Resolves a fact set (from `--facts` JSON, an existing
+/// The `hinzu graph` flow. Resolves a fact set (from `--facts` JSON, an existing
 /// `--db` store, or a live adapter run), seeds effect roots best-effort from the
-/// language's built-in annotations (no policy needed), builds the porting DAG,
-/// and writes it as pretty JSON to `--out` or stdout.
-fn dag(args: DagArgs) -> Result<ExitCode> {
-    let dag = build_dag_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?;
-    let json = serde_json::to_string_pretty(&dag).context("serializing the DAG to JSON")?;
-    write_json(args.out.as_deref(), &json, "DAG")
+/// language's built-in annotations (no policy needed), builds the porting
+/// dependency graph, and writes it as pretty JSON to `--out` or stdout.
+fn graph(args: GraphArgs) -> Result<ExitCode> {
+    let graph = build_graph_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?;
+    let json = serde_json::to_string_pretty(&graph).context("serializing the graph to JSON")?;
+    write_json(args.out.as_deref(), &json, "graph")
 }
 
-/// The `hinzu plan` flow. Builds (or loads) the porting DAG, organizes it into
-/// file-level groups and topological waves, and writes the plan as pretty JSON.
-/// With `--dag <file>`, a previously emitted DAG is deserialized directly, so no
-/// facts are extracted; otherwise facts are resolved exactly as `hinzu dag` does.
+/// The `hinzu plan` flow. Builds (or loads) the porting dependency graph,
+/// organizes it into file-level groups and topological waves, and writes the plan
+/// as pretty JSON. With `--graph <file>`, a previously emitted graph is
+/// deserialized directly, so no facts are extracted; otherwise facts are resolved
+/// exactly as `hinzu graph` does.
 fn plan(args: PlanArgs) -> Result<ExitCode> {
-    let dag = match args.dag.as_deref() {
-        Some(dag_path) => {
-            let json = std::fs::read_to_string(dag_path)
-                .with_context(|| format!("reading DAG from {}", dag_path.display()))?;
-            serde_json::from_str::<hinzu_core::dag::DagOutput>(&json)
-                .with_context(|| format!("parsing DAG from {}", dag_path.display()))?
+    let graph = match args.graph.as_deref() {
+        Some(graph_path) => {
+            let json = std::fs::read_to_string(graph_path)
+                .with_context(|| format!("reading graph from {}", graph_path.display()))?;
+            serde_json::from_str::<hinzu_core::graph::GraphOutput>(&json)
+                .with_context(|| format!("parsing graph from {}", graph_path.display()))?
         }
-        None => build_dag_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?,
+        None => build_graph_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?,
     };
 
     let plan = hinzu_core::plan::build_plan(
-        &dag,
+        &graph,
         hinzu_core::plan::PlanOpts {
             max_group_loc: args.group_max_loc,
             coalesce_small: !args.no_coalesce,
@@ -227,13 +230,13 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
 
 /// Resolve a fact set (from `--facts` JSON, an existing `--db` store, or a live
 /// adapter run), seed effect roots best-effort from the language's built-in
-/// annotations (no policy needed), and build the porting DAG. Shared by `hinzu
-/// dag` and `hinzu plan` so both extract and build identically.
-fn build_dag_from_source(
+/// annotations (no policy needed), and build the porting dependency graph. Shared
+/// by `hinzu graph` and `hinzu plan` so both extract and build identically.
+fn build_graph_from_source(
     path: &Path,
     facts: Option<&Path>,
     db: Option<&Path>,
-) -> Result<hinzu_core::dag::DagOutput> {
+) -> Result<hinzu_core::graph::GraphOutput> {
     // A `--db` store is a valid offline source, like `--facts`; otherwise route
     // by marker (or the given `--facts`).
     let mut facts = match db {
@@ -250,7 +253,7 @@ fn build_dag_from_source(
     let language = facts_language(&facts);
     RootSeeds::for_language(language).seed_unknowns(&mut facts);
 
-    Ok(hinzu_core::dag::build_dag(
+    Ok(hinzu_core::graph::build_graph(
         &facts,
         &path.display().to_string(),
         Some(language.as_str()),
@@ -280,7 +283,7 @@ fn load_facts(args: &CheckArgs) -> Result<FactSet> {
 
 /// Route to a fact source: the `--facts` JSON when given, else a live adapter
 /// run chosen by the project's marker file. Shared by `hinzu check` and
-/// `hinzu dag` so both resolve facts identically.
+/// `hinzu graph` so both resolve facts identically.
 fn route_facts(path: &Path, facts: Option<&Path>) -> Result<FactSet> {
     if let Some(facts) = facts {
         let json = std::fs::read_to_string(facts)

@@ -1,40 +1,51 @@
-# `hinzu dag` — a dependency DAG for AI-assisted porting
+# `hinzu graph` — a dependency graph for AI-assisted porting
 
-`hinzu dag <project>` emits a JSON dependency graph of a codebase, shaped for
+`hinzu graph <project>` emits a JSON dependency graph of a codebase, shaped for
 porting it to another language (or rewriting it) with an AI agent. The core idea:
 
 > Port the **leaves** first — the things that depend on nothing — then work
 > upward, so that whenever the agent ports a symbol, everything that symbol
 > depends on is already ported and testable.
 
-For the operational schedule built *on top* of this DAG — files organized into
+**Why "graph", not "DAG".** Real code has cycles — mutual recursion,
+back-and-forth calls between two modules — so the dependency graph this command
+emits is **not** acyclic in general. What *is* acyclic is its
+**condensation**: collapse each strongly-connected component (a call cycle) to a
+single node and the resulting graph has no cycles, so a dependencies-first
+topological order over it is well-defined. The port order and leaves this command
+reports are computed over that condensation; the members of a cycle come out as
+one contiguous block you port together. Calling the whole thing a "DAG" would be a
+lie whenever the code has a cycle — hence `graph`, with the acyclic view named
+honestly as the **condensation** (see the `condensation` field below).
+
+For the operational schedule built *on top* of this graph — files organized into
 groups (a PR per group) and topological **waves** (batches portable in parallel)
-— see [`hinzu plan`](./plan.md), which reuses this DAG's file rollup directly.
+— see [`hinzu plan`](./plan.md), which reuses this graph's file rollup directly.
 
 It reuses the exact facts the effect engine consumes (`FactSet`: definitions,
 call/use edges, effect roots). Where [`effects`](../crates/hinzu-core/src/effects.rs)
-reasons *up* the graph (which callers a root reaches), `dag` reasons *down* it
+reasons *up* the graph (which callers a root reaches), `graph` reasons *down* it
 (what each symbol depends on) and hands back a **dependencies-first topological
-order**, plus the cycles that must be ported as a unit and per-node metadata to
-size and prioritize the work.
+order** (over the condensation), plus the cycles that must be ported as a unit and
+per-node metadata to size and prioritize the work.
 
 ## Usage
 
 ```sh
 # live extraction (routes by project marker: Cargo.toml / package.json / etc.)
-hinzu dag ./my-project --out dag.json
+hinzu graph ./my-project --out graph.json
 
 # from a pre-extracted fact set (no toolchain needed)
-hinzu dag ./my-project --facts facts.json --out dag.json
+hinzu graph ./my-project --facts facts.json --out graph.json
 
 # from an existing SQLite fact store
-hinzu dag ./my-project --db facts.db
+hinzu graph ./my-project --db facts.db
 
 # default output is stdout
-hinzu dag ./my-project
+hinzu graph ./my-project
 ```
 
-No policy file is required — a DAG does not run the effect-propagation gate.
+No policy file is required — the graph does not run the effect-propagation gate.
 Effect roots are seeded best-effort from the language's built-in annotation base
 (`std.toml`, `node.toml`, `python.toml`, `go.toml`), so `effect_roots` fields are
 populated without a `hinzu.toml`; project `[roots]`/`[trust]` overrides are *not*
@@ -53,7 +64,9 @@ The port order is **dependencies-first**, a.k.a. **leaves-first**:
 - **Cycles** (mutual recursion, back-and-forth calls) can't be linearized, so
   each non-trivial strongly-connected component (size > 1) is condensed into a
   group. Its members appear **contiguously** in the order and share an `scc`
-  group id — port them together, in one pass.
+  group id — port them together, in one pass. Condensing the cycles is exactly
+  what turns a graph-with-cycles into the acyclic **condensation** the order is
+  computed over.
 
 The same direction applies to `file_topo_order` over the file-dependency graph.
 
@@ -62,11 +75,11 @@ Concretely, for a chain `a → b → c` the order is `["c", "b", "a"]`. For a cy
 
 ## JSON schema
 
-Top level (`hinzu_dag_version: 1`):
+Top level (`hinzu_graph_version: 1`):
 
 | field | type | meaning |
 | --- | --- | --- |
-| `hinzu_dag_version` | int | schema version (currently `1`) |
+| `hinzu_graph_version` | int | schema version (currently `1`) |
 | `root` | string | the analyzed target label (usually the project path) |
 | `language` | string \| null | the dominant source language |
 | `fidelity` | object | honesty caveats + counts (see below) |
@@ -75,7 +88,7 @@ Top level (`hinzu_dag_version: 1`):
 | `edges` | array | symbol edges (in fact order) |
 | `files` | array | file-rollup nodes (sorted by path) |
 | `file_edges` | array | file-rollup edges (sorted by `from`,`to`) |
-| `dag` | object | the port-order utilities |
+| `condensation` | object | the acyclic SCC-condensation: the port-order utilities |
 
 ### `fidelity`
 
@@ -147,7 +160,13 @@ callee.file)`, dropping self-loops. `call_edge_count` is how many symbol edges
 project onto the pair; `has_unknown` is true if any contributing symbol edge was
 itself unresolved.
 
-### `dag` — the utilities
+### `condensation` — the acyclic view + port-order utilities
+
+The dependency graph may contain cycles; **collapsing each strongly-connected
+component to a single node yields this acyclic condensation**, and the port order
+is a topological sort of it. That is the whole reason the ordering is
+well-defined — you cannot topologically sort a graph with a cycle, but you can
+sort its condensation.
 
 | field | meaning |
 | --- | --- |
@@ -177,13 +196,13 @@ from the same facts the effect engine uses. Consequently:
 These caveats travel inside `fidelity.notes` so a consumer sees them next to the
 data.
 
-## How a porting agent walks this DAG
+## How a porting agent walks this graph
 
 A simple, robust loop:
 
-1. **Start from `dag.symbol_leaves`** (equivalently, the front of
-   `dag.symbol_topo_order`). These depend on nothing local — port and test them
-   in isolation.
+1. **Start from `condensation.symbol_leaves`** (equivalently, the front of
+   `condensation.symbol_topo_order`). These depend on nothing local — port and
+   test them in isolation.
 2. **Walk `symbol_topo_order` front-to-back.** By construction, when you reach a
    symbol every symbol it calls is already ported. Port it, run its tests, mark
    it done.
@@ -200,10 +219,10 @@ A simple, robust loop:
 6. **Roll up to files** (`file_topo_order`, `file_leaves`, `file_edges`) when you
    want to move a whole module at a time instead of symbol-by-symbol.
 
-Because the order is a topological sort of the dependency graph, the invariant
+Because the order is a topological sort of the graph's condensation, the invariant
 "everything I depend on is already ported" holds at every step — which is exactly
 what makes an incremental, continuously-testable port possible.
 
 To port **in parallel** instead of one symbol at a time — grouping files into
 PRs and scheduling them into waves that can each be ported concurrently — layer
-[`hinzu plan`](./plan.md) on top of this DAG.
+[`hinzu plan`](./plan.md) on top of this graph.

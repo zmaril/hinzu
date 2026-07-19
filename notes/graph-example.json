@@ -1,5 +1,5 @@
 {
-  "hinzu_dag_version": 1,
+  "hinzu_graph_version": 1,
   "root": "adapters/typescript/tests/fixture",
   "language": "typescript",
   "fidelity": {
@@ -192,7 +192,7 @@
       "has_unknown": false
     }
   ],
-  "dag": {
+  "condensation": {
     "symbol_topo_order": [
       "src/core#countKeys",
       "src/core#parse",

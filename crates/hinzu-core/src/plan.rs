@@ -1,13 +1,13 @@
 //! The porting plan: a file-granularity schedule of **waves** and **groups**
-//! over the dependency DAG that [`crate::dag`] already computed. Where the DAG
-//! answers "in what order can a symbol be ported so its dependencies come
+//! over the dependency graph that [`crate::graph`] already computed. Where the
+//! graph answers "in what order can a symbol be ported so its dependencies come
 //! first?", the plan answers the operational question a porting *orchestrator*
 //! asks: **"which files can I hand to parallel threads/PRs right now, and what
 //! does finishing them unlock?"**
 //!
 //! Porting happens file-by-file (a PR per group), so the plan works over the
-//! DAG's file rollup, never re-walking the raw facts — [`build_plan`] takes the
-//! already-built [`DagOutput`] and reuses its file nodes and file edges.
+//! graph's file rollup, never re-walking the raw facts — [`build_plan`] takes the
+//! already-built [`GraphOutput`] and reuses its file nodes and file edges.
 //!
 //! - A **group** is a set of files ported together as one unit (one PR / one
 //!   agent thread). Files in the same file-level dependency cycle *must* share a
@@ -22,7 +22,7 @@
 //!
 //! ## Fidelity
 //!
-//! The plan inherits every caveat of the DAG it is built from — the graph is
+//! The plan inherits every caveat of the graph it is built from — the graph is
 //! call-only, file edges are inferred from call edges (no imports/implementation
 //! table), and unresolved targets are marked rather than dropped. On top of that,
 //! grouping and wave assignment are only as good as those edges, and small-file
@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::dag::DagOutput;
+use crate::graph::GraphOutput;
 
 /// The schema version embedded in every emitted plan.
 pub const HINZU_PLAN_VERSION: u32 = 1;
@@ -116,7 +116,7 @@ pub struct Grouping {
 /// The call-only fidelity of the plan, carried next to the data.
 #[derive(Clone, Debug, Serialize)]
 pub struct Fidelity {
-    /// Always true: the plan is built over the call-only DAG.
+    /// Always true: the plan is built over the call-only dependency graph.
     pub call_only: bool,
     /// Human-readable caveats about what the plan does and does not capture.
     pub notes: Vec<String>,
@@ -149,7 +149,7 @@ pub struct Stats {
 pub struct PlanOutput {
     /// The schema version ([`HINZU_PLAN_VERSION`]).
     pub hinzu_plan_version: u32,
-    /// The analyzed target (carried over from the DAG).
+    /// The analyzed target (carried over from the graph).
     pub root: String,
     /// The dominant source language, if one was determined.
     pub language: Option<String>,
@@ -279,39 +279,42 @@ fn group_loc(g: &WorkGroup, file_loc: &BTreeMap<String, u32>) -> u32 {
         .sum()
 }
 
-/// Build a file-granularity porting plan from an already-built [`DagOutput`].
+/// Build a file-granularity porting plan from an already-built [`GraphOutput`].
 ///
-/// Groups are formed from the DAG's file-level dependency cycles (mandatory) plus
-/// optional small-file coalescing, then laid out into topological waves. The
-/// facts are never re-walked — everything comes from `dag`'s file rollup.
-pub fn build_plan(dag: &DagOutput, opts: PlanOpts) -> PlanOutput {
-    // Per-file attributes, straight off the DAG's file rollup.
-    let file_loc: BTreeMap<String, u32> =
-        dag.files.iter().map(|f| (f.path.clone(), f.loc)).collect();
-    let file_symcount: BTreeMap<String, usize> = dag
+/// Groups are formed from the graph's file-level dependency cycles (mandatory)
+/// plus optional small-file coalescing, then laid out into topological waves. The
+/// facts are never re-walked — everything comes from `graph`'s file rollup.
+pub fn build_plan(graph: &GraphOutput, opts: PlanOpts) -> PlanOutput {
+    // Per-file attributes, straight off the graph's file rollup.
+    let file_loc: BTreeMap<String, u32> = graph
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.loc))
+        .collect();
+    let file_symcount: BTreeMap<String, usize> = graph
         .files
         .iter()
         .map(|f| (f.path.clone(), f.symbol_count))
         .collect();
-    let file_pkgs: BTreeMap<String, Vec<String>> = dag
+    let file_pkgs: BTreeMap<String, Vec<String>> = graph
         .files
         .iter()
         .map(|f| (f.path.clone(), f.external_packages.clone()))
         .collect();
-    let file_effects: BTreeMap<String, Vec<String>> = dag
+    let file_effects: BTreeMap<String, Vec<String>> = graph
         .files
         .iter()
         .map(|f| (f.path.clone(), f.effect_roots.clone()))
         .collect();
 
-    // File dependency edges, `from` depends on `to` (see dag::FileEdge).
-    let file_deps: Vec<(String, String)> = dag
+    // File dependency edges, `from` depends on `to` (see graph::FileEdge).
+    let file_deps: Vec<(String, String)> = graph
         .file_edges
         .iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();
     // Which file pairs carry an unresolved contributing edge.
-    let unknown_pairs: BTreeSet<(String, String)> = dag
+    let unknown_pairs: BTreeSet<(String, String)> = graph
         .file_edges
         .iter()
         .filter(|e| e.has_unknown)
@@ -323,7 +326,7 @@ pub fn build_plan(dag: &DagOutput, opts: PlanOpts) -> PlanOutput {
     let mut groups: BTreeMap<usize, WorkGroup> = BTreeMap::new();
     let mut group_of: BTreeMap<String, usize> = BTreeMap::new();
     let mut next_id = 0usize;
-    for scc in &dag.dag.file_sccs {
+    for scc in &graph.condensation.file_sccs {
         let files: BTreeSet<String> = scc.members.iter().cloned().collect();
         for f in &files {
             group_of.insert(f.clone(), next_id);
@@ -337,7 +340,7 @@ pub fn build_plan(dag: &DagOutput, opts: PlanOpts) -> PlanOutput {
         );
         next_id += 1;
     }
-    for f in dag.files.iter().map(|f| &f.path) {
+    for f in graph.files.iter().map(|f| &f.path) {
         if group_of.contains_key(f) {
             continue;
         }
@@ -478,7 +481,7 @@ pub fn build_plan(dag: &DagOutput, opts: PlanOpts) -> PlanOutput {
     let largest_wave = waves.iter().map(|w| w.group_count).max().unwrap_or(0);
 
     let stats = Stats {
-        file_count: dag.files.len(),
+        file_count: graph.files.len(),
         group_count: out_groups.len(),
         wave_count,
         cycle_group_count,
@@ -490,8 +493,8 @@ pub fn build_plan(dag: &DagOutput, opts: PlanOpts) -> PlanOutput {
 
     PlanOutput {
         hinzu_plan_version: HINZU_PLAN_VERSION,
-        root: dag.root.clone(),
-        language: dag.language.clone(),
+        root: graph.root.clone(),
+        language: graph.language.clone(),
         granularity: "file".to_string(),
         grouping: Grouping {
             max_group_loc: opts.max_group_loc,
@@ -577,11 +580,11 @@ fn coalesce(
     }
 }
 
-/// The plan's honest caveats — the DAG's call-only limits, plus the grouping and
-/// coalescing heuristics layered on top.
+/// The plan's honest caveats — the graph's call-only limits, plus the grouping
+/// and coalescing heuristics layered on top.
 fn fidelity_notes() -> Vec<String> {
     vec![
-        "Built over the call-only dependency DAG: an edge means a caller calls or \
+        "Built over the call-only dependency graph: an edge means a caller calls or \
          references a callee, so file dependencies that flow only through types or \
          imports (never a call) are not represented."
             .to_string(),
@@ -606,8 +609,8 @@ fn fidelity_notes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::build_dag;
     use crate::facts::{make_def, Definition, Edge, FactSet};
+    use crate::graph::build_graph;
 
     fn fdef(id: &str, file: &str, line_end: u32) -> Definition {
         make_def(id, file, 1, line_end)
@@ -624,11 +627,11 @@ mod tests {
         facts
     }
 
-    /// Build a plan from a fact set, going through the real DAG builder so the
+    /// Build a plan from a fact set, going through the real graph builder so the
     /// plan is exercised over genuine file rollups.
     fn plan_of(facts: &FactSet, opts: PlanOpts) -> PlanOutput {
-        let dag = build_dag(facts, "test", Some("rust"));
-        build_plan(&dag, opts)
+        let graph = build_graph(facts, "test", Some("rust"));
+        build_plan(&graph, opts)
     }
 
     fn group_with_file<'a>(plan: &'a PlanOutput, file: &str) -> &'a PlanGroup {

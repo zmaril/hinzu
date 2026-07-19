@@ -10,7 +10,7 @@
   "fidelity": {
     "call_only": true,
     "notes": [
-      "Built over the call-only dependency DAG: an edge means a caller calls or references a callee, so file dependencies that flow only through types or imports (never a call) are not represented.",
+      "Built over the call-only dependency graph: an edge means a caller calls or references a callee, so file dependencies that flow only through types or imports (never a call) are not represented.",
       "File edges are inferred by projecting symbol call edges onto their files; there is no imports/implementation table.",
       "Higher-order calls, dynamic dispatch, and unresolved callbacks are approximated or missed; an edge the adapter could not resolve sets has_unknown_edges on the groups it touches.",
       "Grouping and wave assignment inherit those limits: a missed edge can wrongly split a wave or under-constrain the order.",

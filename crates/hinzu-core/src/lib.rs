@@ -13,9 +13,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub mod dag;
 pub mod effects;
 pub mod facts;
+pub mod graph;
 pub mod plan;
 pub mod policy;
 pub mod roots;

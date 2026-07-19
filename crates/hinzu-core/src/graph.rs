@@ -1,15 +1,18 @@
-//! The porting DAG: a serializable dependency graph of a codebase, shaped for
-//! an AI-assisted port. Where [`crate::effects`] reasons *up* the call graph
-//! (which callers a root reaches), this module reasons *down* it (what each
+//! The porting dependency graph: a serializable dependency graph of a codebase,
+//! shaped for an AI-assisted port. Where [`crate::effects`] reasons *up* the call
+//! graph (which callers a root reaches), this module reasons *down* it (what each
 //! symbol depends on) and answers a different question: **in what order should
 //! a porting agent move code, so that whenever it ports a symbol, everything
 //! that symbol depends on is already ported?**
 //!
-//! The answer is a dependencies-first (leaves-first) topological order over the
-//! call/use graph, with strongly-connected components (mutual recursion / call
-//! cycles) condensed into groups that must be ported together. The output is a
-//! plain data structure ([`DagOutput`]) so it can be emitted as JSON and walked
-//! by a tool that knows nothing about hinzu's internals.
+//! The graph itself is **not** acyclic — mutual recursion and back-and-forth
+//! calls are real, so it may contain cycles. The order is well-defined anyway
+//! because we compute it over the **condensation**: each strongly-connected
+//! component (a call cycle) is collapsed to a single node, and *that* graph is
+//! acyclic, so a dependencies-first (leaves-first) topological order exists. The
+//! members of a cycle are emitted contiguously and must be ported together. The
+//! output is a plain data structure ([`GraphOutput`]) so it can be emitted as
+//! JSON and walked by a tool that knows nothing about hinzu's internals.
 //!
 //! ## Fidelity, stated honestly
 //!
@@ -29,9 +32,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::facts::{EdgeResolution, FactSet, SymbolId};
 
-/// The schema version embedded in every emitted DAG, so a consumer can branch
+/// The schema version embedded in every emitted graph, so a consumer can branch
 /// on shape changes.
-pub const HINZU_DAG_VERSION: u32 = 1;
+pub const HINZU_GRAPH_VERSION: u32 = 1;
 
 /// A node in the symbol dependency graph: one per local definition, plus one
 /// per external call target (a callee with no local definition).
@@ -147,10 +150,12 @@ pub struct SccGroup {
     pub members: Vec<String>,
 }
 
-/// The DAG utilities a porting agent walks: the port order, the cycles, and the
-/// first batch of leaves.
+/// The acyclic SCC-condensation a porting agent walks: the port order, the
+/// cycles, and the first batch of leaves. The dependency graph may contain
+/// cycles; collapsing each strongly-connected component to one node yields this
+/// acyclic view, which is what makes the ordering well-defined.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Dag {
+pub struct Condensation {
     /// Every local symbol in **dependencies-first** order: a symbol appears only
     /// after all of its callees, so popping from the front is always safe to
     /// port. Members of an SCC are emitted as a contiguous block.
@@ -167,7 +172,7 @@ pub struct Dag {
     pub file_leaves: Vec<String>,
 }
 
-/// The call-only fidelity of this DAG, stated so a consumer sees the caveats
+/// The call-only fidelity of this graph, stated so a consumer sees the caveats
 /// next to the data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fidelity {
@@ -181,7 +186,7 @@ pub struct Fidelity {
     pub external_node_count: usize,
 }
 
-/// Aggregate counts for the whole DAG.
+/// Aggregate counts for the whole graph.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stats {
     /// Local (internal) symbols.
@@ -198,11 +203,11 @@ pub struct Stats {
     pub scc_count: usize,
 }
 
-/// The complete DAG document, ready to serialize as JSON.
+/// The complete graph document, ready to serialize as JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DagOutput {
-    /// The schema version ([`HINZU_DAG_VERSION`]).
-    pub hinzu_dag_version: u32,
+pub struct GraphOutput {
+    /// The schema version ([`HINZU_GRAPH_VERSION`]).
+    pub hinzu_graph_version: u32,
     /// The analyzed target (a label — usually the project path).
     pub root: String,
     /// The dominant source language, if one could be determined.
@@ -219,8 +224,8 @@ pub struct DagOutput {
     pub files: Vec<FileNode>,
     /// The file-rollup edges, sorted by (from, to).
     pub file_edges: Vec<FileEdge>,
-    /// The port-order utilities.
-    pub dag: Dag,
+    /// The acyclic SCC-condensation and the port-order utilities derived from it.
+    pub condensation: Condensation,
 }
 
 /// The leading `::`-delimited segment of a symbol id — the "package" an external
@@ -330,7 +335,7 @@ fn strongly_connected_components(adj: &BTreeMap<String, BTreeSet<String>>) -> Ve
 /// The SCC condensation packaged for output: the components in port order, the
 /// per-node group-id map (only for non-trivial components), and the reported
 /// [`SccGroup`]s. A `scc:N` id is minted per non-trivial component in port order.
-struct Condensation {
+struct SccCondensation {
     /// Components (each already sorted) in dependencies-first order.
     order: Vec<Vec<String>>,
     /// node id → its SCC group id, for members of non-trivial components only.
@@ -340,7 +345,7 @@ struct Condensation {
 }
 
 /// Condense a dependency adjacency into ordered components + group ids.
-fn condense(adj: &BTreeMap<String, BTreeSet<String>>) -> Condensation {
+fn condense(adj: &BTreeMap<String, BTreeSet<String>>) -> SccCondensation {
     let order = strongly_connected_components(adj);
     let mut group_of: BTreeMap<String, String> = BTreeMap::new();
     let mut groups: Vec<SccGroup> = Vec::new();
@@ -356,21 +361,21 @@ fn condense(adj: &BTreeMap<String, BTreeSet<String>>) -> Condensation {
             });
         }
     }
-    Condensation {
+    SccCondensation {
         order,
         group_of,
         groups,
     }
 }
 
-/// Build the porting DAG from a fact set.
+/// Build the porting dependency graph from a fact set.
 ///
 /// `root` is a free-form label for the analyzed target (usually the project
 /// path). `language` is the dominant language spelling for the top-level field;
 /// when `None`, it is inferred from the definitions. The facts' effect roots (if
 /// any were seeded) drive the per-symbol `effect_roots` — this function reads
 /// whatever is present and never requires a policy.
-pub fn build_dag(facts: &FactSet, root: &str, language: Option<&str>) -> DagOutput {
+pub fn build_graph(facts: &FactSet, root: &str, language: Option<&str>) -> GraphOutput {
     // Every node: local definitions plus every edge endpoint (external targets
     // have no definition but must still be resolvable in `symbols`).
     let mut all_nodes: BTreeSet<String> = facts.defs.keys().cloned().collect();
@@ -680,8 +685,8 @@ pub fn build_dag(facts: &FactSet, root: &str, language: Option<&str>) -> DagOutp
             .map(|d| d.language.as_str().to_string())
     });
 
-    DagOutput {
-        hinzu_dag_version: HINZU_DAG_VERSION,
+    GraphOutput {
+        hinzu_graph_version: HINZU_GRAPH_VERSION,
         root: root.to_string(),
         language,
         fidelity,
@@ -690,7 +695,7 @@ pub fn build_dag(facts: &FactSet, root: &str, language: Option<&str>) -> DagOutp
         edges,
         files,
         file_edges,
-        dag: Dag {
+        condensation: Condensation {
             symbol_topo_order,
             file_topo_order,
             symbol_sccs: sym_condensation.groups,
@@ -710,7 +715,7 @@ mod tests {
         make_def(id, file, line_start, line_end)
     }
 
-    fn node<'a>(out: &'a DagOutput, id: &str) -> &'a SymbolNode {
+    fn node<'a>(out: &'a GraphOutput, id: &str) -> &'a SymbolNode {
         out.symbols
             .iter()
             .find(|s| s.id == id)
@@ -735,15 +740,15 @@ mod tests {
         let mut facts = abc_facts();
         facts.add_edge(Edge::call("b", "c", "b.rs", 2));
 
-        let out = build_dag(&facts, "chain", Some("rust"));
+        let out = build_graph(&facts, "chain", Some("rust"));
 
         // Dependencies first: c before b before a.
         assert_eq!(
-            out.dag.symbol_topo_order,
+            out.condensation.symbol_topo_order,
             vec!["c".to_string(), "b".to_string(), "a".to_string()]
         );
         // Only c is a leaf (no internal deps).
-        assert_eq!(out.dag.symbol_leaves, vec!["c".to_string()]);
+        assert_eq!(out.condensation.symbol_leaves, vec!["c".to_string()]);
         // a transitively depends on b and c.
         assert_eq!(node(&out, "a").transitive_dep_count, 2);
         assert_eq!(node(&out, "c").transitive_dep_count, 0);
@@ -761,12 +766,12 @@ mod tests {
         facts.add_edge(Edge::call("b", "a", "b.rs", 2));
         facts.add_edge(Edge::call("c", "a", "c.rs", 2));
 
-        let out = build_dag(&facts, "cycle", Some("rust"));
+        let out = build_graph(&facts, "cycle", Some("rust"));
 
         // One non-trivial SCC {a,b} is reported and shared by both members.
-        assert_eq!(out.dag.symbol_sccs.len(), 1);
+        assert_eq!(out.condensation.symbol_sccs.len(), 1);
         assert_eq!(out.stats.scc_count, 1);
-        let scc = &out.dag.symbol_sccs[0];
+        let scc = &out.condensation.symbol_sccs[0];
         assert_eq!(scc.members, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(node(&out, "a").scc.as_deref(), Some("scc:0"));
         assert_eq!(node(&out, "b").scc.as_deref(), Some("scc:0"));
@@ -774,7 +779,7 @@ mod tests {
 
         // The SCC members are contiguous and precede c in the port order.
         let pos = |id: &str| {
-            out.dag
+            out.condensation
                 .symbol_topo_order
                 .iter()
                 .position(|x| x == id)
@@ -797,7 +802,7 @@ mod tests {
             effect: Effect::Net,
         });
 
-        let out = build_dag(&facts, "ext", Some("rust"));
+        let out = build_graph(&facts, "ext", Some("rust"));
 
         // The external target is a node, marked external, always a leaf.
         let foo = node(&out, "pkg::foo");
@@ -808,7 +813,10 @@ mod tests {
         // It is not counted among internal symbols, and not in the port order.
         assert_eq!(out.stats.symbol_count, 1);
         assert_eq!(out.stats.external_count, 1);
-        assert!(!out.dag.symbol_topo_order.contains(&"pkg::foo".to_string()));
+        assert!(!out
+            .condensation
+            .symbol_topo_order
+            .contains(&"pkg::foo".to_string()));
         // `run` still counts it as an external package it depends on, and the
         // seeded effect propagates to `run`'s reachable effects.
         assert_eq!(
@@ -835,7 +843,7 @@ mod tests {
             evidence_file: "d.rs".to_string(),
             evidence_line: 2,
         });
-        let out = build_dag(&facts, "u", Some("rust"));
+        let out = build_graph(&facts, "u", Some("rust"));
         let edge = out.edges.iter().find(|e| e.to == "<indirect>").unwrap();
         assert_eq!(edge.provenance, "unknown");
         assert_eq!(out.fidelity.unknown_edge_count, 1);
@@ -849,7 +857,7 @@ mod tests {
         facts.add_def(def("b::leaf", "b.rs", 1, 4));
         facts.add_edge(Edge::call("a::top", "b::leaf", "a.rs", 2));
 
-        let out = build_dag(&facts, "files", Some("rust"));
+        let out = build_graph(&facts, "files", Some("rust"));
 
         assert_eq!(out.stats.file_count, 2);
         assert_eq!(out.file_edges.len(), 1);
@@ -859,9 +867,9 @@ mod tests {
         assert_eq!(fe.call_edge_count, 1);
         assert!(!fe.has_unknown);
         // b.rs is the file leaf, ordered first.
-        assert_eq!(out.dag.file_leaves, vec!["b.rs".to_string()]);
+        assert_eq!(out.condensation.file_leaves, vec!["b.rs".to_string()]);
         assert_eq!(
-            out.dag.file_topo_order,
+            out.condensation.file_topo_order,
             vec!["b.rs".to_string(), "a.rs".to_string()]
         );
     }
