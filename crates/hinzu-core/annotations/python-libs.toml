@@ -1,0 +1,68 @@
+# hinzu's built-in Python *library* annotation pack — third-party packages the
+# fleet sweep surfaced as Unknown, vouched here so a project need not repeat the
+# same `[trust]` lines in every `hinzu.toml`. This is a SEPARATE file from the
+# stdlib set (`python.toml`): that one maps the CPython standard library's built-in
+# effect surface; this one carries the well-known third-party packages hinzu ships
+# an opinion on. Both are loaded as built-in Python defaults (merged), and a
+# project's own `hinzu.toml` `[trust]` / `[roots]` still overrides either.
+#
+# The two matchers that read this file:
+#   * hinzu-core's `RootSeeds::for_language(Python)` merges BOTH sections — a
+#     `[trust] "x" = "pure"` line clears `x`'s calls of the Unknown that would
+#     otherwise fail the check; a `[roots]` line seeds a real effect.
+#   * the LSP extractor's effect map reads only `[roots]`, so it seeds a package's
+#     declared effects directly by declaration provenance.
+#
+# THE RULE THIS FILE LIVES BY: never vouch pure anything that performs I/O in
+# hinzu's tracked vocabulary (fs/net/db/process/env/clock/random). A wrong "pure"
+# is a false-negative hole in a functional-core gate. When a package's surface is
+# mixed or uncertain, leave it Unknown (fail-closed) rather than guess.
+
+# --- pure presentation / serialization ---------------------------------------
+[trust]
+
+# rich — terminal presentation: Console.print / Console.input, Table, Panel,
+# markup.escape, and the rest of the rendering surface. None of it touches
+# fs/net/db/process/env/clock/random in hinzu's tracked vocabulary. CAVEAT: rich
+# writes to stdout/the terminal, which is console I/O — hinzu has no `console`
+# effect category today, so this is "pure" only with respect to the vocabulary we
+# track, NOT a claim rich is side-effect-free in general.
+"rich" = "pure"
+
+# PyYAML (imported as `yaml`) — `safe_load` / `load` / `dump` operate on a
+# string or a stream that the CALLER supplies; the library itself performs no
+# fs/net. Reading or writing a file is the caller's `open(...)`, seen separately.
+"yaml" = "pure"
+
+# --- database: SQLAlchemy ----------------------------------------------------
+# SQLAlchemy's execution surface is a database effect; its declarative /
+# expression *construction* surface (declarative_base, Column, relationship,
+# mapped_column, the `select()` / `text()` expression builders) is pure metadata
+# assembly and is deliberately NOT vouched here — a package-wide pure vouch would
+# use a substring match and wrongly clear the execution rows below, so the
+# construction surface is left to fail-closed Unknown, honoring the never-fake-pure
+# rule. The `db` rows are keyed on the qualified `Class.method` / function names of
+# the engine/session/connection execution API (the same `<qualname>` spelling
+# `python.toml` uses for `pathlib::Path.mkdir`).
+#
+# HONEST CAVEAT: the current extractor is call-only and does not emit edges for
+# SQLAlchemy's largely module-level usage (declarative_base / Column / relationship
+# at class scope), so these rows will not reduce Unknowns until the reference-level
+# rung lands. They are authored correctly now so they fire the moment it does.
+[roots]
+"sqlalchemy::create_engine" = "db"
+"sqlalchemy::Engine.connect" = "db"
+"sqlalchemy::Engine.execute" = "db"
+"sqlalchemy::Engine.begin" = "db"
+"sqlalchemy::Connection.execute" = "db"
+"sqlalchemy::Connection.commit" = "db"
+"sqlalchemy::Connection.rollback" = "db"
+"sqlalchemy::sessionmaker" = "db"
+"sqlalchemy::Session.execute" = "db"
+"sqlalchemy::Session.query" = "db"
+"sqlalchemy::Session.commit" = "db"
+"sqlalchemy::Session.rollback" = "db"
+"sqlalchemy::Session.flush" = "db"
+"sqlalchemy::Session.get" = "db"
+"sqlalchemy::Session.scalar" = "db"
+"sqlalchemy::Session.scalars" = "db"

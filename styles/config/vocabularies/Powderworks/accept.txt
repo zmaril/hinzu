@@ -91,3 +91,7 @@ ioutil
 filepath
 bufio
 curlie
+PyYAML
+SQLAlchemy
+sessionmaker
+boto3
