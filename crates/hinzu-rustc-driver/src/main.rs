@@ -4,6 +4,23 @@
 //! effect_roots) — so the output deserializes directly through
 //! `hinzu_core::facts::FactSet::from_json`.
 //!
+//! # Reference-level edges (the higher-order / import-time rung)
+//!
+//! Walking `TerminatorKind::Call` alone is *call-only*: a function used as a
+//! **value** — passed as an argument (`register(foo)`), assigned (`let f =
+//! foo;`), returned, reified to a fn-pointer, or captured in a closure handed
+//! elsewhere — is invisible, so its effect never reaches the function that
+//! handed it off. Import-time effects in `static`/`const` initializers are
+//! likewise missed (their bodies were dropped as bare, un-walked definitions).
+//! This driver adds `Edge{kind: reference, resolution: reference}` edges for
+//! those non-call *uses*, resolved through the SAME `Instance::resolve` →
+//! provenance → effect path as calls (see [`CallCollector`]). It mirrors the
+//! Python tree-sitter reference rung (PR #20) but works natively from MIR, which
+//! gives strictly more than a tree-sitter + LSP pass would. The rung is
+//! **sound-additive**: it only ADDS edges/effects, so no real violation the
+//! call-only pass found can vanish; what it adds is the higher-order and
+//! import-time effects the call graph missed.
+//!
 //! Ported from the slice-1 spike. Pinned to nightly-2026-07-18 (rustc 1.99.0),
 //! where the crate is named `rustc_public` (the renamed `stable_mir`). The API
 //! shape was read from the shipped rustc-src: `rustc_public::{run,
@@ -29,9 +46,9 @@ use std::io::Write;
 use std::ops::ControlFlow;
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
-use rustc_public::mir::{MirVisitor, TerminatorKind};
+use rustc_public::mir::{AggregateKind, MirVisitor, Operand, Rvalue, TerminatorKind};
 use rustc_public::ty::{RigidTy, TyKind};
-use rustc_public::CrateDef;
+use rustc_public::{CrateDef, ItemKind};
 use serde::Serialize;
 
 /// The whole fact set, serialized in hinzu's `FactSet` JSON schema.
@@ -54,9 +71,10 @@ struct Def {
     line_end: u32,
 }
 
-/// A "caller uses callee" edge. `kind` is always `call` here (MIR terminators
-/// are call sites); `resolution` is `call` for a statically resolved direct
-/// call and `unresolved` for an indirect (fn-pointer / dyn) call.
+/// A "caller uses callee" edge. `kind` is `call` for a MIR `Call` terminator
+/// (`resolution` = `call` when statically resolved, `unresolved` for an indirect
+/// fn-pointer / dyn call), or `reference` for a function/closure *used as a
+/// value* rather than called (`resolution` = `reference`). Both carry effects.
 #[derive(Serialize)]
 struct Edge {
     caller: String,
@@ -135,20 +153,32 @@ struct CallCollector<'a> {
     edges: Vec<Edge>,
     roots: Vec<EffectRoot>,
     seen_root: &'a mut HashSet<String>,
+    /// `(callee)` of reference edges already emitted from this caller, so a fn
+    /// value used repeatedly (a loop body, the same callback twice) yields one
+    /// reference edge rather than a duplicate per occurrence.
+    seen_ref: HashSet<String>,
 }
 
 impl CallCollector<'_> {
-    /// Record a resolved direct call to `callee`, seeding an effect root when
-    /// the callee's path is a known effectful operation.
-    fn push_direct(&mut self, callee: String, resolved: bool, file: String, line: u32) {
-        if let Some(cat) = effect_category(&callee) {
-            if self.seen_root.insert(callee.clone()) {
+    /// Seed an effect root for `callee` when its path is a known effectful
+    /// operation — shared by the call and reference paths so a referenced
+    /// effectful item (`register(std::fs::read)`) taints its user exactly as a
+    /// direct call would.
+    fn seed_root(&mut self, callee: &str) {
+        if let Some(cat) = effect_category(callee) {
+            if self.seen_root.insert(callee.to_string()) {
                 self.roots.push(EffectRoot {
-                    symbol: callee.clone(),
+                    symbol: callee.to_string(),
                     effect: cat.to_string(),
                 });
             }
         }
+    }
+
+    /// Record a resolved direct call to `callee`, seeding an effect root when
+    /// the callee's path is a known effectful operation.
+    fn push_direct(&mut self, callee: String, resolved: bool, file: String, line: u32) {
+        self.seed_root(&callee);
         self.edges.push(Edge {
             caller: self.caller.clone(),
             callee,
@@ -171,6 +201,52 @@ impl CallCollector<'_> {
             evidence_line: line,
         });
     }
+
+    /// Record a `reference` edge: `caller` uses `callee` as a *value* (a
+    /// callback, an assignment/return operand, a reified fn-pointer, a closure)
+    /// rather than calling it. Seeds an effect root the same way a call does, so
+    /// the referenced item's effect is attributed to the function that hands it
+    /// off. Deduped per caller.
+    fn push_reference(&mut self, callee: String, file: String, line: u32) {
+        if !self.seen_ref.insert(callee.clone()) {
+            return;
+        }
+        self.seed_root(&callee);
+        self.edges.push(Edge {
+            caller: self.caller.clone(),
+            callee,
+            kind: "reference".to_string(),
+            resolution: "reference".to_string(),
+            evidence_file: file,
+            evidence_line: line,
+        });
+    }
+
+    /// If `op` is a constant whose type is a function item (`FnDef`) or a
+    /// closure, emit a reference edge to it — the caller is using it as a value,
+    /// not calling it. A `FnDef` resolves to a monomorphic `Instance` for the
+    /// precise callee name (falling back to the polymorphic def name), the same
+    /// resolution the call path uses; a non-capturing closure is a ZST constant
+    /// of closure type (`register(|| ...)`, `run_closure(closure)`), keyed by its
+    /// def name — the same id its own body is walked under. Non-fn operands
+    /// (locals, non-fn constants) are not references.
+    fn reference_operand(&mut self, op: &Operand, file: &str, line: u32) {
+        if let Operand::Constant(_) = op {
+            match op.ty(self.locals).map(|t| t.kind()) {
+                Ok(TyKind::RigidTy(RigidTy::FnDef(def, args))) => {
+                    let callee = match Instance::resolve(def, &args) {
+                        Ok(inst) => inst.name(),
+                        Err(_) => def.name(),
+                    };
+                    self.push_reference(callee, file.to_string(), line);
+                }
+                Ok(TyKind::RigidTy(RigidTy::Closure(def, _))) => {
+                    self.push_reference(def.name(), file.to_string(), line);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl MirVisitor for CallCollector<'_> {
@@ -179,7 +255,7 @@ impl MirVisitor for CallCollector<'_> {
         term: &rustc_public::mir::Terminator,
         loc: rustc_public::mir::visit::Location,
     ) {
-        if let TerminatorKind::Call { func, .. } = &term.kind {
+        if let TerminatorKind::Call { func, args, .. } = &term.kind {
             let (file, line) = span_file_line(loc.span());
             match func.ty(self.locals).map(|fty| fty.kind()) {
                 // Direct, statically known callee. Resolve to a monomorphic
@@ -189,14 +265,58 @@ impl MirVisitor for CallCollector<'_> {
                         Ok(inst) => (inst.name(), true),
                         Err(_) => (def.name(), false),
                     };
-                    self.push_direct(callee, resolved, file, line);
+                    self.push_direct(callee, resolved, file.clone(), line);
                 }
                 // A fn-pointer / dyn value, or an operand whose type is
                 // unavailable: unresolved either way.
-                _ => self.push_indirect(file, line),
+                _ => self.push_indirect(file.clone(), line),
             }
+            // Any *argument* that is itself a function item is a value being
+            // handed off — `register(foo)` — not a call to it. Emit a reference
+            // so `foo`'s effect is attributed to this caller. (A fn-pointer
+            // reified in a prior statement, `_2 = foo as fn()`, is caught by
+            // `visit_operand` instead; a bare fn-item argument is caught here.)
+            for arg in args {
+                self.reference_operand(arg, &file, line);
+            }
+            // Deliberately do NOT descend into the Call via `super_terminator`:
+            // its `func`/`args` operands would re-enter `visit_operand`, and the
+            // callee `func` would be mis-emitted as a reference. Statements are
+            // visited independently by `super_basic_block`, so nothing is lost.
+            return;
         }
         self.super_terminator(term, loc);
+    }
+
+    fn visit_operand(&mut self, op: &Operand, loc: rustc_public::mir::visit::Location) {
+        // Reached for operands inside statements (an assignment RHS `_3 = foo`,
+        // a `ReifyFnPointer` cast operand `foo as fn()`, an aggregate element,
+        // the `_0 = foo` that lowers `return foo`) and non-Call terminators —
+        // but NOT a Call's own func/args (handled in `visit_terminator`). A
+        // function item in any of these positions is a value reference.
+        let (file, line) = span_file_line(loc.span());
+        self.reference_operand(op, &file, line);
+        self.super_operand(op, loc);
+    }
+
+    fn visit_rvalue(&mut self, rvalue: &Rvalue, loc: rustc_public::mir::visit::Location) {
+        // A closure (or coroutine-closure) construction is a value: the closure
+        // is its own `Instance` with its own body, walked separately and keyed by
+        // its def name, so a reference edge to it transitively carries whatever
+        // effects the closure body performs — the higher-order case where the
+        // closure is handed to another function to invoke.
+        if let Rvalue::Aggregate(kind, _) = rvalue {
+            let closure = match kind {
+                AggregateKind::Closure(def, _) => Some(def.name()),
+                AggregateKind::CoroutineClosure(def, _) => Some(def.name()),
+                _ => None,
+            };
+            if let Some(name) = closure {
+                let (file, line) = span_file_line(loc.span());
+                self.push_reference(name, file, line);
+            }
+        }
+        self.super_rvalue(rvalue, loc);
     }
 }
 
@@ -220,6 +340,27 @@ fn make_def(id: String, file: String, line_start: u32, line_end: u32) -> Def {
     }
 }
 
+/// Walk one body, attributing its call/reference edges and effect roots to
+/// `caller`, and fold the result into `facts`.
+fn walk_body(
+    caller: &str,
+    body: &rustc_public::mir::Body,
+    facts: &mut Facts,
+    seen_root: &mut HashSet<String>,
+) {
+    let mut c = CallCollector {
+        caller: caller.to_string(),
+        locals: body.locals(),
+        edges: Vec::new(),
+        roots: Vec::new(),
+        seen_root,
+        seen_ref: HashSet::new(),
+    };
+    c.visit_body(body);
+    facts.edges.append(&mut c.edges);
+    facts.effect_roots.append(&mut c.roots);
+}
+
 fn analyze() -> ControlFlow<()> {
     let mut facts = Facts::default();
     let mut seen_root: HashSet<String> = HashSet::new();
@@ -233,12 +374,39 @@ fn analyze() -> ControlFlow<()> {
         let inst = match Instance::try_from(item) {
             Ok(i) => i,
             Err(_) => {
-                // Generic / not directly instantiable
-                // (requires_monomorphization). Record the definition; its
-                // internal calls appear via the concrete instances the compiler
-                // actually instantiated.
+                // Not directly instantiable via `Instance::try_from`. Two cases:
+                //   * a generic fn (`requires_monomorphization`): record the
+                //     definition only — its calls appear via the concrete
+                //     instances the compiler actually instantiated.
+                //   * a concrete body `try_from` cannot key on its own — a
+                //     closure (its upvars/kind are implicit) or a `static` /
+                //     `const` initializer. These have a real body carrying
+                //     effects (a closure that reads a file; an import-time
+                //     `static X = read_config()`), so walk it directly, keyed by
+                //     the item's own name — the Rust analogue of Python's
+                //     module-scope import-time effects.
                 if def_ids.insert(name.clone(), ()).is_none() {
-                    facts.definitions.push(make_def(name, file, line_start, line_end));
+                    facts
+                        .definitions
+                        .push(make_def(name.clone(), file, line_start, line_end));
+                }
+                // A closure reports `requires_monomorphization` like a generic
+                // fn, but its body is concrete and is NOT re-walked via any
+                // separate monomorphization — recognize it by its closure type
+                // and walk it directly, so a reference edge into it lands on a
+                // node that actually carries the closure body's effects.
+                let is_closure = matches!(
+                    item.ty().kind(),
+                    TyKind::RigidTy(RigidTy::Closure(..))
+                        | TyKind::RigidTy(RigidTy::CoroutineClosure(..))
+                );
+                let walkable = matches!(item.kind(), ItemKind::Static | ItemKind::Const)
+                    || is_closure
+                    || !item.requires_monomorphization();
+                if walkable {
+                    if let Some(body) = item.body() {
+                        walk_body(&name, &body, &mut facts, &mut seen_root);
+                    }
                 }
                 continue;
             }
@@ -254,16 +422,7 @@ fn analyze() -> ControlFlow<()> {
         }
 
         let Some(body) = inst.body() else { continue };
-        let mut c = CallCollector {
-            caller: disp.clone(),
-            locals: body.locals(),
-            edges: Vec::new(),
-            roots: Vec::new(),
-            seen_root: &mut seen_root,
-        };
-        c.visit_body(&body);
-        facts.edges.append(&mut c.edges);
-        facts.effect_roots.append(&mut c.roots);
+        walk_body(&disp, &body, &mut facts, &mut seen_root);
     }
 
     let dir = std::env::var("HINZU_FACTS_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -291,4 +450,41 @@ fn main() {
         args.remove(1);
     }
     let _ = rustc_public::run!(&args, analyze);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effect_category, strip_generics};
+
+    /// Generics are stripped so effect matching runs on the callee's *path*, not
+    /// on its type arguments — a type argument that mentions `std::fs` must not
+    /// masquerade as an fs call.
+    #[test]
+    fn strip_generics_removes_type_arguments() {
+        assert_eq!(
+            strip_generics("std::fs::read_to_string::<&str>"),
+            "std::fs::read_to_string::"
+        );
+        assert_eq!(
+            strip_generics("Option::<std::fs::FileType>::is_some_and"),
+            "Option::::is_some_and"
+        );
+    }
+
+    /// The same effect classifier the call and reference paths share: an fs path
+    /// is `fs`, a net path is `net`, and a pure callee — including one whose type
+    /// argument merely mentions `std::fs` — is `None`.
+    #[test]
+    fn effect_category_matches_the_callee_path_not_type_args() {
+        assert_eq!(
+            effect_category("std::fs::read_to_string::<&str>"),
+            Some("fs")
+        );
+        assert_eq!(effect_category("std::net::TcpStream::connect"), Some("net"));
+        assert_eq!(
+            effect_category("Option::<std::fs::FileType>::is_some_and"),
+            None
+        );
+        assert_eq!(effect_category("core::cmp::max::<usize>"), None);
+    }
 }
