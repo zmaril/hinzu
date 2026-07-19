@@ -68,20 +68,52 @@ hinzu --help     # list commands
 hinzu --version  # print the version
 ```
 
-`hinzu graph` emits a dependencies-first (leaves-first) port order over the
-call/use graph — the same facts the effect engine consumes, reused to answer
-"in what order should an agent move this code?" The graph may contain cycles
-(mutual recursion); the acyclic SCC-condensation is what makes the order
-well-defined. See [notes/graph.md](notes/graph.md) for the JSON schema, the
-ordering semantics, and how a porting agent walks it.
+## Porting a codebase, in dependency order
 
-`hinzu port-diff` closes the loop: given a source package's graph + plan and a
-target port's graph, it reports — file by file, symbol by symbol — how much has
-actually been ported, in a way that survives file decomposition and relocation.
-It is config-driven (one toml describes several packages) and emits a JSON report
-plus an optional self-contained HTML dashboard. See
-[notes/port-diff.md](notes/port-diff.md) for the config schema, the input modes,
-`--from` closure scoping, and the band definitions.
+`graph`, `plan`, and `port-diff` form a pipeline for porting a codebase to
+another language or framework with AI agents. The point is to work in dependency
+order — **leaves first** — so that whenever an agent ports a symbol everything
+that symbol depends on already exists and is testable, instead of shotgunning
+files and stitching them back together afterward. All three reuse the exact facts
+the effect engine consumes.
+
+`hinzu graph <dir>` emits the dependency graph: **call** edges at the symbol
+level and **module-dependency** edges at the file level. Real code has cycles
+(mutual recursion, back-and-forth calls between modules), so the graph is **not**
+acyclic in general — calling it a "DAG" would be a lie the moment the code has a
+cycle. What *is* acyclic is its **condensation**: collapse each
+strongly-connected component to a single node and a dependencies-first
+topological order becomes well-defined. That acyclic view, and the port-order
+utilities built on it, live in the `condensation` field.
+
+`hinzu plan <dir>` turns that graph into an operational schedule: **waves**
+(topological layers with no dependency between the groups in a wave, so an
+orchestrator can port a whole wave in parallel) over **groups** (a PR / an agent
+thread per group — a dependency cycle is collapsed into one mandatory unit, and
+small tightly-coupled files are coalesced so there isn't a thread per one-liner).
+`--from <entry>` scopes the plan to the transitive dependency closure of an entry
+point — exactly what that one entry needs, in port order, and nothing else.
+
+`hinzu port-diff --config <toml> --package <p>` measures how far a port has
+actually gotten. It matches a source package's graph + plan against the target
+port's graph by **symbol-graph structure** (so it survives file rename and
+decomposition), bands every source file **DONE / PORTED / STARTED / NOT-STARTED**,
+and emits a ready-frontier — unported files whose source-dependencies are all
+ported — plus, with `--html`, a self-contained dashboard. It is config-driven:
+one toml describes several packages under a shared naming ruleset. `--from`
+scopes it too.
+
+**Fidelity, honestly.** The graph is **call-only** — it misses higher-order and
+dynamic dispatch, and file edges are *inferred* from call edges (there is no
+imports / implementation table). port-diff's STARTED and PORTED bands are
+structural too: a name-and-structure match, which call-edge overlap annotates for
+confidence but never fabricates. Only **DONE** is cross-checked against a
+conformance oracle — and on the `pi` → `atilla` port it holds exactly: the DONE
+band equals the target's per-package conformance-native count.
+
+See [notes/graph.md](notes/graph.md), [notes/plan.md](notes/plan.md), and
+[notes/port-diff.md](notes/port-diff.md) for the JSON schemas, the ordering and
+wave semantics, `--from` closure scoping, and the band definitions.
 
 ## Development
 
