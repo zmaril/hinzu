@@ -1,0 +1,19 @@
+# The reference-fixture policy. It exercises the two effects the TypeScript
+# compiler-API reference rung recovers that call-only missed:
+#
+#   * a HIGHER-ORDER reference — `src/core.ts`'s `scheduleAudit` passes the
+#     filesystem function `readFile` as a value, so it reaches `fs`.
+#   * a MODULE-LEVEL (import-time) network effect — `src/models.ts` issues a
+#     `fetch` at module scope, attributed to that file's `<module>` node,
+#     reaching `net`.
+#
+# Both files are the functional core (they forbid those effects). Under call-only
+# neither violation was visible: `scheduleAudit` never saw the value it passed,
+# and module scope emitted no edges at all.
+
+[analysis]
+on_unknown = "fail"
+
+[region.core]
+paths  = ["src/**"]
+forbid = ["fs", "net", "process"]

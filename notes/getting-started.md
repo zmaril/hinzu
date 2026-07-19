@@ -169,7 +169,9 @@ Takeaway: the native TypeScript path produces a real, queryable effect map on a 
 
 ### Rust: StableMIR on straitjacket
 
-A ~230-line `rustc_public` (StableMIR) driver, run over straitjacket via `RUSTC_WORKSPACE_WRAPPER` on nightly 1.99: **341 functions, 1,912 call edges, 99.95% statically resolved.** The single unresolved edge is an honest stored-function-pointer call (`FnPtr`, not `FnDef`), bucketed rather than faked; no `dyn` calls survived to MIR, because monomorphization lowered them to concrete `FnDef`s. It found 4 std effect roots and 8 transitively-effectful functions, for example `resolve → load_file_config → config::load_config → std::fs::read_to_string`. The costs of rustc_public's youth: the `stable_mir` to `rustc_public` rename dates every existing tutorial, and `rustc_private` plus dylib linkage pins the binary to one exact nightly.
+A `rustc_public` (StableMIR) driver, run over straitjacket via `RUSTC_WORKSPACE_WRAPPER` on nightly 1.99: **341 functions, 1,912 call edges, 99.95% statically resolved.** The single unresolved edge is an honest stored-function-pointer call (`FnPtr`, not `FnDef`), bucketed rather than faked; no `dyn` calls survived to MIR, because monomorphization lowered them to concrete `FnDef`s. It found 4 std effect roots and 8 transitively-effectful functions, for example `resolve → load_file_config → config::load_config → std::fs::read_to_string`. The costs of rustc_public's youth: the `stable_mir` to `rustc_public` rename dates every existing tutorial, and `rustc_private` plus dylib linkage pins the binary to one exact nightly.
+
+**Reference-level edges, natively from MIR (the call-only caveat, lifted for Rust).** Walking `Call` terminators alone is call-only: a function used as a *value* — passed as a callback (`register(foo)`), assigned, returned, reified to a fn-pointer, stored in a struct field (`RegexRule { judge: judge_font }`), or captured in a closure handed elsewhere — produced no edge, so its effect never reached the function that handed it off; and a closure's own body was recorded as a bare definition but never walked, so its effect was invisible. The driver now also walks each body's statements and operands (not just call terminators) and emits `Edge{kind: reference, resolution: reference}` when a function item or closure appears as a value: a `FnDef`/closure constant in a call argument, an assignment RHS, a returned operand, or a fn-pointer reification (`visit_operand`); a closure `Rvalue::Aggregate` construction (`visit_rvalue`); and the initializer body of a `static`/`const` — including a `LazyLock`/lazy static, the Rust analogue of a module-level import-time effect, attributed to the static's own id. The callee of a `Call` is emitted once, as a `call`, never re-emitted as a reference (the two paths are disjoint by construction — a Call's operands are not re-visited). Referenced closures are walked under their own def id, so a reference edge into a closure transitively carries whatever its body does. This is the same rung the Python tree-sitter driver and the TypeScript checker reached, done natively from MIR — which gives strictly more than a tree-sitter + LSP pass would, since MIR is already monomorphized and typed. It is **sound-additive**: it only adds edges/effects, so no violation the call-only pass found can vanish. On straitjacket, turning it on added **126 reference edges** and surfaced **3 higher-order fs findings call-only missed** — three closure bodies that read files (in `main`, `Projects::discover`, `walk::collect_files`), previously un-walked — while leaving the pre-existing 9 forbidden-fs violators unchanged (12 = 9 + 3, none removed). The stored fn-pointer `judge` case (`pattern_rules → judge_font`) now draws its reference edge too; it correctly does *not* taint, because those judges are pure — visibility without a false positive. A committed fixture (`adapters/rust/tests/reference-fixture/`, with its driver-produced `reference-fixture-facts.json`) gives stable-CI coverage of the higher-order callback, the handed-off closure, and the lazy import-time initializer with no nightly toolchain required.
 
 ### The analysis engine: DBSP
 
@@ -210,6 +212,26 @@ checker cannot see through is `Unknown` and fails by default, until a `[trust]`
 line vouches for it — identical to Rust's unseen-external handling. The built-in
 Node annotation set lives in `crates/hinzu-core/annotations/node.toml`, the
 counterpart to `std.toml`.
+
+The adapter is at **full reference-level parity** — the same rung the Python
+tree-sitter driver reached, done natively in the tsc checker. Beyond call edges it
+draws a `reference` edge for two flows call-only misses, each resolved through the
+identical declaration → provenance → effect path: **higher-order** value-position
+uses (an effectful symbol passed as a callback, stored, returned, in a literal, or
+as a default parameter — `register(fetch)`, `register(fs.readFile)`), and
+**module-level (import-time)** effects, which run when a file is imported and have
+no enclosing function. The latter are attributed to a synthetic per-file
+`<module>` definition (`<module>@<relpath>`, whole-file span), emitted only for a
+file whose import-time code actually reaches an effect. Both are sound-additive: a
+call callee is never re-emitted as a reference (dedupe by position), so the rung
+only ever adds the higher-order and import-time effects the call view could not
+see. On powdermonkey (a 236-file Bun/React app), turning the rung on lifted the
+reference edges from 214 to 239, seeded three effect roots call-only missed
+(`WebSocket`, `process.argv`, `fs.readdirSync`), gave 101 files a `<module>` node,
+and — under an illustrative browser-must-not-touch-network policy — added six
+findings on top of the 58 the call view already had, every one of the 58
+preserved: a module-scope `treaty(...)` client built at import time and five
+higher-order `WebSocket` references.
 
 Re-running the shared pipeline over pi (earendil-works/pi) proves it on real
 code: the adapter extracted 16,056 definitions and 41,980 edges (137 reference,

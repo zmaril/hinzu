@@ -1,0 +1,80 @@
+{
+  "definitions": [
+    {
+      "id": "src/core#register",
+      "display": "register",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 15,
+      "line_end": 17
+    },
+    {
+      "id": "src/core#scheduleAudit",
+      "display": "scheduleAudit",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 19,
+      "line_end": 24
+    },
+    {
+      "id": "src/core#pureTotal",
+      "display": "pureTotal",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 26,
+      "line_end": 28
+    },
+    {
+      "id": "src/core#(callback)",
+      "display": "(callback)",
+      "language": "typescript",
+      "file": "src/core.ts",
+      "line_start": 27,
+      "line_end": 27
+    },
+    {
+      "id": "<module>@src/models.ts",
+      "display": "<module>",
+      "language": "typescript",
+      "file": "src/models.ts",
+      "line_start": 1,
+      "line_end": 11
+    }
+  ],
+  "edges": [
+    {
+      "caller": "src/core#scheduleAudit",
+      "callee": "src/core#register",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 23
+    },
+    {
+      "caller": "src/core#scheduleAudit",
+      "callee": "node:fs::readFile",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 23
+    },
+    {
+      "caller": "<module>@src/models.ts",
+      "callee": "global::fetch",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "src/models.ts",
+      "evidence_line": 10
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "node:fs::readFile",
+      "effect": "fs"
+    },
+    {
+      "symbol": "global::fetch",
+      "effect": "net"
+    }
+  ]
+}
