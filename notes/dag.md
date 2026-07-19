@@ -7,6 +7,10 @@ porting it to another language (or rewriting it) with an AI agent. The core idea
 > upward, so that whenever the agent ports a symbol, everything that symbol
 > depends on is already ported and testable.
 
+For the operational schedule built *on top* of this DAG — files organized into
+groups (a PR per group) and topological **waves** (batches portable in parallel)
+— see [`hinzu plan`](./plan.md), which reuses this DAG's file rollup directly.
+
 It reuses the exact facts the effect engine consumes (`FactSet`: definitions,
 call/use edges, effect roots). Where [`effects`](../crates/hinzu-core/src/effects.rs)
 reasons *up* the graph (which callers a root reaches), `dag` reasons *down* it
@@ -199,3 +203,7 @@ A simple, robust loop:
 Because the order is a topological sort of the dependency graph, the invariant
 "everything I depend on is already ported" holds at every step — which is exactly
 what makes an incremental, continuously-testable port possible.
+
+To port **in parallel** instead of one symbol at a time — grouping files into
+PRs and scheduling them into waves that can each be ported concurrently — layer
+[`hinzu plan`](./plan.md) on top of this DAG.

@@ -16,6 +16,7 @@ use anyhow::Result;
 pub mod dag;
 pub mod effects;
 pub mod facts;
+pub mod plan;
 pub mod policy;
 pub mod roots;
 pub mod store;

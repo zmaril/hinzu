@@ -34,6 +34,11 @@ enum Cmd {
     /// leaves (no dependencies) first, then symbols whose dependencies are all
     /// ported. No policy is needed — a DAG does not run the propagation gate.
     Dag(DagArgs),
+    /// Emit a JSON porting plan: the dependency DAG organized into file-level
+    /// groups (a PR per group; cycles ported together) and topological waves (a
+    /// wave is a batch of groups with no dependency between them, portable in
+    /// parallel). Reuses `hinzu dag`, or loads a previously emitted dag.json.
+    Plan(PlanArgs),
 }
 
 #[derive(Parser)]
@@ -67,6 +72,31 @@ struct DagArgs {
     /// Where to write the DAG JSON. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct PlanArgs {
+    /// The project to analyze.
+    path: PathBuf,
+    /// Pre-extracted facts as JSON, in place of a live adapter run.
+    #[arg(long)]
+    facts: Option<PathBuf>,
+    /// An existing SQLite fact store to read facts from, in place of a live run.
+    #[arg(long)]
+    db: Option<PathBuf>,
+    /// A previously emitted DAG JSON (`hinzu dag --out`). When given, the plan is
+    /// built straight from it — no facts are extracted.
+    #[arg(long)]
+    dag: Option<PathBuf>,
+    /// Where to write the plan JSON. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// The loc ceiling a coalesced group is kept under.
+    #[arg(long, default_value_t = 200)]
+    group_max_loc: usize,
+    /// Disable small-file coalescing: group by dependency cycles only.
+    #[arg(long)]
+    no_coalesce: bool,
 }
 
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
@@ -107,6 +137,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::Dag(args) => match dag(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::Plan(args) => match plan(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -160,13 +194,53 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
 /// language's built-in annotations (no policy needed), builds the porting DAG,
 /// and writes it as pretty JSON to `--out` or stdout.
 fn dag(args: DagArgs) -> Result<ExitCode> {
+    let dag = build_dag_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?;
+    let json = serde_json::to_string_pretty(&dag).context("serializing the DAG to JSON")?;
+    write_json(args.out.as_deref(), &json, "DAG")
+}
+
+/// The `hinzu plan` flow. Builds (or loads) the porting DAG, organizes it into
+/// file-level groups and topological waves, and writes the plan as pretty JSON.
+/// With `--dag <file>`, a previously emitted DAG is deserialized directly, so no
+/// facts are extracted; otherwise facts are resolved exactly as `hinzu dag` does.
+fn plan(args: PlanArgs) -> Result<ExitCode> {
+    let dag = match args.dag.as_deref() {
+        Some(dag_path) => {
+            let json = std::fs::read_to_string(dag_path)
+                .with_context(|| format!("reading DAG from {}", dag_path.display()))?;
+            serde_json::from_str::<hinzu_core::dag::DagOutput>(&json)
+                .with_context(|| format!("parsing DAG from {}", dag_path.display()))?
+        }
+        None => build_dag_from_source(&args.path, args.facts.as_deref(), args.db.as_deref())?,
+    };
+
+    let plan = hinzu_core::plan::build_plan(
+        &dag,
+        hinzu_core::plan::PlanOpts {
+            max_group_loc: args.group_max_loc,
+            coalesce_small: !args.no_coalesce,
+        },
+    );
+    let json = serde_json::to_string_pretty(&plan).context("serializing the plan to JSON")?;
+    write_json(args.out.as_deref(), &json, "plan")
+}
+
+/// Resolve a fact set (from `--facts` JSON, an existing `--db` store, or a live
+/// adapter run), seed effect roots best-effort from the language's built-in
+/// annotations (no policy needed), and build the porting DAG. Shared by `hinzu
+/// dag` and `hinzu plan` so both extract and build identically.
+fn build_dag_from_source(
+    path: &Path,
+    facts: Option<&Path>,
+    db: Option<&Path>,
+) -> Result<hinzu_core::dag::DagOutput> {
     // A `--db` store is a valid offline source, like `--facts`; otherwise route
     // by marker (or the given `--facts`).
-    let mut facts = match args.db.as_deref() {
-        Some(db) if args.facts.is_none() => hinzu_core::store::Store::open(db)
+    let mut facts = match db {
+        Some(db) if facts.is_none() => hinzu_core::store::Store::open(db)
             .and_then(|s| s.load_facts())
             .with_context(|| format!("loading facts from store {}", db.display()))?,
-        _ => route_facts(&args.path, args.facts.as_deref())?,
+        _ => route_facts(path, facts)?,
     };
 
     // Seed effect roots so the per-symbol `effect_roots` field is populated, the
@@ -176,17 +250,20 @@ fn dag(args: DagArgs) -> Result<ExitCode> {
     let language = facts_language(&facts);
     RootSeeds::for_language(language).seed_unknowns(&mut facts);
 
-    let dag = hinzu_core::dag::build_dag(
+    Ok(hinzu_core::dag::build_dag(
         &facts,
-        &args.path.display().to_string(),
+        &path.display().to_string(),
         Some(language.as_str()),
-    );
-    let json = serde_json::to_string_pretty(&dag).context("serializing the DAG to JSON")?;
+    ))
+}
 
-    match args.out.as_deref() {
+/// Write pretty JSON to `out` (with a trailing newline) or stdout. `what` names
+/// the document in any I/O error.
+fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
+    match out {
         Some(out) => {
             std::fs::write(out, format!("{json}\n"))
-                .with_context(|| format!("writing DAG to {}", out.display()))?;
+                .with_context(|| format!("writing {what} to {}", out.display()))?;
         }
         None => println!("{json}"),
     }

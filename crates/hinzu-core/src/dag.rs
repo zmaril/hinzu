@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::facts::{EdgeResolution, FactSet, SymbolId};
 
@@ -35,7 +35,7 @@ pub const HINZU_DAG_VERSION: u32 = 1;
 
 /// A node in the symbol dependency graph: one per local definition, plus one
 /// per external call target (a callee with no local definition).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SymbolNode {
     /// The stable symbol id (the graph key).
     pub id: String,
@@ -77,7 +77,7 @@ pub struct SymbolNode {
 }
 
 /// An edge in the symbol dependency graph: "from calls/references to".
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SymbolEdge {
     /// The caller symbol id.
     pub from: String,
@@ -99,7 +99,7 @@ pub struct SymbolEdge {
 }
 
 /// A file-rollup node: the symbol graph aggregated onto its defining files.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileNode {
     /// The file path (the graph key).
     pub path: String,
@@ -126,7 +126,7 @@ pub struct FileNode {
 
 /// A file-rollup edge: the aggregate of the symbol call edges that cross from
 /// one file into another (self-loops dropped).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileEdge {
     /// The depending file.
     pub from: String,
@@ -139,7 +139,7 @@ pub struct FileEdge {
 }
 
 /// One strongly-connected component (a call cycle) reported to the consumer.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SccGroup {
     /// The group id (`"scc:N"`), matching the `scc` field on its members.
     pub id: String,
@@ -149,7 +149,7 @@ pub struct SccGroup {
 
 /// The DAG utilities a porting agent walks: the port order, the cycles, and the
 /// first batch of leaves.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dag {
     /// Every local symbol in **dependencies-first** order: a symbol appears only
     /// after all of its callees, so popping from the front is always safe to
@@ -169,7 +169,7 @@ pub struct Dag {
 
 /// The call-only fidelity of this DAG, stated so a consumer sees the caveats
 /// next to the data.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fidelity {
     /// Always true: edges are derived from the call/use graph only.
     pub call_only: bool,
@@ -182,7 +182,7 @@ pub struct Fidelity {
 }
 
 /// Aggregate counts for the whole DAG.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stats {
     /// Local (internal) symbols.
     pub symbol_count: usize,
@@ -199,7 +199,7 @@ pub struct Stats {
 }
 
 /// The complete DAG document, ready to serialize as JSON.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DagOutput {
     /// The schema version ([`HINZU_DAG_VERSION`]).
     pub hinzu_dag_version: u32,

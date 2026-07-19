@@ -1,0 +1,66 @@
+{
+  "hinzu_plan_version": 1,
+  "root": "adapters/typescript/tests/fixture",
+  "language": "typescript",
+  "granularity": "file",
+  "grouping": {
+    "max_group_loc": 200,
+    "coalesce_small": true
+  },
+  "fidelity": {
+    "call_only": true,
+    "notes": [
+      "Built over the call-only dependency DAG: an edge means a caller calls or references a callee, so file dependencies that flow only through types or imports (never a call) are not represented.",
+      "File edges are inferred by projecting symbol call edges onto their files; there is no imports/implementation table.",
+      "Higher-order calls, dynamic dispatch, and unresolved callbacks are approximated or missed; an edge the adapter could not resolve sets has_unknown_edges on the groups it touches.",
+      "Grouping and wave assignment inherit those limits: a missed edge can wrongly split a wave or under-constrain the order.",
+      "Cycle groups are mandatory (a file dependency cycle must be ported together), but small-file coalescing is a size heuristic tuned by max_group_loc; independent small files are not force-merged and simply share a wave."
+    ]
+  },
+  "stats": {
+    "file_count": 2,
+    "group_count": 1,
+    "wave_count": 1,
+    "cycle_group_count": 0,
+    "coalesced_group_count": 1,
+    "singleton_group_count": 0,
+    "largest_wave": 1,
+    "critical_path_length": 1
+  },
+  "groups": [
+    {
+      "id": "group:0",
+      "reason": "coalesced-small",
+      "files": [
+        "src/core.ts",
+        "src/io.ts"
+      ],
+      "loc": 19,
+      "symbol_count": 4,
+      "wave": 0,
+      "depends_on": [],
+      "unlocks": [],
+      "external_packages": [
+        "node:fs"
+      ],
+      "effect_roots": [
+        "fs"
+      ],
+      "has_unknown_edges": false
+    }
+  ],
+  "waves": [
+    {
+      "wave": 0,
+      "group_ids": [
+        "group:0"
+      ],
+      "files": [
+        "src/core.ts",
+        "src/io.ts"
+      ],
+      "loc": 19,
+      "group_count": 1
+    }
+  ]
+}
