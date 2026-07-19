@@ -345,21 +345,22 @@ allow = ["fs", "net", "process", "env"]
         let facts = leak_facts();
         let summaries = NaiveEngine.propagate(&facts);
 
+        // Run the builtin engine plus a freshly-registered Marker under `policy_src`.
+        let run = |policy_src: &str| {
+            let policy = Policy::from_toml(policy_src).unwrap();
+            let cx = RuleContext::new(&facts, &summaries, &policy);
+            let mut engine = RuleEngine::with_builtin();
+            engine.register(Box::new(Marker));
+            engine.run(&cx)
+        };
+
         // Not enabled: the marker rule is skipped, only effects runs.
-        let policy = Policy::from_toml(POLICY).unwrap();
-        let cx = RuleContext::new(&facts, &summaries, &policy);
-        let mut engine = RuleEngine::with_builtin();
-        engine.register(Box::new(Marker));
-        let findings = engine.run(&cx);
+        let findings = run(POLICY);
         assert!(findings.iter().all(|f| f.rule == EFFECTS_RULE_ID));
 
         // Enabled: the marker rule fires alongside effects.
         let enabled_src = format!("{POLICY}\n[rules]\nenable = [\"marker\"]\n");
-        let policy = Policy::from_toml(&enabled_src).unwrap();
-        let cx = RuleContext::new(&facts, &summaries, &policy);
-        let mut engine = RuleEngine::with_builtin();
-        engine.register(Box::new(Marker));
-        let findings = engine.run(&cx);
+        let findings = run(&enabled_src);
         assert!(findings.iter().any(|f| f.rule == "marker"));
         assert!(findings.iter().any(|f| f.rule == EFFECTS_RULE_ID));
     }
