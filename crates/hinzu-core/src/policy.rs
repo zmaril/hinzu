@@ -107,13 +107,35 @@ impl Region {
     }
 }
 
-/// The full policy — regions, the globs that exclude files entirely, and what
-/// to do about `Unknown`.
+/// Configuration for the rule engine, parsed from the `[rules]` section of
+/// `hinzu.toml`. It sits beside `[region.*]` rather than folding into it: the
+/// effect-region policy is path-shaped and keeps its own surface, while the
+/// named rules the design note introduces are structure-shaped and gated here.
+///
+/// `enable` turns on the named rules by id; the effect-region policy always runs
+/// whenever a `[region.*]` is present, exactly as before, so a `hinzu.toml` with
+/// no `[rules]` section behaves identically to one written before the section
+/// existed. `tables` holds each rule's own `[rules.<id>]` config verbatim, so a
+/// rule owns the schema of its table and a new rule adds a section without
+/// touching the ones already parsed.
+#[derive(Clone, Debug, Default)]
+pub struct RulesConfig {
+    /// The named rules turned on, by id. The effect-region policy is not listed
+    /// here — it runs on the presence of `[region.*]`.
+    pub enable: Vec<String>,
+    /// Per-rule config tables (`[rules.<id>]`), kept as raw TOML so each rule
+    /// parses its own thresholds and toggles.
+    pub tables: BTreeMap<String, toml::Value>,
+}
+
+/// The full policy — regions, the globs that exclude files entirely, what to do
+/// about `Unknown`, and the rule-engine configuration.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     pub regions: Vec<Region>,
     pub ignore: Vec<Pattern>,
     pub on_unknown: OnUnknown,
+    pub rules: RulesConfig,
 }
 
 impl Policy {
@@ -173,6 +195,36 @@ impl Violation {
     /// (from `on_unknown = "warn"`) are reported but do not fail.
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
+    }
+
+    /// One human-readable line explaining the violation, distinguishing a
+    /// forbidden-effect violation from an unknown-external one so the two never
+    /// read the same. This is the message the report prints and the string the
+    /// rule engine carries as a [`crate::rules::Finding`]'s `message`, so both
+    /// paths render a violation identically.
+    pub fn describe(&self) -> String {
+        match &self.finding {
+            Finding::ForbiddenEffect => format!(
+                "{} forbids {} in region '{}': {}",
+                self.display,
+                self.effect.as_str(),
+                self.region,
+                self.evidence.join(" -> "),
+            ),
+            Finding::Unknown { callee, flavor } => {
+                let what = match flavor {
+                    UnknownFlavor::Effect => format!("unknown external `{callee}`"),
+                    UnknownFlavor::Target => "an unresolved call target".to_string(),
+                };
+                format!(
+                    "{} cannot certify in region '{}': reaches {} — {}",
+                    self.display,
+                    self.region,
+                    what,
+                    self.evidence.join(" -> "),
+                )
+            }
+        }
     }
 }
 
@@ -275,6 +327,12 @@ struct PolicyDoc {
     analysis: AnalysisDoc,
     #[serde(default)]
     region: BTreeMap<String, RegionDoc>,
+    /// The `[rules]` section: `enable = [...]` plus each rule's `[rules.<id>]`
+    /// subtable, kept as a raw table so per-rule schemas stay with their rules.
+    /// Absent in every `hinzu.toml` written before the rule engine — parsing it
+    /// as an `Option` keeps those files behaving exactly as they did.
+    #[serde(default)]
+    rules: Option<toml::value::Table>,
 }
 
 #[derive(Default, Deserialize)]
@@ -318,12 +376,33 @@ impl PolicyDoc {
             });
         }
 
+        let rules = parse_rules(self.rules)?;
+
         Ok(Policy {
             regions,
             ignore,
             on_unknown,
+            rules,
         })
     }
+}
+
+/// Parse the `[rules]` section into a [`RulesConfig`]. `enable` is pulled out as
+/// the list of named-rule ids; every remaining key is a `[rules.<id>]` config
+/// subtable kept verbatim for the rule that owns it. A missing section yields
+/// the default (no named rules, no tables) — the pre-rule-engine behavior.
+fn parse_rules(table: Option<toml::value::Table>) -> Result<RulesConfig> {
+    let Some(mut table) = table else {
+        return Ok(RulesConfig::default());
+    };
+    let enable = match table.remove("enable") {
+        None => Vec::new(),
+        Some(v) => v
+            .try_into::<Vec<String>>()
+            .context("[rules] enable must be a list of rule ids")?,
+    };
+    let tables = table.into_iter().collect();
+    Ok(RulesConfig { enable, tables })
 }
 
 impl RegionDoc {
@@ -403,6 +482,31 @@ allow = ["fs", "net", "process", "env"]
             line_start: 1,
             line_end: 5,
         }
+    }
+
+    /// A `hinzu.toml` with no `[rules]` section parses to an empty rules config:
+    /// no named rules enabled, no per-rule tables. This is the backward-compat
+    /// guarantee — files written before the rule engine behave unchanged.
+    #[test]
+    fn absent_rules_section_parses_to_empty_config() {
+        let policy = Policy::from_toml(FIXTURE).unwrap();
+        assert!(policy.rules.enable.is_empty());
+        assert!(policy.rules.tables.is_empty());
+    }
+
+    /// The `[rules]` section is parsed: `enable` lists the named rules and each
+    /// `[rules.<id>]` subtable is kept verbatim for the rule that owns it.
+    #[test]
+    fn rules_section_parses_enable_and_per_rule_tables() {
+        let src = format!(
+            "{FIXTURE}\n[rules]\nenable = [\"prop-drilling\"]\n\n[rules.prop-drilling]\nmax_depth = 3\n"
+        );
+        let policy = Policy::from_toml(&src).unwrap();
+        assert_eq!(policy.rules.enable, vec!["prop-drilling".to_string()]);
+        let table = policy.rules.tables.get("prop-drilling").unwrap();
+        assert_eq!(table.get("max_depth").and_then(|v| v.as_integer()), Some(3));
+        // The reserved `enable` key is not mistaken for a rule table.
+        assert!(!policy.rules.tables.contains_key("enable"));
     }
 
     #[test]

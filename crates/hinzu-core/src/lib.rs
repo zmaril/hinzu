@@ -22,6 +22,7 @@ pub mod plan;
 pub mod policy;
 pub mod portdiff;
 pub mod roots;
+pub mod rules;
 pub mod store;
 
 /// Shared builders for the unit tests across the engine's modules, kept in one
@@ -38,7 +39,8 @@ pub(crate) mod test_support {
 
 use effects::{EffectEngine, NaiveEngine};
 use facts::{Definition, Edge, Effect, EffectRoot, FactSet, Language};
-use policy::{check, Policy};
+use policy::Policy;
+use rules::{Finding, RuleContext, RuleEngine};
 
 /// Engine entry point. Builds a synthetic demo fact set that mirrors a
 /// functional-core violation — an in-core function that reaches the filesystem
@@ -48,12 +50,13 @@ pub fn run() -> Result<String> {
     let facts = demo_facts();
     let summaries = NaiveEngine.propagate(&facts);
     let policy = demo_policy()?;
-    let violations = check(&facts, &summaries, &policy);
+    let cx = RuleContext::new(&facts, &summaries, &policy);
+    let findings = RuleEngine::with_builtin().run(&cx);
     format_report(
         "hinzu effect analysis (demo)",
         &facts,
         &summaries,
-        &violations,
+        &findings,
     )
 }
 
@@ -88,12 +91,16 @@ pub fn check_facts(
     let summaries = engine.propagate(&facts);
     store.write_summaries(&summaries)?;
 
-    let violations = check(&facts, &summaries, policy);
-    let report = format_report("hinzu effect analysis", &facts, &summaries, &violations)?;
+    // Fold every enabled rule over the shared context. Today that is the ported
+    // effect-region rule alone, so the findings — and the report and exit code
+    // they drive — are identical to running the effect-region check directly.
+    let cx = RuleContext::new(&facts, &summaries, policy);
+    let findings = RuleEngine::with_builtin().run(&cx);
+    let report = format_report("hinzu effect analysis", &facts, &summaries, &findings)?;
     // Only errors fail the run. `on_unknown = "warn"` produces reported-but-
     // non-failing warnings, so the count that drives the exit code is the
     // number of error-severity findings.
-    let errors = violations.iter().filter(|v| v.is_error()).count();
+    let errors = findings.iter().filter(|f| f.is_error()).count();
     Ok(CheckOutcome {
         report,
         violations: errors,
@@ -106,7 +113,7 @@ fn format_report(
     title: &str,
     facts: &FactSet,
     summaries: &std::collections::BTreeMap<facts::SymbolId, effects::EffectSummary>,
-    violations: &[policy::Violation],
+    findings: &[Finding],
 ) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "{title}")?;
@@ -126,54 +133,26 @@ fn format_report(
     }
 
     writeln!(out)?;
-    let errors: Vec<&policy::Violation> = violations.iter().filter(|v| v.is_error()).collect();
-    let warnings: Vec<&policy::Violation> = violations.iter().filter(|v| !v.is_error()).collect();
+    let errors: Vec<&Finding> = findings.iter().filter(|f| f.is_error()).collect();
+    let warnings: Vec<&Finding> = findings.iter().filter(|f| !f.is_error()).collect();
 
     if errors.is_empty() {
         writeln!(out, "policy: no violations")?;
     } else {
         writeln!(out, "policy violations ({}):", errors.len())?;
-        for v in &errors {
-            writeln!(out, "  {}", describe_violation(v))?;
+        for f in &errors {
+            writeln!(out, "  {}", f.message)?;
         }
     }
     if !warnings.is_empty() {
         writeln!(out)?;
         writeln!(out, "warnings ({}):", warnings.len())?;
-        for v in &warnings {
-            writeln!(out, "  {}", describe_violation(v))?;
+        for f in &warnings {
+            writeln!(out, "  {}", f.message)?;
         }
     }
 
     Ok(out)
-}
-
-/// One line describing a finding, distinguishing a forbidden-effect violation
-/// from an unknown-external one so the two never read the same.
-fn describe_violation(v: &policy::Violation) -> String {
-    use policy::{Finding, UnknownFlavor};
-    match &v.finding {
-        Finding::ForbiddenEffect => format!(
-            "{} forbids {} in region '{}': {}",
-            v.display,
-            v.effect.as_str(),
-            v.region,
-            v.evidence.join(" -> "),
-        ),
-        Finding::Unknown { callee, flavor } => {
-            let what = match flavor {
-                UnknownFlavor::Effect => format!("unknown external `{callee}`"),
-                UnknownFlavor::Target => "an unresolved call target".to_string(),
-            };
-            format!(
-                "{} cannot certify in region '{}': reaches {} — {}",
-                v.display,
-                v.region,
-                what,
-                v.evidence.join(" -> "),
-            )
-        }
-    }
 }
 
 /// The synthetic scenario: `handle_request` (in the functional core) calls
@@ -253,6 +232,7 @@ allow = ["fs", "net", "process", "env"]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::check;
 
     #[test]
     fn run_returns_a_message() {

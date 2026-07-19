@@ -38,6 +38,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   / count` and `x % n` are flagged, a guarded divide and a divide by a nonzero
   constant are not — plus an `#[ignore]`d live end-to-end test over the demo
   crate.
+- **A rule-engine core: the effect-region check now runs as the first rule
+  behind a pluggable `Rule` trait.** hinzu's effect analysis is lifted into a
+  shared shape — a rule is a query over a `RuleContext` (the fact set, the
+  per-symbol effect summaries, the policy, and the forward adjacency that
+  reconstructs evidence paths) that emits `Finding`s, and a small engine folds
+  every enabled rule over one shared context and concatenates the results. A
+  `Finding` generalizes the effect check's `Violation`: it keeps the rule id,
+  the flagged definition and its location, the human-facing message, the
+  evidence chain, and the severity, without hard-coding an effect or a region,
+  so a future structure-shaped rule fills the same fields. The `hinzu.toml`
+  policy gains a `[rules]` section — `enable` turns on named rules and each
+  `[rules.<id>]` subtable carries that rule's own config — while the
+  effect-region policy keeps its `[region.*]` surface and still runs on the
+  presence of a region. A file with no `[rules]` section parses and behaves
+  exactly as before, and `hinzu check` produces the same violations, exit codes,
+  and report as it did, now routed through the engine. This is scaffolding: the
+  seam is design-agnostic and leaves room for the language-understanding rules
+  to attach later, none of which ship here.
 - **Full reference-level parity for the native TypeScript adapter — higher-order
   and module-level (import-time) effects in the tsc compiler API.** The adapter
   already drew `reference` edges for a bare identifier resolving to an owned
