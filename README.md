@@ -60,9 +60,16 @@ cargo install --path crates/hinzu-cli
 
 ```sh
 hinzu run       # run the engine (placeholder for now)
+hinzu check <p> # check a project's effects against a hinzu.toml policy
+hinzu dag <p>   # emit a JSON dependency DAG for AI-assisted porting
 hinzu --help    # list commands
 hinzu --version # print the version
 ```
+
+`hinzu dag` emits a dependencies-first (leaves-first) port order over the
+call/use graph — the same facts the effect engine consumes, reused to answer
+"in what order should an agent move this code?" See [notes/dag.md](notes/dag.md)
+for the JSON schema, the ordering semantics, and how a porting agent walks it.
 
 ## Development
 

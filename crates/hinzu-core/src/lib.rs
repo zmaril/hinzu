@@ -13,6 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+pub mod dag;
 pub mod effects;
 pub mod facts;
 pub mod policy;

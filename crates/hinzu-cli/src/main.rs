@@ -30,6 +30,10 @@ enum Cmd {
     Run,
     /// Check a project's effect usage against a `hinzu.toml` policy.
     Check(CheckArgs),
+    /// Emit a JSON dependency DAG of a project, for AI-assisted porting: port
+    /// leaves (no dependencies) first, then symbols whose dependencies are all
+    /// ported. No policy is needed — a DAG does not run the propagation gate.
+    Dag(DagArgs),
 }
 
 #[derive(Parser)]
@@ -48,6 +52,21 @@ struct CheckArgs {
     /// The propagation engine: `dbsp` (default) or the reference `naive` BFS.
     #[arg(long, value_enum, default_value_t = Engine::Dbsp)]
     engine: Engine,
+}
+
+#[derive(Parser)]
+struct DagArgs {
+    /// The project to analyze.
+    path: PathBuf,
+    /// Pre-extracted facts as JSON, in place of a live adapter run.
+    #[arg(long)]
+    facts: Option<PathBuf>,
+    /// An existing SQLite fact store to read facts from, in place of a live run.
+    #[arg(long)]
+    db: Option<PathBuf>,
+    /// Where to write the DAG JSON. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
@@ -84,6 +103,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::Check(args) => match check(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::Dag(args) => match dag(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -132,41 +155,86 @@ fn check(args: CheckArgs) -> Result<ExitCode> {
     }
 }
 
+/// The `hinzu dag` flow. Resolves a fact set (from `--facts` JSON, an existing
+/// `--db` store, or a live adapter run), seeds effect roots best-effort from the
+/// language's built-in annotations (no policy needed), builds the porting DAG,
+/// and writes it as pretty JSON to `--out` or stdout.
+fn dag(args: DagArgs) -> Result<ExitCode> {
+    // A `--db` store is a valid offline source, like `--facts`; otherwise route
+    // by marker (or the given `--facts`).
+    let mut facts = match args.db.as_deref() {
+        Some(db) if args.facts.is_none() => hinzu_core::store::Store::open(db)
+            .and_then(|s| s.load_facts())
+            .with_context(|| format!("loading facts from store {}", db.display()))?,
+        _ => route_facts(&args.path, args.facts.as_deref())?,
+    };
+
+    // Seed effect roots so the per-symbol `effect_roots` field is populated, the
+    // same built-in annotation base `hinzu check` starts from — but policy-free:
+    // no `[roots]`/`[trust]` overrides, so it stays best-effort. `seed_unknowns`
+    // also marks unresolved externals, sharpening edge provenance.
+    let language = facts_language(&facts);
+    RootSeeds::for_language(language).seed_unknowns(&mut facts);
+
+    let dag = hinzu_core::dag::build_dag(
+        &facts,
+        &args.path.display().to_string(),
+        Some(language.as_str()),
+    );
+    let json = serde_json::to_string_pretty(&dag).context("serializing the DAG to JSON")?;
+
+    match args.out.as_deref() {
+        Some(out) => {
+            std::fs::write(out, format!("{json}\n"))
+                .with_context(|| format!("writing DAG to {}", out.display()))?;
+        }
+        None => println!("{json}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Load facts from the `--facts` JSON (the offline path), or extract them live
 /// by running the StableMIR driver over the target cargo project. When the path
 /// is not a cargo project and no facts are given, fail honestly rather than
 /// faking an analysis.
 fn load_facts(args: &CheckArgs) -> Result<FactSet> {
-    if let Some(path) = &args.facts {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("reading facts from {}", path.display()))?;
+    route_facts(&args.path, args.facts.as_deref())
+}
+
+/// Route to a fact source: the `--facts` JSON when given, else a live adapter
+/// run chosen by the project's marker file. Shared by `hinzu check` and
+/// `hinzu dag` so both resolve facts identically.
+fn route_facts(path: &Path, facts: Option<&Path>) -> Result<FactSet> {
+    if let Some(facts) = facts {
+        let json = std::fs::read_to_string(facts)
+            .with_context(|| format!("reading facts from {}", facts.display()))?;
         return FactSet::from_json(&json)
-            .with_context(|| format!("parsing facts from {}", path.display()));
+            .with_context(|| format!("parsing facts from {}", facts.display()));
     }
     // A Cargo.toml routes to the Rust StableMIR path; a tsconfig/package.json to
     // the TypeScript compiler-API adapter; a pyproject/setup.py/setup.cfg to the
     // ty-driven Python adapter; a go.mod to the gopls-driven Go adapter. Rust
     // wins a tie so a Rust crate with a stray package.json is not misrouted.
-    if rust_adapter::is_cargo_project(&args.path) {
-        return rust_adapter::extract_facts(&args.path)
-            .with_context(|| format!("extracting Rust facts from {}", args.path.display()));
+    if rust_adapter::is_cargo_project(path) {
+        return rust_adapter::extract_facts(path)
+            .with_context(|| format!("extracting Rust facts from {}", path.display()));
     }
-    if ts_adapter::is_ts_project(&args.path) {
-        return ts_adapter::extract_facts(&args.path)
-            .with_context(|| format!("extracting TypeScript facts from {}", args.path.display()));
+    if ts_adapter::is_ts_project(path) {
+        return ts_adapter::extract_facts(path)
+            .with_context(|| format!("extracting TypeScript facts from {}", path.display()));
     }
-    if py_adapter::is_python_project(&args.path) {
-        return py_adapter::extract_facts(&args.path)
-            .with_context(|| format!("extracting Python facts from {}", args.path.display()));
+    if py_adapter::is_python_project(path) {
+        return py_adapter::extract_facts(path)
+            .with_context(|| format!("extracting Python facts from {}", path.display()));
     }
-    if go_adapter::is_go_project(&args.path) {
-        return go_adapter::extract_facts(&args.path)
-            .with_context(|| format!("extracting Go facts from {}", args.path.display()));
+    if go_adapter::is_go_project(path) {
+        return go_adapter::extract_facts(path)
+            .with_context(|| format!("extracting Go facts from {}", path.display()));
     }
     anyhow::bail!(
         "{} is not a cargo, TypeScript, Python, or Go project — pass --facts <json> to analyze \
          pre-extracted facts",
-        args.path.display()
+        path.display()
     )
 }
 
