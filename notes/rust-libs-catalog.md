@@ -104,3 +104,25 @@ reading `.git`. A project that isolates gix's pure helpers can narrow this with
 its own `[trust]` line. The same reasoning applies to the TLS crates, marked `net`
 though they are sans-I/O in the strict sense — they exist for network security, so
 `net` is the safe label.
+
+## Fidelity: call edges plus native reference edges (MIR)
+
+The pack seeds *which* library operations are effects; the StableMIR driver
+decides *which functions reach them*. That driver is no longer call-only. Beyond
+each body's `Call` terminators it walks the body's statements and operands and
+draws a `reference` edge whenever a function item or closure is used as a **value**
+rather than called — passed as a callback (`register(foo)`), assigned, returned,
+reified to a fn-pointer, stored in a struct field
+(`RegexRule { judge: judge_font }`), or captured in a closure handed elsewhere —
+and it walks referenced closure bodies (previously recorded as bare, un-walked
+definitions) so their effects surface. A `static`/`const` initializer — including a
+`LazyLock`/lazy static, the Rust analogue of a module-level import-time effect — is
+walked and attributed to the static's own id. Resolution rides the same
+`Instance::resolve` → provenance → effect path as calls, so a referenced pack
+operation (`register(reqwest::get)`) taints its user exactly as a direct call
+would. This is the reference-level rung the Python and TypeScript adapters already
+reached, done natively from monomorphized MIR — so **the call-only caveat is lifted
+for Rust**. It is sound-additive: reference edges only ever add the higher-order and
+import-time effects the call graph could not see, never remove a real one. See
+[`getting-started.md`](./getting-started.md) (the straitjacket before/after) for
+the measured effect.

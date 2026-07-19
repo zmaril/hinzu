@@ -1,0 +1,29 @@
+# The Rust reference-fixture policy. It exercises the effects the native
+# StableMIR reference-edge rung recovers that a call-only graph missed — every
+# one reaches the filesystem only by handing off a function *value*:
+#
+#   * a HIGHER-ORDER reference — `core.rs`'s `schedule_audit` passes the
+#     filesystem function `read_audit` as a callback, so it reaches `fs`.
+#   * a CLOSURE reference — `defer_read` hands a closure to another function to
+#     invoke; the closure body reaches `fs`.
+#   * an IMPORT-TIME (lazy) reference — the `BOOT_CONFIG` `LazyLock` initializer
+#     references a closure that reads a file on first access, the Rust analogue
+#     of a module-level import-time effect.
+#
+# `core.rs` is the functional core (it forbids `fs`); `effects.rs` is the
+# sanctioned carve-out. Under call-only all three core functions looked pure.
+#
+# `on_unknown = "ignore"` keeps the fixture pointed at the reference recovery:
+# `run_with` invokes its callback through a fn pointer, an honest `<indirect>`
+# Unknown the reference rung does not (and should not) resolve away.
+
+[analysis]
+on_unknown = "ignore"
+
+[region.core]
+paths  = ["src/core.rs"]
+forbid = ["fs", "net", "db", "process"]
+
+[region.effects]
+paths = ["src/effects.rs"]
+allow = ["fs", "net", "db", "process", "env", "clock", "random"]

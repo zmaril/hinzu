@@ -8,6 +8,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Full reference-level parity for the native TypeScript adapter — higher-order
+  and module-level (import-time) effects in the tsc compiler API.** The adapter
+  already drew `reference` edges for a bare identifier resolving to an owned
+  function used as a value; two flows call-only still missed are now covered,
+  each resolved through the *same* declaration → provenance → effect path as a
+  call. **Higher-order:** a value-position use of an *external* effectful symbol —
+  an ambient global (`register(fetch)`), a node built-in (`register(fs.readFile)`,
+  `register(readFile)` from a named `node:fs` import), or an effectful npm import —
+  now taints its enclosing function, not only owned functions. **Module-level:**
+  code that runs at import time (a top-level `fetch(...)`, an effectful call
+  outside any function, a module-scope initializer like
+  `export const api = treaty(origin)`) has no enclosing function, so call-only
+  dropped it entirely; the adapter now gives each file a synthetic `<module>`
+  definition (`<module>@<relpath>`, whole-file span) and attributes import-time
+  effects to it as `reference` edges, emitting the node only for a file whose
+  import-time code actually reaches an effect — exactly the `<module>` model the
+  Python tree-sitter rung introduced. A call callee is never re-emitted as a
+  reference (deduped by position, now including tagged-template tags), so the rung
+  is **sound-additive**: it only adds the higher-order and import-time effects the
+  call view could not see. On **powdermonkey** (236-file Bun/React app) the rung
+  lifted reference edges 214 → 239, seeded three roots call-only missed
+  (`WebSocket`, `process.argv`, `fs.readdirSync`), gave 101 files a `<module>`
+  node, and — under an illustrative browser-must-not-touch-network policy — added
+  six findings atop the 58 the call view already had (every one preserved): an
+  import-time `treaty(...)` client and five higher-order `WebSocket` references. A
+  committed `adapters/typescript/tests/reference-fixture` (higher-order
+  `node:fs::readFile` reach + a module-level `fetch` on the file's `<module>`
+  node) gives stable-CI coverage with no Node required, plus an `#[ignore]`d live
+  end-to-end test.
+- **Reference-level edges for the native Rust adapter — higher-order and
+  import-time effects natively from MIR.** The StableMIR driver
+  (`crates/hinzu-rustc-driver`) was call-only: it walked each monomorphized body's
+  `Call` terminators, so a function used as a *value* — passed as a callback
+  (`register(foo)`), assigned, returned, reified to a fn-pointer, stored in a
+  struct field (straitjacket's `RegexRule { judge: judge_font }`), or captured in a
+  closure handed elsewhere — produced no edge, and a closure's own body was
+  recorded as a bare definition but never walked, so both flows were invisible. The
+  driver now also walks each body's statements/operands and emits `Edge{kind:
+  reference, resolution: reference}` for those non-call *uses*: a `FnDef`/closure
+  constant in a call argument, an assignment RHS, a returned operand or a
+  fn-pointer reification (`visit_operand`); a closure `Rvalue::Aggregate`
+  construction (`visit_rvalue`); and the initializer body of a `static`/`const` —
+  including a `LazyLock`/lazy static, the Rust analogue of a module-level
+  import-time effect, attributed to the static's own id. Referenced closures are
+  walked under their own def id so a reference edge into one transitively carries
+  its body's effects. Resolution rides the *same* `Instance::resolve` → provenance
+  → effect path as calls, and effect roots seed identically, so a referenced
+  effectful item taints its user exactly as a direct call would. A `Call`'s own
+  callee is emitted once, as a `call`, never re-emitted as a reference (the two
+  paths are disjoint by construction). This is the rung the Python tree-sitter
+  driver and the TypeScript checker already reached, done natively from
+  monomorphized MIR — **the call-only caveat is lifted for Rust**. The rung is
+  **sound-additive**: it only adds edges/effects, so no violation call-only found
+  can vanish. On **straitjacket** it added 126 reference edges and surfaced 3
+  higher-order `fs` findings call-only missed — three closure bodies that read
+  files (`main`, `Projects::discover`, `walk::collect_files`), previously
+  un-walked — while leaving the pre-existing 9 forbidden-`fs` violators unchanged
+  (12 = 9 + 3, none removed); the stored fn-pointer `judge` case
+  (`pattern_rules → judge_font`) draws its reference edge and correctly does not
+  taint, since those judges are pure. A committed fixture
+  (`adapters/rust/tests/reference-fixture/`, with its driver-produced
+  `reference-fixture-facts.json`) gives stable-CI coverage of the higher-order
+  callback, the handed-off closure, and the lazy import-time initializer with no
+  nightly toolchain required (`crates/hinzu-cli/tests/rust_check.rs`). Walking
+  closure and `static`/`const` bodies also refined the driver's edge resolution:
+  a **named** `FnDef` call target the driver could not *monomorphize* (a
+  generic/trait call in a polymorphic body — `<P as AsRef<Path>>::as_ref`) is now
+  labeled `resolution: call`, keeping its trait-method name for the engine's
+  name-based resolution order (a std name clears to trusted-pure; an unresolvable
+  user name still degrades to `Unknown`) rather than `resolution: unresolved`,
+  which is reserved for a genuinely *anonymous* fn-pointer / `dyn` target
+  (`<indirect>`). This keeps the `self-check` functional-core guard green — its
+  dogfood run over hinzu-core surfaced `Store::open`'s `impl AsRef<Path>`
+  `with_context` closure, whose `path.as_ref()` was a benign, pure, unmonomorphized
+  std trait call, not a real effect.
+
 - **The reference-level rung of the precision ladder, for Python: a tree-sitter
   syntactic layer resolved through the LSP.** The generic LSP driver builds its
   graph from `callHierarchy/outgoingCalls`, which is call-only — it misses a

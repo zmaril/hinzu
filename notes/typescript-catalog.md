@@ -78,6 +78,38 @@ an ambient global like `fetch`, which is not an import. A call into any other
 third-party package becomes `Unknown` until a `[trust]` line vouches for it, so
 an unseen dependency can never be read as pure by omission.
 
+## Reference-level extraction
+
+Call edges are only half the picture. A function reaches an effect two other ways
+a call-only view never sees, and the adapter emits a `reference` edge for each —
+resolved through the *same* declaration → provenance → effect path as a call, so
+it is sound-additive: it only ever adds edges and roots, never removes one, so no
+violation the call view found can vanish.
+
+- **Higher-order references.** A value-position use of an effectful symbol — a
+  function passed as a callback (`register(readFile)`), stored, returned, put in
+  an array/object literal, or used as a default parameter — taints its enclosing
+  function, because that value reaches its effect when something later invokes it.
+  Both an owned function used as a value and an external effectful symbol
+  (`fetch`, a node built-in like `fs.readFile`, an effectful npm import) draw the
+  edge. The callee of a call is *not* re-emitted as a reference — the dedupe is by
+  position, so nothing is counted as both a call and a reference.
+- **Module-level (import-time) effects.** Code that runs when a module is
+  imported — a top-level `fetch(...)`, an effectful call outside any function, a
+  module-scope initializer like `export const api = treaty(origin)` — has no
+  enclosing function to attribute to. The adapter gives each file a synthetic
+  `<module>` definition (`<module>@<relpath>`, whole-file span) and attributes
+  import-time effects to it, so they are visible and policeable rather than
+  silently dropped. The node is emitted only for a file whose import-time code
+  actually reaches an effect, so pure files spawn no empty node. This mirrors the
+  `<module>` node the Python tree-sitter rung introduced.
+
+Because a bare reference to an effectful value taints even where the value is only
+read (for example reading `WebSocket.OPEN` references the `WebSocket` network
+primitive), the reference rung is a deliberate over-approximation: it never misses
+a real effect, at the cost of occasionally flagging a symbol that is referenced
+but not invoked — the same soundness-over-precision trade the Python rung makes.
+
 hinzu-core carries the same table as a shipped annotation set,
 `crates/hinzu-core/annotations/node.toml` — the TypeScript counterpart to
 `std.toml` — so its `Unknown` classification agrees with what the adapter seeds,

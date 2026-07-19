@@ -1,0 +1,16 @@
+# A tiny crate exercising the reference-edge (higher-order / import-time) rung of
+# the native StableMIR driver. It is NOT part of the workspace; `hinzu check`
+# builds it under the pinned nightly with the driver as RUSTC_WORKSPACE_WRAPPER.
+# The committed `reference-fixture-facts.json` was produced by that run so stable
+# CI can assert the rung without a nightly toolchain.
+[package]
+name = "reference-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Standalone crate — not a member of the hinzu workspace.
+[workspace]
