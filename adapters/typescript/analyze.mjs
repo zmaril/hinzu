@@ -159,6 +159,30 @@ function isFunctionLike(n) {
   );
 }
 
+// A type declaration we register as a definition so signature-type edges have a
+// local port target: classes, interfaces, type aliases, and enums. Registering
+// these (not just function-like nodes) is what lets a `type` edge resolve to a
+// local definition — a real port dependency — rather than an external leaf.
+function isTypeDeclLike(n) {
+  return (
+    ts.isClassDeclaration(n) ||
+    ts.isClassExpression(n) ||
+    ts.isInterfaceDeclaration(n) ||
+    ts.isTypeAliasDeclaration(n) ||
+    ts.isEnumDeclaration(n)
+  );
+}
+
+// The display name of a type declaration node (mirrors `nameForNode` for the
+// callable case): the declared name, or the variable it is assigned to for an
+// anonymous class expression.
+function typeNameForNode(n) {
+  if (n.name) return n.name.getText();
+  const p = n.parent;
+  if (p && ts.isVariableDeclaration(p) && p.name) return p.name.getText();
+  return "(anonymous type)";
+}
+
 function nameForNode(n) {
   if (
     (ts.isFunctionDeclaration(n) ||
@@ -202,8 +226,10 @@ for (const sf of program.getSourceFiles()) {
   if (!rel) continue;
   const relNoExt = rel.replace(/\.[cm]?tsx?$/, "");
   const walk = (n) => {
-    if (isFunctionLike(n)) {
-      const qualified = [...qualifierChain(n), nameForNode(n)].filter(Boolean).join(".");
+    const fnLike = isFunctionLike(n);
+    if (fnLike || isTypeDeclLike(n)) {
+      const name = fnLike ? nameForNode(n) : typeNameForNode(n);
+      const qualified = [...qualifierChain(n), name].filter(Boolean).join(".");
       let id = `${relNoExt}#${qualified}`;
       if (defs.has(id)) id += `@${lineOf(sf, n.getStart())}`;
       if (defs.has(id)) id += `~${anon++}`;
@@ -259,6 +285,110 @@ function addEffectLeaf(caller, symbol, effect, evFile, evLine, kind = "call") {
 // call-only view never anchored.
 function addRefLeaf(caller, symbol, effect, evFile, evLine) {
   addEffectLeaf(caller, symbol, effect, evFile, evLine, "reference");
+}
+
+// --- signature-type dependency edges -----------------------------------------
+// A `type` edge means: this function (or class) depends on that type because it
+// names it in its parameter types, return type, or extends/implements bounds. It
+// is a *porting* dependency, not a call — a function taking a `File` parameter
+// does not itself perform any filesystem effect — so it carries no effect root
+// and hinzu-core excludes it from effect propagation. It is emitted with
+// resolution "reference" (a static resolution to the type's declaration), NOT
+// with `addEdge` (whose resolution mirrors the kind and would be an invalid
+// "type" resolution). Deduped per (from, to): a type is a structural dependency,
+// not a count of mention sites.
+let typeEdges = 0;
+const typeEdgeSeen = new Set();
+function addTypeEdge(caller, callee, evFile, evLine) {
+  if (!caller || !callee || caller === callee) return;
+  const key = `${caller} ${callee}`;
+  if (typeEdgeSeen.has(key)) return;
+  typeEdgeSeen.add(key);
+  if (moduleMeta.has(caller)) moduleUsed.add(caller);
+  edges.push({
+    caller,
+    callee,
+    kind: "type",
+    resolution: "reference",
+    evidence_file: evFile,
+    evidence_line: evLine,
+  });
+  typeEdges++;
+}
+
+// Collect the named type entities inside a type node: every `TypeReferenceNode`'s
+// name, walking through generic type arguments, unions, intersections, arrays,
+// tuples, parenthesized/optional/rest types, and `extends`-style
+// `ExpressionWithTypeArguments`. Skips the structural type operators themselves —
+// only *named* references (which can resolve to a declaration) are collected.
+function collectTypeNames(typeNode, out) {
+  if (!typeNode) return;
+  const visit = (t) => {
+    if (!t) return;
+    if (ts.isTypeReferenceNode(t)) {
+      out.push(t.typeName);
+      if (t.typeArguments) t.typeArguments.forEach(visit);
+      return;
+    }
+    if (ts.isExpressionWithTypeArguments(t)) {
+      out.push(t.expression);
+      if (t.typeArguments) t.typeArguments.forEach(visit);
+      return;
+    }
+    ts.forEachChild(t, visit);
+  };
+  visit(typeNode);
+}
+
+// Resolve a type-name entity (an `Identifier` or `QualifiedName`, or a heritage
+// expression) to the id of a LOCAL definition, or null. Follows aliases, then
+// looks for a declaration that is both owned (in the analyzed project) and
+// registered as a definition — a class/interface/type-alias/enum (or, for a
+// value used as a base, a function-like). Built-in/lib types resolve to
+// `lib.*.d.ts` (not owned) → null → skipped. Type parameters resolve to a
+// `TypeParameterDeclaration` (never registered) → null → skipped.
+function resolveTypeDefId(nameNode) {
+  let s = checker.getSymbolAtLocation(nameNode);
+  if (s && s.flags & ts.SymbolFlags.Alias) {
+    try {
+      s = checker.getAliasedSymbol(s);
+    } catch {}
+  }
+  for (const d of s?.getDeclarations?.() || []) {
+    if (!ownedRel(d.getSourceFile().fileName)) continue;
+    const id = defIdByNode.get(d);
+    if (id) return id;
+  }
+  return null;
+}
+
+// Emit a `type` edge from `fromId` to each local type named in `nameNodes`.
+function emitTypeEdgesTo(fromId, nameNodes, rel, sf) {
+  if (!fromId) return;
+  for (const nameNode of nameNodes) {
+    const toId = resolveTypeDefId(nameNode);
+    if (toId) addTypeEdge(fromId, toId, rel, lineOf(sf, nameNode.getStart()));
+  }
+}
+
+// A function/method/arrow depends on the types in its parameter and return
+// signature.
+function emitSignatureTypeEdges(fnNode, fnId, rel, sf) {
+  if (!fnId) return;
+  const names = [];
+  for (const p of fnNode.parameters || []) collectTypeNames(p.type, names);
+  collectTypeNames(fnNode.type, names);
+  emitTypeEdgesTo(fnId, names, rel, sf);
+}
+
+// A class depends on the types in its extends/implements heritage clauses.
+function emitHeritageTypeEdges(classNode, classId, rel, sf) {
+  if (!classId) return;
+  const names = [];
+  for (const clause of classNode.heritageClauses || []) {
+    for (const t of clause.types || []) collectTypeNames(t, names);
+  }
+  emitTypeEdgesTo(classId, names, rel, sf);
 }
 
 const LIB_RE = /\/lib\.[^/]+\.d\.ts$/;
@@ -501,6 +631,17 @@ for (const sf of program.getSourceFiles()) {
       handleReference(n, caller, rel, line, importMap);
     }
 
+    // Signature-type dependency edges. The caller is the declaration ITSELF (its
+    // own def id), not the enclosing function: a function depends on the types in
+    // its signature, and a class on its bases. Unlike calls/references, these do
+    // not go through `caller`, so they are emitted here regardless of scope.
+    if (isFn) {
+      emitSignatureTypeEdges(n, defIdByNode.get(n), rel, sf);
+    }
+    if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+      emitHeritageTypeEdges(n, defIdByNode.get(n), rel, sf);
+    }
+
     ts.forEachChild(n, walk);
     if (isFn) stack.pop();
   };
@@ -639,8 +780,8 @@ for (const id of moduleUsed) {
 
 console.error(
   `hinzu-ts: call sites ${callSites} | resolved ${resolved} | edges ${edges.length} ` +
-    `(reference ${refEdges}, unknown ${unknownEdges}) | effect roots ${rootSet.size} | ` +
-    `module defs ${moduleUsed.size}`,
+    `(reference ${refEdges}, type ${typeEdges}, unknown ${unknownEdges}) | ` +
+    `effect roots ${rootSet.size} | module defs ${moduleUsed.size}`,
 );
 
 // --- emit the FactSet JSON ---------------------------------------------------

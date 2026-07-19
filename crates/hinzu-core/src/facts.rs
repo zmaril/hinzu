@@ -165,13 +165,27 @@ pub(crate) fn make_def(id: &str, file: &str, line_start: u32, line_end: u32) -> 
     }
 }
 
-/// Whether an edge is a resolved call or a bare reference to a symbol (for
-/// example, passing a function as a callback). Both carry effects.
+/// What kind of dependency an edge records.
+///
+/// - `Call` — a resolved call: the caller invokes the callee.
+/// - `Reference` — a bare reference to a symbol, for example passing a function
+///   as a callback. Both `Call` and `Reference` carry effects.
+/// - `Type` — a **signature type-dependency**: a function depends on a type
+///   named in its parameter types, return type, or (for a class) its
+///   `extends`/`implements` bounds. This is *not* a call — a function taking a
+///   `File` parameter does not itself perform any filesystem effect — so a
+///   `Type` edge deliberately does **not** propagate runtime effects (see
+///   [`EdgeKind::carries_effects`]). It exists so the porting dependency graph
+///   knows a function cannot be ported until the types in its signature are:
+///   `--from` closures follow `Type` edges. Adapters that resolve types (the
+///   TypeScript and Rust drivers today; an LSP/tree-sitter rung later) emit it;
+///   a call-only adapter simply omits it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EdgeKind {
     Call,
     Reference,
+    Type,
 }
 
 impl EdgeKind {
@@ -180,7 +194,18 @@ impl EdgeKind {
         match self {
             EdgeKind::Call => "call",
             EdgeKind::Reference => "reference",
+            EdgeKind::Type => "type",
         }
+    }
+
+    /// Whether this edge participates in effect propagation and the reverse
+    /// call graph the checker walks. `Call` and `Reference` carry effects; a
+    /// `Type` edge is a signature-type dependency for porting closures and must
+    /// **not** propagate runtime effects, so it is excluded from the effect
+    /// engine, the root-seeding, and every reverse-call-graph the policy check
+    /// consumes.
+    pub fn carries_effects(&self) -> bool {
+        matches!(self, EdgeKind::Call | EdgeKind::Reference)
     }
 }
 
@@ -192,6 +217,7 @@ impl FromStr for EdgeKind {
         match s {
             "call" => Ok(EdgeKind::Call),
             "reference" => Ok(EdgeKind::Reference),
+            "type" => Ok(EdgeKind::Type),
             other => anyhow::bail!("unknown edge kind: {other}"),
         }
     }
@@ -223,10 +249,13 @@ impl EdgeResolution {
 
     /// The resolution that mirrors an edge kind when the adapter records no
     /// finer provenance: a call resolves as `Call`, a reference as `Reference`.
+    /// A `Type` edge is a static resolution to a type declaration, so it mirrors
+    /// as `Reference`.
     pub fn for_kind(kind: EdgeKind) -> Self {
         match kind {
             EdgeKind::Call => EdgeResolution::Call,
             EdgeKind::Reference => EdgeResolution::Reference,
+            EdgeKind::Type => EdgeResolution::Reference,
         }
     }
 }
@@ -284,6 +313,21 @@ impl Edge {
             caller: caller.to_string(),
             callee: callee.to_string(),
             kind: EdgeKind::Reference,
+            resolution: EdgeResolution::Reference,
+            evidence_file: evidence_file.to_string(),
+            evidence_line,
+        }
+    }
+
+    /// A `Type` edge: a signature type-dependency from a function (or class) to a
+    /// type named in its parameters, return, or `extends`/`implements` bounds.
+    /// Resolves statically to the type's declaration (mirrored as `Reference`)
+    /// and does **not** carry effects — see [`EdgeKind::Type`].
+    pub fn type_dep(caller: &str, callee: &str, evidence_file: &str, evidence_line: u32) -> Self {
+        Edge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            kind: EdgeKind::Type,
             resolution: EdgeResolution::Reference,
             evidence_file: evidence_file.to_string(),
             evidence_line,
@@ -376,5 +420,70 @@ mod def_map {
     ) -> Result<BTreeMap<SymbolId, Definition>, D::Error> {
         let defs = Vec::<Definition>::deserialize(d)?;
         Ok(defs.into_iter().map(|d| (d.id.clone(), d)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_kind_type_round_trips_through_str() {
+        assert_eq!(EdgeKind::Type.as_str(), "type");
+        assert_eq!(EdgeKind::from_str("type").unwrap(), EdgeKind::Type);
+        // Every kind survives a str round trip.
+        for kind in [EdgeKind::Call, EdgeKind::Reference, EdgeKind::Type] {
+            assert_eq!(EdgeKind::from_str(kind.as_str()).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn only_call_and_reference_carry_effects() {
+        assert!(EdgeKind::Call.carries_effects());
+        assert!(EdgeKind::Reference.carries_effects());
+        // A signature-type dependency is not a call — it must not propagate
+        // effects.
+        assert!(!EdgeKind::Type.carries_effects());
+    }
+
+    #[test]
+    fn type_dep_constructor_is_a_type_edge_with_reference_resolution() {
+        let e = Edge::type_dep("app::foo", "app::Widget", "foo.rs", 3);
+        assert_eq!(e.kind, EdgeKind::Type);
+        // A type edge resolves statically to the type's declaration, mirrored as
+        // Reference — never an invalid "type" resolution.
+        assert_eq!(e.resolution, EdgeResolution::Reference);
+        assert_eq!(
+            EdgeResolution::for_kind(EdgeKind::Type),
+            EdgeResolution::Reference
+        );
+    }
+
+    #[test]
+    fn type_edge_survives_json_round_trip() {
+        let edge = Edge::type_dep("app::foo", "app::Widget", "foo.rs", 2);
+        let json = serde_json::to_string(&edge).unwrap();
+        // The kind serializes with the store/JSON spelling.
+        assert!(json.contains("\"kind\":\"type\""), "json was {json}");
+        let back: Edge = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, edge);
+        assert_eq!(back.kind, EdgeKind::Type);
+    }
+
+    #[test]
+    fn type_edge_ingests_through_factset_from_json() {
+        // The wire schema `hinzu check --facts` reads carries the type edge.
+        let json = r#"{
+            "definitions": [],
+            "edges": [{
+                "caller": "app::foo", "callee": "app::Widget",
+                "kind": "type", "resolution": "reference",
+                "evidence_file": "foo.rs", "evidence_line": 2
+            }],
+            "effect_roots": []
+        }"#;
+        let facts = FactSet::from_json(json).unwrap();
+        assert_eq!(facts.edges.len(), 1);
+        assert_eq!(facts.edges[0].kind, EdgeKind::Type);
     }
 }
