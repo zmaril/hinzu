@@ -5,7 +5,9 @@
 //! ready-frontier list; and a graph-confirmed-vs-name-only table. All CSS is
 //! inline and no asset is fetched, so the file renders offline.
 
-use hinzu_core::portdiff::{Band, BandCounts, FileEntry, PortDiffReport};
+use hinzu_core::portdiff::{
+    Band, BandCounts, FileEntry, MultiPackageReport, PackageRollup, PortDiffReport, RollupTotals,
+};
 
 /// Presentation metadata that is not in the report itself.
 pub struct HtmlMeta {
@@ -125,6 +127,264 @@ pub fn render_html(report: &PortDiffReport, meta: &HtmlMeta) -> String {
     h
 }
 
+// ===========================================================================
+// Combined whole-port dashboard (`--all`)
+// ===========================================================================
+
+/// Presentation metadata for the combined (`--all`) dashboard.
+pub struct MultiHtmlMeta {
+    /// A short label for the source ecosystem (e.g. its language + base dir).
+    pub source_label: String,
+    /// A short label for the target ecosystem.
+    pub target_label: String,
+    /// How the graphs were obtained ("extracted live per package" / cache note).
+    pub input_mode: String,
+}
+
+/// `(done + ported) / files` as a rounded percent — the structural upper bound.
+fn done_ported_pct(bands: &BandCounts, files: usize) -> String {
+    if files == 0 {
+        return "0%".to_string();
+    }
+    let v = (bands.done + bands.ported) as f64 / files as f64;
+    format!("{}%", (v * 100.0).round() as i64)
+}
+
+/// Render the combined whole-port dashboard: a top rollup with an overall
+/// completion bar and per-package band bars, a summary table with a TOTAL row,
+/// and a per-package section reusing the single-package band + wave view.
+pub fn render_multi_html(report: &MultiPackageReport, meta: &MultiHtmlMeta) -> String {
+    let t = &report.totals;
+    let mut h = String::with_capacity(64 * 1024);
+    h.push_str(&multi_head(report, meta));
+    h.push_str(&multi_hero(report));
+    h.push_str(&multi_overall_bar(t));
+    h.push_str(&multi_pkg_bars(&report.packages));
+    h.push_str(&multi_summary_table(report));
+    for pkg in &report.packages {
+        h.push_str(&multi_pkg_section(pkg));
+    }
+    h.push_str("</body></html>");
+    h
+}
+
+/// The combined dashboard `<head>` + header line.
+fn multi_head(report: &MultiPackageReport, meta: &MultiHtmlMeta) -> String {
+    let n = report.packages.len();
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Whole-port progress: {src} → {tgt}</title>
+<style>{css}{extra}</style></head><body>
+<h1>Whole-port progress: <span style="color:var(--acc)">{src}</span> → <span style="color:var(--acc)">{tgt}</span>, graph-matched</h1>
+<div class="sub">{n} packages · source <b>{sl}</b> · target <b>{tl}</b> · {mode} · {tf} source files · symbol-graph matching that survives file decomposition &amp; relocation</div>
+"#,
+        src = esc(&report.source_kind),
+        tgt = esc(&report.target_kind),
+        sl = esc(&meta.source_label),
+        tl = esc(&meta.target_label),
+        mode = esc(&meta.input_mode),
+        tf = report.totals.source_files_total,
+        css = CSS,
+        extra = MULTI_CSS,
+    )
+}
+
+/// The combined hero card row.
+fn multi_hero(report: &MultiPackageReport) -> String {
+    let t = &report.totals;
+    let n = report.packages.len();
+    format!(
+        r#"<div class="grid cards">
+  <div class="card"><div class="big">{pct}</div><div class="lbl">symbols name-matched</div><div class="note">{m}/{tot} matchable across {n} pkgs</div></div>
+  <div class="card"><div class="big" style="color:{done_c}">{done}</div><div class="lbl">DONE (test-verified)</div><div class="note">= {native} conformance native ✓</div></div>
+  <div class="card"><div class="big">{pd}</div><div class="lbl">PORTED + DONE files</div><div class="note">structural upper bound, of {tf}</div></div>
+  <div class="card"><div class="big">{tf}</div><div class="lbl">source files</div><div class="note">{n} packages</div></div>
+</div>
+"#,
+        pct = pct(t.symbols_matched_pct),
+        m = t.symbols_matched,
+        tot = t.symbols_total,
+        done_c = band_color(Band::Done),
+        done = t.bands.done,
+        native = t.conformance_native,
+        pd = t.bands.done + t.bands.ported,
+        tf = t.source_files_total,
+    )
+}
+
+/// The overall completion bar panel.
+fn multi_overall_bar(t: &RollupTotals) -> String {
+    bar_legend_panel(
+        r#"Overall port completion <span class="q">DONE test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span>"#,
+        &t.bands,
+        t.source_files_total,
+        true,
+    )
+}
+
+/// The per-package file-band bars.
+fn multi_pkg_bars(packages: &[PackageRollup]) -> String {
+    let mut rows = String::new();
+    for p in packages {
+        rows.push_str(&format!(
+            r#"<div class="pkgbar"><div class="nm">{nm}</div>{bar}<div class="pc">{pc}</div></div>"#,
+            nm = esc(&p.package),
+            bar = band_bar(&p.bands, p.source_files_total),
+            pc = done_ported_pct(&p.bands, p.source_files_total),
+        ));
+    }
+    format!(
+        r#"<div class="panel">
+  <h2>Per-package file bands <span class="q">bar % = (DONE + PORTED) / files, the structural upper bound</span></h2>
+  {rows}
+</div>
+"#,
+    )
+}
+
+/// The summary table with a TOTAL row.
+fn multi_summary_table(report: &MultiPackageReport) -> String {
+    let mut rows = String::new();
+    for p in &report.packages {
+        rows.push_str(&summary_row(
+            "",
+            &format!(r#"<td class="mono">{}</td>"#, esc(&p.package)),
+            p.source_files_total,
+            &p.bands,
+            p.symbols_matched,
+            p.symbols_total,
+            p.symbols_matched_pct,
+            p.conformance_native,
+            &p.wave_count.to_string(),
+        ));
+    }
+    let t = &report.totals;
+    let total_row = summary_row(
+        r#" class="total""#,
+        "<td>TOTAL</td>",
+        t.source_files_total,
+        &t.bands,
+        t.symbols_matched,
+        t.symbols_total,
+        t.symbols_matched_pct,
+        t.conformance_native,
+        "—",
+    );
+    format!(
+        r#"<div class="panel">
+  <h2>Summary table</h2>
+  <table>
+    <thead><tr><th>package</th><th class="num">files</th><th class="num" style="color:{dc}">DONE</th><th class="num" style="color:{pc}">PORTED</th><th class="num" style="color:{sc}">STARTED</th><th class="num" style="color:{nc}">NOT-STARTED</th><th class="num">symbols matched</th><th class="num">conf. native</th><th class="num">waves</th></tr></thead>
+    <tbody>{rows}{total_row}</tbody>
+  </table>
+  <div class="callout">DONE band == conformance native modules per package — the structural matcher and the test manifest agree on the test-verified floor. STARTED / PORTED are structural (graph-derived) and under-count by design.</div>
+</div>
+"#,
+        dc = band_color(Band::Done),
+        pc = band_color(Band::Ported),
+        sc = band_color(Band::Started),
+        nc = band_color(Band::NotStarted),
+    )
+}
+
+/// One summary-table row: `row_attr` is the `<tr>` attributes (`""` or
+/// ` class="total"`), `name_cell` the first `<td>`, `waves` the last cell's text.
+#[allow(clippy::too_many_arguments)]
+fn summary_row(
+    row_attr: &str,
+    name_cell: &str,
+    files: usize,
+    bands: &BandCounts,
+    sym_matched: usize,
+    sym_total: usize,
+    pct_val: f64,
+    native: usize,
+    waves: &str,
+) -> String {
+    format!(
+        r#"<tr{row_attr}>
+    {name_cell}
+    <td class="num">{files}</td>
+    <td class="num" style="color:{dc}">{d}</td>
+    <td class="num" style="color:{pc}">{p}</td>
+    <td class="num" style="color:{sc}">{s}</td>
+    <td class="num dim">{ns}</td>
+    <td class="num {cls}">{sm}/{st} ({smp})</td>
+    <td class="num">{native}</td>
+    <td class="num">{waves}</td>
+  </tr>"#,
+        dc = band_color(Band::Done),
+        d = bands.done,
+        pc = band_color(Band::Ported),
+        p = bands.ported,
+        sc = band_color(Band::Started),
+        s = bands.started,
+        ns = bands.not_started,
+        cls = pct_class(pct_val),
+        sm = sym_matched,
+        st = sym_total,
+        smp = pct(pct_val),
+    )
+}
+
+/// A per-package section reusing the single-package band + wave view.
+fn multi_pkg_section(pkg: &PackageRollup) -> String {
+    format!(
+        r#"<div class="sec"><h2 style="font-size:17px">{nm} <span class="q">{files} files · {sm}/{st} symbols matched ({smp})</span></h2>
+{bands}{waves}</div>
+"#,
+        nm = esc(&pkg.package),
+        files = pkg.source_files_total,
+        sm = pkg.symbols_matched,
+        st = pkg.symbols_total,
+        smp = pct(pkg.symbols_matched_pct),
+        bands = bands_panel(&pkg.report.overall.bands, pkg.source_files_total),
+        waves = waves_panel(&pkg.report),
+    )
+}
+
+/// The four-band legend row.
+fn band_legend(b: &BandCounts) -> String {
+    [
+        (Band::Done, b.done),
+        (Band::Ported, b.ported),
+        (Band::Started, b.started),
+        (Band::NotStarted, b.not_started),
+    ]
+    .iter()
+    .map(|(band, v)| {
+        format!(
+            r#"<span><i style="background:{c}"></i>{name} — {v}</span>"#,
+            c = band_color(*band),
+            name = band_name(*band),
+        )
+    })
+    .collect()
+}
+
+/// The name-match % → cell color class.
+fn pct_class(p: f64) -> &'static str {
+    if p >= 0.7 {
+        "hi"
+    } else if p >= 0.45 {
+        "mid"
+    } else {
+        "lo"
+    }
+}
+
+/// Extra styles for the combined view, layered over [`CSS`].
+const MULTI_CSS: &str = r#"
+.pkgbar{display:flex;align-items:center;gap:14px;margin:9px 0}
+.pkgbar .nm{width:130px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+.pkgbar .bar{flex:1}
+.pkgbar .pc{width:52px;text-align:right;font-variant-numeric:tabular-nums;color:var(--dim);font-size:12px}
+.big-bar{height:22px}
+.sec{margin-top:34px;border-top:1px solid var(--line);padding-top:12px}
+tr.total{border-top:2px solid var(--line);font-weight:700}
+a{color:var(--acc)}"#;
+
 /// The `<head>`, style block, and header line.
 fn head(report: &PortDiffReport, meta: &HtmlMeta) -> String {
     let o = &report.overall;
@@ -188,29 +448,31 @@ fn cards(report: &PortDiffReport) -> String {
 
 /// The file-band bar + legend panel.
 fn bands_panel(b: &BandCounts, total: usize) -> String {
-    let legend = [
-        (Band::Done, b.done),
-        (Band::Ported, b.ported),
-        (Band::Started, b.started),
-        (Band::NotStarted, b.not_started),
-    ]
-    .iter()
-    .map(|(band, v)| {
-        format!(
-            r#"<span><i style="background:{c}"></i>{name} — {v}</span>"#,
-            c = band_color(*band),
-            name = band_name(*band),
-        )
-    })
-    .collect::<String>();
+    bar_legend_panel(
+        r#"File bands <span class="q">DONE = test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span>"#,
+        b,
+        total,
+        false,
+    )
+}
+
+/// A `panel` wrapping a heading, a full-width band bar, and the band legend.
+/// Shared by the single-package file-band panel and the combined overall-
+/// completion panel; `big` swaps in the taller `big-bar` variant.
+fn bar_legend_panel(heading: &str, bands: &BandCounts, total: usize, big: bool) -> String {
+    let bar = if big {
+        band_bar(bands, total).replace(r#"class="bar""#, r#"class="bar big-bar""#)
+    } else {
+        band_bar(bands, total)
+    };
     format!(
         r#"<div class="panel">
-  <h2>File bands <span class="q">DONE = test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span></h2>
+  <h2>{heading}</h2>
   {bar}
   <div class="legend">{legend}</div>
 </div>
 "#,
-        bar = band_bar(b, total),
+        legend = band_legend(bands),
     )
 }
 

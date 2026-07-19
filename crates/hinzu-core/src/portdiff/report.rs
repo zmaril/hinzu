@@ -210,6 +210,120 @@ pub struct Fidelity {
     pub notes: Vec<String>,
 }
 
+/// One package's headline numbers, plus the full per-package report embedded so
+/// a combined `--out` is self-contained. The headline fields are lifted out of
+/// [`PortDiffReport`] for a compact rollup table without re-walking the report.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackageRollup {
+    /// The `--package` name.
+    pub package: String,
+    /// Distinct source files considered (the band denominator).
+    pub source_files_total: usize,
+    /// Per-band file counts for this package.
+    pub bands: BandCounts,
+    /// Matchable source symbols (the match denominator).
+    pub symbols_total: usize,
+    /// Matchable source symbols that matched a target symbol.
+    pub symbols_matched: usize,
+    /// `symbols_matched / symbols_total`, rounded to 3 dp (`0.0` when empty).
+    pub symbols_matched_pct: f64,
+    /// Conformance native (test-verified) modules for this package.
+    pub conformance_native: usize,
+    /// Files banded DONE — equals `conformance_native` when the oracle holds.
+    pub done_band: usize,
+    /// How many waves the source port plan has.
+    pub wave_count: usize,
+    /// The full per-package report, embedded so the combined JSON is complete.
+    pub report: PortDiffReport,
+}
+
+/// The summed totals across every package in a [`MultiPackageReport`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RollupTotals {
+    /// Summed source files across all packages.
+    pub source_files_total: usize,
+    /// Summed per-band file counts across all packages.
+    pub bands: BandCounts,
+    /// Summed matchable source symbols.
+    pub symbols_total: usize,
+    /// Summed matched source symbols.
+    pub symbols_matched: usize,
+    /// Overall `symbols_matched / symbols_total`, rounded to 3 dp.
+    pub symbols_matched_pct: f64,
+    /// Summed conformance native modules.
+    pub conformance_native: usize,
+    /// Summed DONE-banded files.
+    pub done_band: usize,
+}
+
+/// The combined whole-port rollup: every package's [`PortDiffReport`] plus the
+/// summed totals. The serialized shape of `hinzu port-diff --all`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiPackageReport {
+    /// The source language / ecosystem tag echoed from config (`"ts"`).
+    pub source_kind: String,
+    /// The target language / ecosystem tag (`"rust"`).
+    pub target_kind: String,
+    /// Per-package rollups, in the order the packages were run.
+    pub packages: Vec<PackageRollup>,
+    /// The summed totals across every package.
+    pub totals: RollupTotals,
+}
+
+impl MultiPackageReport {
+    /// Aggregate per-package reports into the combined rollup. Each `(name,
+    /// report)` pair is lifted to a [`PackageRollup`] (headline numbers +
+    /// embedded report), and the [`RollupTotals`] are the element-wise sums, with
+    /// the overall match % recomputed from the summed matched / total (not an
+    /// average of per-package percentages). Deterministic: package order is the
+    /// caller's order, nothing is sorted or randomized.
+    pub fn aggregate(
+        source_kind: &str,
+        target_kind: &str,
+        reports: Vec<(String, PortDiffReport)>,
+    ) -> MultiPackageReport {
+        let mut packages = Vec::with_capacity(reports.len());
+        let mut totals = RollupTotals::default();
+        for (name, report) in reports {
+            let o = &report.overall;
+            let cc = &report.conformance_crosscheck;
+            totals.source_files_total += o.source_files_total;
+            totals.bands.done += o.bands.done;
+            totals.bands.ported += o.bands.ported;
+            totals.bands.started += o.bands.started;
+            totals.bands.not_started += o.bands.not_started;
+            totals.symbols_total += o.symbols_total;
+            totals.symbols_matched += o.symbols_matched;
+            totals.conformance_native += cc.native_modules;
+            totals.done_band += cc.done_band;
+            packages.push(PackageRollup {
+                package: name,
+                source_files_total: o.source_files_total,
+                bands: o.bands.clone(),
+                symbols_total: o.symbols_total,
+                symbols_matched: o.symbols_matched,
+                symbols_matched_pct: o.symbols_matched_pct,
+                conformance_native: cc.native_modules,
+                done_band: cc.done_band,
+                wave_count: report.waves.len(),
+                report,
+            });
+        }
+        totals.symbols_matched_pct = if totals.symbols_total > 0 {
+            ((totals.symbols_matched as f64 / totals.symbols_total as f64) * 1000.0).round()
+                / 1000.0
+        } else {
+            0.0
+        };
+        MultiPackageReport {
+            source_kind: source_kind.to_string(),
+            target_kind: target_kind.to_string(),
+            packages,
+            totals,
+        }
+    }
+}
+
 /// The complete port-diff report, ready to serialize as JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortDiffReport {
@@ -234,4 +348,117 @@ pub struct PortDiffReport {
     pub conformance_crosscheck: ConformanceCrosscheck,
     /// The honest fidelity block.
     pub fidelity: Fidelity,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal [`PortDiffReport`] carrying just the headline numbers the rollup
+    /// reads — every other field is an empty default. `wave_count` empty waves are
+    /// pushed so `report.waves.len()` is exact.
+    #[allow(clippy::too_many_arguments)]
+    fn tiny(
+        files: usize,
+        bands: (usize, usize, usize, usize),
+        sym_total: usize,
+        sym_matched: usize,
+        native: usize,
+        done_band: usize,
+        wave_count: usize,
+    ) -> PortDiffReport {
+        let bands = BandCounts {
+            done: bands.0,
+            ported: bands.1,
+            started: bands.2,
+            not_started: bands.3,
+        };
+        PortDiffReport {
+            source_kind: "ts".to_string(),
+            target_kind: "rust".to_string(),
+            overall: Overall {
+                source_files_total: files,
+                symbols_total: sym_total,
+                symbols_synthetic_excluded: 0,
+                symbols_matched: sym_matched,
+                symbols_matched_pct: if sym_total > 0 {
+                    (sym_matched as f64 / sym_total as f64 * 1000.0).round() / 1000.0
+                } else {
+                    0.0
+                },
+                tier_counts: TierCounts::default(),
+                graph: GraphConfirmSummary::default(),
+                bands: bands.clone(),
+            },
+            file_map_summary: FileMapSummary::default(),
+            files: Vec::new(),
+            waves: vec![
+                WaveBand {
+                    wave: 0,
+                    files: 0,
+                    bands: BandCounts::default(),
+                    symbols_total: 0,
+                    symbols_matched: 0,
+                    symbols_pct: 0.0,
+                };
+                wave_count
+            ],
+            ready_frontier: Vec::new(),
+            ready_frontier_total: 0,
+            naive_vs_graph: NaiveVsGraph {
+                naive_files_matched: 0,
+                graph_files_matched: 0,
+                recovered_files: Vec::new(),
+                recovered_count: 0,
+            },
+            conformance_crosscheck: ConformanceCrosscheck {
+                native_modules: native,
+                native_files: Vec::new(),
+                done_band,
+                ported_plus_done: bands.done + bands.ported,
+                note: String::new(),
+            },
+            fidelity: Fidelity {
+                structural_not_correctness: true,
+                matchable_denominator: String::new(),
+                cluster_caveat: String::new(),
+                notes: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn aggregate_sums_totals_and_recomputes_overall_pct() {
+        // Two tiny packages: 10 files (D1 P2 S3 N4), 20 symbols 10 matched, and
+        // 6 files (D0 P1 S2 N3), 30 symbols 20 matched.
+        let a = tiny(10, (1, 2, 3, 4), 20, 10, 1, 1, 2);
+        let b = tiny(6, (0, 1, 2, 3), 30, 20, 0, 0, 1);
+        let multi = MultiPackageReport::aggregate(
+            "ts",
+            "rust",
+            vec![("ai".to_string(), a), ("agent".to_string(), b)],
+        );
+
+        // Per-package rollups preserve order + headline numbers + wave counts.
+        assert_eq!(multi.packages.len(), 2);
+        assert_eq!(multi.packages[0].package, "ai");
+        assert_eq!(multi.packages[0].wave_count, 2);
+        assert_eq!(multi.packages[1].package, "agent");
+        assert_eq!(multi.packages[1].source_files_total, 6);
+
+        // Totals are the element-wise sums.
+        let t = &multi.totals;
+        assert_eq!(t.source_files_total, 16);
+        assert_eq!(t.bands.done, 1);
+        assert_eq!(t.bands.ported, 3);
+        assert_eq!(t.bands.started, 5);
+        assert_eq!(t.bands.not_started, 7);
+        assert_eq!(t.symbols_total, 50);
+        assert_eq!(t.symbols_matched, 30);
+        assert_eq!(t.conformance_native, 1);
+        assert_eq!(t.done_band, 1);
+        // Overall % is recomputed from the sums (30/50 = 0.6), not an average of
+        // the per-package 0.5 and 0.667.
+        assert_eq!(t.symbols_matched_pct, 0.6);
+    }
 }

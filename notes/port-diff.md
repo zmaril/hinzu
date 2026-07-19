@@ -31,6 +31,11 @@ hinzu port-diff --config notes/port-pi-atilla.toml --package ai \
 HINZU_RUSTC_DRIVER=/path/to/hinzu-rustc-driver \
   hinzu port-diff --config notes/port-pi-atilla.toml --package ai --out report.json
 
+# the whole port: every package in one combined rollup + dashboard
+HINZU_RUSTC_DRIVER=/path/to/hinzu-rustc-driver \
+  hinzu port-diff --config notes/port-pi-atilla.toml --all \
+  --cache-dir .portcache --out all.json --html all.html
+
 # scoped to what one entry point needs, and which of it is unported
 hinzu port-diff --config notes/port-pi-atilla.toml --package ai \
   --source-graph pi-ai-graph.json --target-graph atilla-ai-graph.json \
@@ -93,6 +98,58 @@ size is printed to stderr, e.g.:
 scoped to closure of src/providers/all#builtinProviders: 61 symbols across 53 files (of 3517)
 ```
 
+## `--all` — the whole-port rollup
+
+`--all` runs port-diff for **every** `[packages.*]` in `--config` and emits a
+single combined rollup instead of one package's report. It extracts each package
+live exactly the way the single-package path does — the source from its
+`source_dir`, the target from its `target_dir` (a Rust target still needs
+`HINZU_RUSTC_DRIVER`) — runs the diff per package, and aggregates the results.
+`--out` then writes the combined JSON and `--html` the combined dashboard.
+
+`--all` is whole-port, so it rejects the single-package selectors rather than
+silently ignoring them:
+
+- `--all` **with** `--package` is an error (pick one).
+- `--all` **with** `--from` is an error — a rooted view is inherently
+  single-package (it scopes one source to one entry point's closure), so scope a
+  single `--package` instead.
+- `--all` **with** any pre-extracted override (`--source-graph` / `--source-plan`
+  / `--target-graph`) is an error — those name one package's graphs; `--all`
+  extracts per package. Use `--cache-dir` (below) for reuse across runs.
+
+### `--cache-dir <dir>` — reusable per-package extraction
+
+Extraction is the expensive part, and `--all` does it five times over. With
+`--cache-dir <dir>`, each package's extracted artifacts are cached as
+`<dir>/<pkg>-source-graph.json`, `<dir>/<pkg>-source-plan.json`, and
+`<dir>/<pkg>-target-graph.json`: a file that is already present is read (that
+package's extraction is skipped), and one that is missing is written after a live
+extraction. So the first `--all` run does the full (slow) extraction and every
+re-run is fast and reproducible. Delete the dir to force a fresh extraction.
+
+### The combined JSON shape
+
+`--all --out` writes a `MultiPackageReport`:
+
+| field | meaning |
+| --- | --- |
+| `source_kind` / `target_kind` | the language pair, echoed from config |
+| `packages[]` | one `PackageRollup` per package, in config (sorted-name) order |
+| `totals` | the summed `RollupTotals` across every package |
+
+Each `packages[]` entry carries the package's **headline numbers** —
+`source_files_total`, per-band `bands` (`done` / `ported` / `started` /
+`not_started`), `symbols_total` / `symbols_matched` / `symbols_matched_pct`,
+`conformance_native`, `done_band`, `wave_count` — **and** the full per-package
+`report` (a complete `PortDiffReport`, so the combined JSON is self-contained).
+`totals` sums the files, bands, symbols, and conformance counts, with
+`symbols_matched_pct` recomputed from the summed matched / total (not an average
+of the per-package percentages). The combined `--html` dashboard renders a top
+rollup (an overall completion bar + per-package band bars + a summary table with
+a TOTAL row) followed by a per-package section reusing the single-package band /
+wave view.
+
 ## The config file
 
 One toml describes several same-shape package ports with a single shared naming
@@ -135,9 +192,9 @@ ruleset. See [`notes/port-pi-atilla.toml`](./port-pi-atilla.toml) for the workin
 | `conformance_package` | the manifest `package` this crate's conformance modules are filed under; the manifest `src` prefix stripped to recover a source path is `packages/<conformance_package>/` |
 
 The CLI merges the shared `[naming]` block with the selected package's
-crate-specific fields into one `PortDiffConfig`. The code is structured so a loop
-over `packages` (an all-packages sweep) is a small addition; today a single
-`--package` is required, and omitting it lists the available names.
+crate-specific fields into one `PortDiffConfig`. A single `--package` diffs one
+entry; `--all` (see above) loops over every `packages` table for the whole-port
+rollup. Omitting both lists the available names and the `--all` option.
 
 ## Reading the report — the bands
 

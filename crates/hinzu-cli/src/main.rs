@@ -129,10 +129,25 @@ struct PortDiffArgs {
     /// package). See `notes/port-diff.md` for the schema.
     #[arg(long)]
     config: PathBuf,
-    /// Which package in the config to diff. Required — if omitted, the available
-    /// package names are listed. (The all-packages sweep is a separate step.)
+    /// Which package in the config to diff. Give this or `--all`; if neither is
+    /// given, the available package names (and `--all`) are listed. Mutually
+    /// exclusive with `--all`.
     #[arg(long)]
     package: Option<String>,
+    /// Run port-diff for EVERY package in `--config` and emit a combined rollup
+    /// JSON (`--out`) + a combined HTML dashboard (`--html`). Mutually exclusive
+    /// with `--package`, with `--from` (a rooted view is single-package), and
+    /// with the pre-extracted `--source-graph` / `--source-plan` / `--target-graph`
+    /// overrides (those are single-package; `--all` extracts per package). Use
+    /// `--cache-dir` to make the per-package extraction reusable across runs.
+    #[arg(long)]
+    all: bool,
+    /// A directory for per-package extracted graphs/plans, used only with `--all`.
+    /// For each package, `<dir>/<pkg>-{source-graph,source-plan,target-graph}.json`
+    /// is read when present (skipping that package's extraction) and written after
+    /// a live extraction — so re-runs avoid the slow Rust/TypeScript re-extraction.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Override: a pre-extracted SOURCE graph JSON (`hinzu graph --out`). Skips
     /// the live source extraction. Extraction is slow, so pre-extracting once and
     /// re-running the diff off the JSON is the common path.
@@ -303,10 +318,14 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
 /// `--html` — a self-contained dashboard.
 fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
     let cfg = portdiff_config::MultiPackageConfig::load(&args.config)?;
+    if args.all {
+        return port_diff_all(&cfg, &args);
+    }
     let package = match &args.package {
         Some(p) => p.clone(),
         None => anyhow::bail!(
-            "select a package with --package <name>; available packages: {}",
+            "select a package with --package <name>, or --all to sweep every package; \
+             available packages: {}",
             cfg.package_names().join(", ")
         ),
     };
@@ -341,22 +360,7 @@ fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
     // ---- target graph: load an override, else extract live ----------------
     let target_graph = match &args.target_graph {
         Some(p) => load_graph(p)?,
-        None => {
-            if resolved.config.target_kind == "rust"
-                && std::env::var_os("HINZU_RUSTC_DRIVER").is_none()
-            {
-                anyhow::bail!(
-                    "extracting the Rust target graph needs the StableMIR driver: set \
-                     HINZU_RUSTC_DRIVER to a prebuilt hinzu-rustc-driver binary (built on its \
-                     pinned nightly), or pass --target-graph <json> to use a pre-extracted graph"
-                );
-            }
-            eprintln!(
-                "extracting target graph from {}",
-                resolved.target_path.display()
-            );
-            build_graph_from_source(&resolved.target_path, None, None)?
-        }
+        None => extract_target_graph_live(&resolved)?,
     };
 
     // The conformance manifest is read HERE (the CLI is outside the functional
@@ -393,6 +397,174 @@ fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
     let json = serde_json::to_string_pretty(&report)
         .context("serializing the port-diff report to JSON")?;
     write_json(args.out.as_deref(), &json, "port-diff report")
+}
+
+/// The `hinzu port-diff --all` flow. Runs port-diff for EVERY package in the
+/// config — extracting each package's source graph + plan and target graph the
+/// same way the single-package live path does (with the same honest
+/// `HINZU_RUSTC_DRIVER` requirement for a Rust target) — aggregates the
+/// per-package reports into a [`MultiPackageReport`], and writes the combined JSON
+/// (`--out`) and, with `--html`, a combined dashboard. `--cache-dir` makes the
+/// per-package extraction reusable across runs.
+fn port_diff_all(
+    cfg: &portdiff_config::MultiPackageConfig,
+    args: &PortDiffArgs,
+) -> Result<ExitCode> {
+    // `--all` is whole-port and multi-package, so the single-package selectors and
+    // overrides are rejected rather than silently ignored.
+    if args.package.is_some() {
+        anyhow::bail!("--all runs every package; drop --package (they are mutually exclusive)");
+    }
+    if !args.from.is_empty() {
+        anyhow::bail!(
+            "--from scopes a single rooted view, which is single-package; drop --all or --from"
+        );
+    }
+    if args.source_graph.is_some() || args.source_plan.is_some() || args.target_graph.is_some() {
+        anyhow::bail!(
+            "--source-graph / --source-plan / --target-graph are single-package overrides; \
+             --all extracts per package (use --cache-dir to reuse extractions across runs)"
+        );
+    }
+
+    let mut reports: Vec<(String, hinzu_core::portdiff::PortDiffReport)> = Vec::new();
+    for name in cfg.package_names() {
+        let resolved = cfg.resolve(&name)?;
+        eprintln!("=== port-diff {name} ===");
+
+        // Source graph + plan, then target graph — each cached under --cache-dir
+        // when set, else extracted live exactly like the single-package path.
+        let source_graph =
+            cached_or_extract(args.cache_dir.as_deref(), &name, "source-graph", || {
+                eprintln!(
+                    "extracting source graph from {}",
+                    resolved.source_path.display()
+                );
+                build_graph_from_source(&resolved.source_path, None, None)
+            })?;
+        let source_plan = cached_or_build_plan(args.cache_dir.as_deref(), &name, &source_graph)?;
+        let target_graph =
+            cached_or_extract(args.cache_dir.as_deref(), &name, "target-graph", || {
+                extract_target_graph_live(&resolved)
+            })?;
+
+        let manifest_json = read_conformance_manifest(&resolved.manifest_path);
+        let report = hinzu_core::portdiff::port_diff(
+            &source_graph,
+            &source_plan,
+            &target_graph,
+            &resolved.config,
+            manifest_json.as_deref(),
+        );
+        reports.push((name, report));
+    }
+
+    let multi = hinzu_core::portdiff::MultiPackageReport::aggregate(
+        &cfg.source_kind,
+        &cfg.target_kind,
+        reports,
+    );
+
+    if let Some(html_path) = &args.html {
+        let meta = portdiff_html::MultiHtmlMeta {
+            source_label: format!("{} · base {}", cfg.source_kind, cfg.base_dir),
+            target_label: cfg.target_kind.clone(),
+            input_mode: match &args.cache_dir {
+                Some(d) => format!("extracted per package (cache {})", d.display()),
+                None => "extracted live per package".to_string(),
+            },
+        };
+        let html = portdiff_html::render_multi_html(&multi, &meta);
+        std::fs::write(html_path, html).with_context(|| {
+            format!("writing combined HTML dashboard to {}", html_path.display())
+        })?;
+        eprintln!("wrote combined HTML dashboard to {}", html_path.display());
+    }
+
+    let json =
+        serde_json::to_string_pretty(&multi).context("serializing the combined report to JSON")?;
+    write_json(args.out.as_deref(), &json, "combined port-diff report")
+}
+
+/// Extract a package's target graph live from its `target_dir`, requiring the
+/// StableMIR driver (`HINZU_RUSTC_DRIVER`) when the target is Rust — the same
+/// honest failure the single-package and `--all` paths share rather than faking
+/// an analysis. Pre-extract the target graph to skip this (single-package
+/// `--target-graph`, or a populated `--cache-dir`).
+fn extract_target_graph_live(
+    resolved: &portdiff_config::ResolvedPackage,
+) -> Result<hinzu_core::graph::GraphOutput> {
+    if resolved.config.target_kind == "rust" && std::env::var_os("HINZU_RUSTC_DRIVER").is_none() {
+        anyhow::bail!(
+            "extracting the Rust target graph needs the StableMIR driver: set \
+             HINZU_RUSTC_DRIVER to a prebuilt hinzu-rustc-driver binary (built on its \
+             pinned nightly), or supply a pre-extracted target graph"
+        );
+    }
+    eprintln!(
+        "extracting target graph from {}",
+        resolved.target_path.display()
+    );
+    build_graph_from_source(&resolved.target_path, None, None)
+}
+
+/// Read a per-package graph from the cache (`<dir>/<pkg>-<kind>.json`) when it is
+/// present, else run `extract`, write the result to the cache (when a cache dir is
+/// set), and return it. `kind` is `"source-graph"` or `"target-graph"`.
+fn cached_or_extract(
+    cache_dir: Option<&Path>,
+    pkg: &str,
+    kind: &str,
+    extract: impl FnOnce() -> Result<hinzu_core::graph::GraphOutput>,
+) -> Result<hinzu_core::graph::GraphOutput> {
+    if let Some(dir) = cache_dir {
+        let path = dir.join(format!("{pkg}-{kind}.json"));
+        if path.is_file() {
+            eprintln!("cache hit: {}", path.display());
+            return load_graph(&path);
+        }
+        let graph = extract()?;
+        write_cache(dir, &path, &graph, "graph")?;
+        return Ok(graph);
+    }
+    extract()
+}
+
+/// The source plan: read from `<dir>/<pkg>-source-plan.json` when present, else
+/// build it from the source graph and cache it. Keeps `--all` reproducible without
+/// re-deriving the plan on every run.
+fn cached_or_build_plan(
+    cache_dir: Option<&Path>,
+    pkg: &str,
+    source_graph: &hinzu_core::graph::GraphOutput,
+) -> Result<hinzu_core::plan::PlanOutput> {
+    if let Some(dir) = cache_dir {
+        let path = dir.join(format!("{pkg}-source-plan.json"));
+        if path.is_file() {
+            eprintln!("cache hit: {}", path.display());
+            return load_plan(&path);
+        }
+        let plan =
+            hinzu_core::plan::build_plan(source_graph, hinzu_core::plan::PlanOpts::default());
+        write_cache(dir, &path, &plan, "plan")?;
+        return Ok(plan);
+    }
+    Ok(hinzu_core::plan::build_plan(
+        source_graph,
+        hinzu_core::plan::PlanOpts::default(),
+    ))
+}
+
+/// Write a cache artifact as pretty JSON, creating the cache dir if needed.
+fn write_cache<T: serde::Serialize>(dir: &Path, path: &Path, value: &T, what: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating cache dir {}", dir.display()))?;
+    let json = serde_json::to_string_pretty(value)
+        .with_context(|| format!("serializing cached {what}"))?;
+    std::fs::write(path, format!("{json}\n"))
+        .with_context(|| format!("writing cached {what} to {}", path.display()))?;
+    eprintln!("cached {} → {}", what, path.display());
+    Ok(())
 }
 
 /// Read a pre-extracted [`GraphOutput`] JSON.

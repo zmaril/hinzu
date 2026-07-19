@@ -61,8 +61,8 @@ mod report;
 pub use config::{ConformanceConfig, NamingRules, PortDiffConfig};
 pub use report::{
     Band, BandCounts, ConformanceCrosscheck, Fidelity, FileEntry, FileMapSummary,
-    FileTierBreakdown, FrontierEntry, GraphConfirmSummary, NaiveVsGraph, Overall, PortDiffReport,
-    TierCounts, WaveBand,
+    FileTierBreakdown, FrontierEntry, GraphConfirmSummary, MultiPackageReport, NaiveVsGraph,
+    Overall, PackageRollup, PortDiffReport, RollupTotals, TierCounts, WaveBand,
 };
 
 // ===========================================================================

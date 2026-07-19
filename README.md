@@ -100,8 +100,11 @@ port's graph by **symbol-graph structure** (so it survives file rename and
 decomposition), bands every source file **DONE / PORTED / STARTED / NOT-STARTED**,
 and emits a ready-frontier — unported files whose source-dependencies are all
 ported — plus, with `--html`, a self-contained dashboard. It is config-driven:
-one toml describes several packages under a shared naming ruleset. `--from`
-scopes it too.
+one toml describes several packages under a shared naming ruleset. `--all` sweeps
+**every** package into one combined rollup JSON + dashboard (with `--cache-dir`
+to make the repeated extraction reusable); `--from` scopes a single `--package`
+to one entry point's closure (a rooted view is single-package, so it is not
+combined with `--all`).
 
 **Fidelity, honestly.** The graph is **call-only** — it misses higher-order and
 dynamic dispatch, and file edges are *inferred* from call edges (there is no
