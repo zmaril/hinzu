@@ -98,6 +98,70 @@ size is printed to stderr, e.g.:
 scoped to closure of src/providers/all#builtinProviders: 61 symbols across 53 files (of 3517)
 ```
 
+The closure follows every dependency edge the source graph carries — **call,
+reference, and signature-type** edges. Since the TypeScript and Rust adapters emit
+`kind = "type"` edges (a function → the types named in its parameters, return, or a
+class's `extends`/`implements` bases), a `--from` closure pulls in the *types* an
+entry point needs ported, not just what it calls — so the "what does this need"
+answer is complete over both control-flow and type dependencies.
+
+## `--all --from` — the cross-package closure
+
+`--from` with a single `--package` scopes one package's source. `--from` with
+`--all` is the **cross-package closure**: "what does this entry point need, across
+*every* package, and how much of it is ported?" It is the natural query for a
+bootstrap entry — a CLI's `main`, whose closure reaches down through several
+packages.
+
+```sh
+# what the whole pi CLI needs to boot, across ai / agent / tui / coding-agent
+HINZU_RUSTC_DRIVER=/path/to/hinzu-rustc-driver \
+  hinzu port-diff --config notes/port-pi-atilla.toml --all \
+  --from 'coding-agent/src/main#main' \
+  --cache-dir .portcache --out cli-crosspkg.json --html cli-crosspkg.html
+```
+
+How it works:
+
+1. **Union source graph.** A single source graph is built whose files span every
+   package — extracted over the nearest project root that contains all the
+   packages' `source_dir`s, so the TypeScript compiler resolves cross-package
+   workspace imports to *local source* (not external stubs). Its file paths are
+   workspace-relative (`packages/<pkg>/src/…`). The union is cached as
+   `<cache-dir>/union-source-graph.json`, reusable across runs. (The core union
+   primitive is `hinzu_core::graph::merge_graphs`, which unions symbols by id —
+   de-duplicating, and upgrading an external leaf to a local definition when a
+   later graph defines it — and unions edges; it is what a multi-extraction path
+   composes with.)
+2. **Closure over the union.** `--from` is resolved against the union and the
+   dependency closure taken over it, so it **crosses package boundaries**,
+   following call, reference, and type edges into whatever the entry transitively
+   needs, wherever it lives.
+3. **Per-file → package routing.** Each closure file is routed to its owning
+   package by matching its path prefix (`packages/ai/…` → package `ai`). Each
+   package's slice is re-rooted to `src/…` (`hinzu_core::graph::reroot_subgraph`)
+   so the package's own `PortDiffConfig` — naming rules, crate prefix, conformance
+   package — matches it unchanged.
+4. **Per-package diff + rollup.** Each slice is matched against that package's
+   target crate (extracted live, or from `--cache-dir`), banded DONE / PORTED /
+   STARTED / NOT-STARTED, and aggregated into a `RootedCrossPackageReport`: the
+   overall closure size, how many packages it spans, each package's slice
+   breakdown, and the summed totals. `--html` renders the whole-port dashboard
+   (per-package sections + the closure rollup) for the closure.
+
+The single-package overrides (`--source-graph` / `--source-plan` /
+`--target-graph`) name one package's graphs and so apply only to the
+single-package form; `--all --from` extracts the union + a target per package
+(use `--cache-dir` to reuse). The `RootedCrossPackageReport` shape:
+
+| field | meaning |
+| --- | --- |
+| `roots` | the resolved entry roots the closure was taken from |
+| `closure_symbols` / `closure_files` | union-closure size (across every package) |
+| `packages_spanned` | how many packages have ≥1 closure file |
+| `packages[]` | per-package slice: `closure_files`, `closure_symbols`, and the package's full port-diff `rollup` over just that slice |
+| `totals` | the summed `RollupTotals` across the slices |
+
 ## `--all` — the whole-port rollup
 
 `--all` runs port-diff for **every** `[packages.*]` in `--config` and emits a
@@ -111,12 +175,13 @@ live exactly the way the single-package path does — the source from its
 silently ignoring them:
 
 - `--all` **with** `--package` is an error (pick one).
-- `--all` **with** `--from` is an error — a rooted view is inherently
-  single-package (it scopes one source to one entry point's closure), so scope a
-  single `--package` instead.
 - `--all` **with** any pre-extracted override (`--source-graph` / `--source-plan`
   / `--target-graph`) is an error — those name one package's graphs; `--all`
   extracts per package. Use `--cache-dir` (below) for reuse across runs.
+
+`--all` **with** `--from` is *not* an error — it is the cross-package closure
+(see "`--all --from`" above), a rooted view that spans every package rather than
+the whole-port sweep.
 
 ### `--cache-dir <dir>` — reusable per-package extraction
 

@@ -62,7 +62,8 @@ pub use config::{ConformanceConfig, NamingRules, PortDiffConfig};
 pub use report::{
     Band, BandCounts, ConformanceCrosscheck, Fidelity, FileEntry, FileMapSummary,
     FileTierBreakdown, FrontierEntry, GraphConfirmSummary, MultiPackageReport, NaiveVsGraph,
-    Overall, PackageRollup, PortDiffReport, RollupTotals, TierCounts, WaveBand,
+    Overall, PackageClosureRollup, PackageRollup, PortDiffReport, RollupTotals,
+    RootedCrossPackageReport, TierCounts, WaveBand,
 };
 
 // ===========================================================================

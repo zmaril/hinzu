@@ -389,13 +389,31 @@ fn condense(adj: &BTreeMap<String, BTreeSet<String>>) -> SccCondensation {
 }
 
 /// Per-node metadata for a local definition, carried into [`assemble_graph`].
-/// External nodes have no metadata (`None`).
-struct NodeMeta {
+/// External nodes have no metadata (`None`). Visible to the `merge` submodule,
+/// which reassembles graphs from existing [`SymbolNode`]s.
+pub(super) struct NodeMeta {
     display: String,
     file: String,
     language: String,
     line_start: u32,
     line_end: u32,
+}
+
+/// The [`NodeMeta`] for an existing symbol node, or `None` for an external leaf
+/// (no defining file). Shared by [`filter_to_closure`] and the `merge` submodule
+/// so a graph rebuilt from [`SymbolNode`]s recovers the same metadata everywhere.
+pub(super) fn node_meta_of(sym: &SymbolNode) -> Option<NodeMeta> {
+    if sym.external {
+        None
+    } else {
+        Some(NodeMeta {
+            display: sym.display.clone(),
+            file: sym.file.clone().unwrap_or_default(),
+            language: sym.language.clone().unwrap_or_default(),
+            line_start: sym.line_start.unwrap_or(0),
+            line_end: sym.line_end.unwrap_or(0),
+        })
+    }
 }
 
 /// Build the porting dependency graph from a fact set.
@@ -531,18 +549,10 @@ pub fn filter_to_closure(graph: &GraphOutput, roots: &[SymbolId]) -> GraphOutput
         if !closure.contains(&sym.id) {
             continue;
         }
-        let meta = if sym.external {
-            None
-        } else {
+        let meta = node_meta_of(sym);
+        if meta.is_some() {
             effect_roots.insert(sym.id.clone(), sym.effect_roots.clone());
-            Some(NodeMeta {
-                display: sym.display.clone(),
-                file: sym.file.clone().unwrap_or_default(),
-                language: sym.language.clone().unwrap_or_default(),
-                line_start: sym.line_start.unwrap_or(0),
-                line_end: sym.line_end.unwrap_or(0),
-            })
-        };
+        }
         nodes.insert(sym.id.clone(), meta);
     }
 
@@ -562,6 +572,13 @@ pub fn filter_to_closure(graph: &GraphOutput, roots: &[SymbolId]) -> GraphOutput
         &effect_roots,
     )
 }
+
+/// Cross-package graph union + per-package slicing: [`merge_graphs`] and
+/// [`reroot_subgraph`], used to build and partition a `--from` closure that
+/// spans package boundaries. Kept in a submodule so this file stays focused on
+/// building a single graph; they reuse `assemble_graph` and `node_meta_of`.
+mod merge;
+pub use merge::{merge_graphs, reroot_subgraph};
 
 /// A single `--from` pattern resolving to more than this many symbols is called
 /// out in [`RootResolution::notes`], so the operator sees a broad match.
@@ -723,7 +740,7 @@ pub fn resolve_roots(graph: &GraphOutput, patterns: &[String]) -> Result<RootRes
 /// `None` for an external target. Every endpoint of every edge in `edges` must
 /// be a key in `nodes`. `effect_roots` gives each internal node its reachable
 /// effect categories (external nodes always report none).
-fn assemble_graph(
+pub(super) fn assemble_graph(
     root: &str,
     language: Option<&str>,
     nodes: &BTreeMap<String, Option<NodeMeta>>,
@@ -1330,9 +1347,9 @@ mod tests {
         assert!(!out.fidelity.call_only);
         assert!(out.fidelity.includes_type_edges);
         // The foo->Widget edge is a resolved type edge.
-        let te = out.edges.iter().find(|e| e.to == "app::Widget").unwrap();
-        assert_eq!(te.kind, "type");
-        assert_eq!(te.provenance, "resolved");
+        let type_edge = out.edges.iter().find(|e| e.to == "app::Widget").unwrap();
+        assert_eq!(type_edge.kind, "type");
+        assert_eq!(type_edge.provenance, "resolved");
 
         // Closure of foo pulls in the type it names in its signature (the
         // closure set is sorted).

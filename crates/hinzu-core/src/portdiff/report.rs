@@ -237,6 +237,28 @@ pub struct PackageRollup {
     pub report: PortDiffReport,
 }
 
+impl PackageRollup {
+    /// Lift a package's report to a rollup: the headline numbers pulled out of the
+    /// report, plus the full report embedded. Shared by the whole-port and
+    /// cross-package rollups so both extract the headline the same way.
+    pub(crate) fn from_report(package: String, report: PortDiffReport) -> PackageRollup {
+        let o = &report.overall;
+        let cc = &report.conformance_crosscheck;
+        PackageRollup {
+            package,
+            source_files_total: o.source_files_total,
+            bands: o.bands.clone(),
+            symbols_total: o.symbols_total,
+            symbols_matched: o.symbols_matched,
+            symbols_matched_pct: o.symbols_matched_pct,
+            conformance_native: cc.native_modules,
+            done_band: cc.done_band,
+            wave_count: report.waves.len(),
+            report,
+        }
+    }
+}
+
 /// The summed totals across every package in a [`MultiPackageReport`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RollupTotals {
@@ -254,6 +276,34 @@ pub struct RollupTotals {
     pub conformance_native: usize,
     /// Summed DONE-banded files.
     pub done_band: usize,
+}
+
+impl RollupTotals {
+    /// Fold one package report's headline numbers into the running totals. Shared
+    /// by the whole-port and cross-package rollups so both sum identically.
+    pub(crate) fn add_report(&mut self, report: &PortDiffReport) {
+        let o = &report.overall;
+        let cc = &report.conformance_crosscheck;
+        self.source_files_total += o.source_files_total;
+        self.bands.done += o.bands.done;
+        self.bands.ported += o.bands.ported;
+        self.bands.started += o.bands.started;
+        self.bands.not_started += o.bands.not_started;
+        self.symbols_total += o.symbols_total;
+        self.symbols_matched += o.symbols_matched;
+        self.conformance_native += cc.native_modules;
+        self.done_band += cc.done_band;
+    }
+
+    /// Recompute the overall match % from the accumulated matched / total (not an
+    /// average of per-package percentages). Call once after the last `add_report`.
+    pub(crate) fn recompute_pct(&mut self) {
+        self.symbols_matched_pct = if self.symbols_total > 0 {
+            ((self.symbols_matched as f64 / self.symbols_total as f64) * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
+    }
 }
 
 /// The combined whole-port rollup: every package's [`PortDiffReport`] plus the
@@ -285,41 +335,110 @@ impl MultiPackageReport {
         let mut packages = Vec::with_capacity(reports.len());
         let mut totals = RollupTotals::default();
         for (name, report) in reports {
-            let o = &report.overall;
-            let cc = &report.conformance_crosscheck;
-            totals.source_files_total += o.source_files_total;
-            totals.bands.done += o.bands.done;
-            totals.bands.ported += o.bands.ported;
-            totals.bands.started += o.bands.started;
-            totals.bands.not_started += o.bands.not_started;
-            totals.symbols_total += o.symbols_total;
-            totals.symbols_matched += o.symbols_matched;
-            totals.conformance_native += cc.native_modules;
-            totals.done_band += cc.done_band;
-            packages.push(PackageRollup {
-                package: name,
-                source_files_total: o.source_files_total,
-                bands: o.bands.clone(),
-                symbols_total: o.symbols_total,
-                symbols_matched: o.symbols_matched,
-                symbols_matched_pct: o.symbols_matched_pct,
-                conformance_native: cc.native_modules,
-                done_band: cc.done_band,
-                wave_count: report.waves.len(),
-                report,
-            });
+            totals.add_report(&report);
+            packages.push(PackageRollup::from_report(name, report));
         }
-        totals.symbols_matched_pct = if totals.symbols_total > 0 {
-            ((totals.symbols_matched as f64 / totals.symbols_total as f64) * 1000.0).round()
-                / 1000.0
-        } else {
-            0.0
-        };
+        totals.recompute_pct();
         MultiPackageReport {
             source_kind: source_kind.to_string(),
             target_kind: target_kind.to_string(),
             packages,
             totals,
+        }
+    }
+}
+
+/// One package's slice of a cross-package `--from` closure: how much of the
+/// closure lives in this package, plus the full port-diff over *just that slice*.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackageClosureRollup {
+    /// The `--package` name this slice belongs to.
+    pub package: String,
+    /// Files of this package that fall in the union closure.
+    pub closure_files: usize,
+    /// Local symbols of this package that fall in the union closure.
+    pub closure_symbols: usize,
+    /// The port-diff of this package's closure slice against its target crate —
+    /// headline numbers + the embedded per-package [`PortDiffReport`].
+    pub rollup: PackageRollup,
+}
+
+/// The cross-package rooted report: a `--from` closure taken over the **union**
+/// source graph (so it crosses package boundaries), routed per file to its owning
+/// package, and matched — per package — against that package's target crate. The
+/// serialized shape of `hinzu port-diff --all --from <entry>`.
+///
+/// It answers "what does *this entry point* need, across every package, and how
+/// much of it is ported" — e.g. the whole CLI's bootstrap closure, spanning
+/// several packages, with each package's slice banded DONE / PORTED / STARTED /
+/// NOT-STARTED against its own port.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RootedCrossPackageReport {
+    /// The source / target language tags echoed from config.
+    pub source_kind: String,
+    pub target_kind: String,
+    /// The resolved entry roots the closure was taken from.
+    pub roots: Vec<String>,
+    /// Total local symbols in the union closure (across every package).
+    pub closure_symbols: usize,
+    /// Total files in the union closure (across every package).
+    pub closure_files: usize,
+    /// How many packages the closure touches (have ≥1 closure file).
+    pub packages_spanned: usize,
+    /// Per-package closure slices, in config (sorted-name) order.
+    pub packages: Vec<PackageClosureRollup>,
+    /// Summed totals across the per-package slices (files, bands, symbols).
+    pub totals: RollupTotals,
+}
+
+impl RootedCrossPackageReport {
+    /// Assemble the cross-package rooted report from the resolved roots, the union
+    /// closure totals, and each package's `(name, closure_files, closure_symbols,
+    /// report)`. Per-package slices are lifted to [`PackageRollup`]s (reusing the
+    /// same headline extraction as the whole-port rollup) and the [`RollupTotals`]
+    /// are the element-wise sums, with the overall match % recomputed from the
+    /// summed matched / total. Deterministic: package order is the caller's.
+    pub fn aggregate(
+        source_kind: &str,
+        target_kind: &str,
+        roots: Vec<String>,
+        closure_symbols: usize,
+        closure_files: usize,
+        slices: Vec<(String, usize, usize, PortDiffReport)>,
+    ) -> RootedCrossPackageReport {
+        let mut packages = Vec::with_capacity(slices.len());
+        let mut totals = RollupTotals::default();
+        for (name, cfiles, csyms, report) in slices {
+            totals.add_report(&report);
+            packages.push(PackageClosureRollup {
+                closure_files: cfiles,
+                closure_symbols: csyms,
+                rollup: PackageRollup::from_report(name.clone(), report),
+                package: name,
+            });
+        }
+        totals.recompute_pct();
+        RootedCrossPackageReport {
+            source_kind: source_kind.to_string(),
+            target_kind: target_kind.to_string(),
+            roots,
+            closure_symbols,
+            closure_files,
+            packages_spanned: packages.len(),
+            packages,
+            totals,
+        }
+    }
+
+    /// Project to a [`MultiPackageReport`] so the combined whole-port HTML renderer
+    /// can be reused for the cross-package closure dashboard. The per-package
+    /// slices become the rollup's packages and the summed totals carry over.
+    pub fn as_multi(&self) -> MultiPackageReport {
+        MultiPackageReport {
+            source_kind: self.source_kind.clone(),
+            target_kind: self.target_kind.clone(),
+            packages: self.packages.iter().map(|p| p.rollup.clone()).collect(),
+            totals: self.totals.clone(),
         }
     }
 }

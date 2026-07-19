@@ -136,10 +136,15 @@ struct PortDiffArgs {
     package: Option<String>,
     /// Run port-diff for EVERY package in `--config` and emit a combined rollup
     /// JSON (`--out`) + a combined HTML dashboard (`--html`). Mutually exclusive
-    /// with `--package`, with `--from` (a rooted view is single-package), and
-    /// with the pre-extracted `--source-graph` / `--source-plan` / `--target-graph`
-    /// overrides (those are single-package; `--all` extracts per package). Use
-    /// `--cache-dir` to make the per-package extraction reusable across runs.
+    /// with `--package` and with the pre-extracted `--source-graph` /
+    /// `--source-plan` / `--target-graph` overrides (those are single-package;
+    /// `--all` extracts per package). Use `--cache-dir` to make the per-package
+    /// extraction reusable across runs. With `--from`, `--all` switches to the
+    /// **cross-package closure**: a union source graph across every package is
+    /// built, the entry point's closure taken over it (spanning package
+    /// boundaries), and each closure file routed to its owning package's target
+    /// crate — "what does this entry need, across all packages, and how much is
+    /// ported".
     #[arg(long)]
     all: bool,
     /// A directory for per-package extracted graphs/plans, used only with `--all`.
@@ -165,7 +170,11 @@ struct PortDiffArgs {
     /// Scope the SOURCE to the dependency closure of an entry point before
     /// diffing: the report then covers only what this symbol (or file)
     /// transitively needs, and which of it is unported. Repeatable (the closure
-    /// is the union). Same pattern rules as `hinzu graph --from`.
+    /// is the union). Same pattern rules as `hinzu graph --from`. With `--package`
+    /// this is a single-package rooted view; with `--all` it becomes the
+    /// cross-package closure (resolved over the union source graph, routed per
+    /// package). The `--source-graph` / `--target-graph` overrides apply only to
+    /// the single-package form.
     #[arg(long = "from")]
     from: Vec<String>,
     /// Where to write the report JSON. Defaults to stdout.
@@ -319,7 +328,13 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
 fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
     let cfg = portdiff_config::MultiPackageConfig::load(&args.config)?;
     if args.all {
-        return port_diff_all(&cfg, &args);
+        return if args.from.is_empty() {
+            port_diff_all(&cfg, &args)
+        } else {
+            // `--all --from` is the cross-package closure: a union source graph,
+            // one entry point's closure across package boundaries, routed per file.
+            port_diff_cross_from(&cfg, &args)
+        };
     }
     let package = match &args.package {
         Some(p) => p.clone(),
@@ -415,11 +430,6 @@ fn port_diff_all(
     if args.package.is_some() {
         anyhow::bail!("--all runs every package; drop --package (they are mutually exclusive)");
     }
-    if !args.from.is_empty() {
-        anyhow::bail!(
-            "--from scopes a single rooted view, which is single-package; drop --all or --from"
-        );
-    }
     if args.source_graph.is_some() || args.source_plan.is_some() || args.target_graph.is_some() {
         anyhow::bail!(
             "--source-graph / --source-plan / --target-graph are single-package overrides; \
@@ -484,6 +494,253 @@ fn port_diff_all(
     let json =
         serde_json::to_string_pretty(&multi).context("serializing the combined report to JSON")?;
     write_json(args.out.as_deref(), &json, "combined port-diff report")
+}
+
+/// The `hinzu port-diff --all --from <entry>` flow: the **cross-package closure**.
+///
+/// Where single-package `--from` scopes one package's source, and `--all` sweeps
+/// every package whole, this combines them: it builds a UNION source graph across
+/// every `[packages.*]` (one monorepo-rooted extraction whose files already span
+/// the packages — see [`find_union_root`]), takes the entry point's dependency
+/// closure over it (so the closure crosses package boundaries, following call,
+/// reference *and* signature-type edges), then routes each closure file to its
+/// owning package by path prefix and matches that package's slice against its own
+/// target crate. The result is a [`RootedCrossPackageReport`]: overall closure
+/// size, how many packages it spans, and each package's slice banded DONE / PORTED
+/// / STARTED / NOT-STARTED — "what does this entry need, across all packages, and
+/// how much is left".
+///
+/// `--cache-dir` makes both the union extraction (`<dir>/union-source-graph.json`)
+/// and each package's target graph reusable across runs. The single-package
+/// overrides (`--source-graph` / `--source-plan` / `--target-graph`) are rejected:
+/// they name one package's graphs, whereas this extracts the union + per package.
+fn port_diff_cross_from(
+    cfg: &portdiff_config::MultiPackageConfig,
+    args: &PortDiffArgs,
+) -> Result<ExitCode> {
+    if args.package.is_some() {
+        anyhow::bail!(
+            "--all --from is the cross-package closure (it spans every package); drop --package \
+             — use --package --from for a single-package rooted view instead"
+        );
+    }
+    if args.source_graph.is_some() || args.source_plan.is_some() || args.target_graph.is_some() {
+        anyhow::bail!(
+            "--source-graph / --source-plan / --target-graph are single-package overrides; the \
+             cross-package closure extracts a union source graph + a target graph per package \
+             (use --cache-dir to reuse extractions across runs)"
+        );
+    }
+
+    // Resolve every package, then find the extraction root whose tree contains all
+    // of them (so cross-package imports resolve to local source, not externals).
+    let resolved: Vec<portdiff_config::ResolvedPackage> = cfg
+        .package_names()
+        .iter()
+        .map(|n| cfg.resolve(n))
+        .collect::<Result<_>>()?;
+    let source_paths: Vec<PathBuf> = resolved.iter().map(|r| r.source_path.clone()).collect();
+    let union_root = find_union_root(&source_paths);
+    eprintln!(
+        "cross-package --from: union source root {}",
+        union_root.display()
+    );
+
+    // The union source graph (cache-reusable), the closure over it, then routing.
+    let union = cached_or_extract_union(args.cache_dir.as_deref(), &union_root)?;
+    let resolution =
+        hinzu_core::graph::resolve_roots(&union, &args.from).map_err(|e| anyhow::anyhow!(e))?;
+    for note in &resolution.notes {
+        eprintln!("{note}");
+    }
+    let closure = hinzu_core::graph::filter_to_closure(&union, &resolution.roots);
+    eprintln!(
+        "closure of {}: {} symbols across {} files (of {} in the union)",
+        resolution.roots.join(", "),
+        closure.stats.symbol_count,
+        closure.stats.file_count,
+        union.stats.symbol_count,
+    );
+
+    // Route each closure file to its owning package (path prefix = the package's
+    // source dir relative to the union root), then diff that package's slice.
+    let mut slices: Vec<(String, usize, usize, hinzu_core::portdiff::PortDiffReport)> = Vec::new();
+    for r in &resolved {
+        let Ok(rel) = r.source_path.strip_prefix(&union_root) else {
+            continue;
+        };
+        let prefix = format!("{}/", rel.display());
+        let closure_files = closure
+            .files
+            .iter()
+            .filter(|f| f.path.starts_with(&prefix))
+            .count();
+        let closure_symbols = closure
+            .symbols
+            .iter()
+            .filter(|s| {
+                !s.external
+                    && s.file
+                        .as_deref()
+                        .map(|f| f.starts_with(&prefix))
+                        .unwrap_or(false)
+            })
+            .count();
+        if closure_files == 0 {
+            continue;
+        }
+        eprintln!(
+            "=== {} : {closure_files} closure files, {closure_symbols} symbols (prefix {prefix}) ===",
+            r.name
+        );
+
+        // Slice the closure to this package and re-root it to `src/…` so the
+        // package's own PortDiffConfig matches it unchanged, then plan + diff it.
+        let scoped_source = hinzu_core::graph::reroot_subgraph(&closure, &prefix);
+        let scoped_plan =
+            hinzu_core::plan::build_plan(&scoped_source, hinzu_core::plan::PlanOpts::default());
+        let target_graph =
+            cached_or_extract(args.cache_dir.as_deref(), &r.name, "target-graph", || {
+                extract_target_graph_live(r)
+            })?;
+        let manifest_json = read_conformance_manifest(&r.manifest_path);
+        let report = hinzu_core::portdiff::port_diff(
+            &scoped_source,
+            &scoped_plan,
+            &target_graph,
+            &r.config,
+            manifest_json.as_deref(),
+        );
+        slices.push((r.name.clone(), closure_files, closure_symbols, report));
+    }
+
+    if slices.is_empty() {
+        anyhow::bail!(
+            "the --from closure matched no package source files under the union root {}; \
+             check the entry pattern and the packages' source_dir paths",
+            union_root.display()
+        );
+    }
+
+    let rooted = hinzu_core::portdiff::RootedCrossPackageReport::aggregate(
+        &cfg.source_kind,
+        &cfg.target_kind,
+        resolution.roots.clone(),
+        closure.stats.symbol_count,
+        closure.stats.file_count,
+        slices,
+    );
+
+    if let Some(html_path) = &args.html {
+        // Reuse the whole-port dashboard renderer over the closure's per-package
+        // slices; the header carries the closure roots + union root.
+        let multi = rooted.as_multi();
+        let meta = portdiff_html::MultiHtmlMeta {
+            source_label: format!(
+                "{} · closure of {} · union {}",
+                cfg.source_kind,
+                resolution.roots.join(", "),
+                union_root.display()
+            ),
+            target_label: cfg.target_kind.clone(),
+            input_mode: match &args.cache_dir {
+                Some(d) => format!("cross-package closure · cache {}", d.display()),
+                None => "cross-package closure · extracted live".to_string(),
+            },
+        };
+        let html = portdiff_html::render_multi_html(&multi, &meta);
+        std::fs::write(html_path, html).with_context(|| {
+            format!(
+                "writing cross-package HTML dashboard to {}",
+                html_path.display()
+            )
+        })?;
+        eprintln!(
+            "wrote cross-package HTML dashboard to {}",
+            html_path.display()
+        );
+    }
+
+    let json = serde_json::to_string_pretty(&rooted)
+        .context("serializing the cross-package rooted report to JSON")?;
+    write_json(args.out.as_deref(), &json, "cross-package rooted report")
+}
+
+/// The extraction root for a cross-package union source graph: the nearest
+/// ancestor of every package's source dir that the adapters recognize as a project
+/// (so its own tsconfig/Cargo resolves the workspace imports to local source, and
+/// the extraction owns files across every package). Starts at the common ancestor
+/// of the source dirs and walks up until a project marker is found; falls back to
+/// the common ancestor itself if none is (the adapter still searches upward for a
+/// config).
+fn find_union_root(source_paths: &[PathBuf]) -> PathBuf {
+    let base = common_ancestor(source_paths);
+    let mut cur = base.clone();
+    loop {
+        if is_recognized_project(&cur) {
+            return cur;
+        }
+        match cur.parent() {
+            Some(p) if p != cur => cur = p.to_path_buf(),
+            _ => return base,
+        }
+    }
+}
+
+/// The longest directory prefix shared by every path.
+fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
+    let mut iter = paths.iter();
+    let Some(first) = iter.next() else {
+        return PathBuf::new();
+    };
+    let mut comps: Vec<std::path::Component> = first.components().collect();
+    for p in iter {
+        let pc: Vec<std::path::Component> = p.components().collect();
+        let n = comps
+            .iter()
+            .zip(pc.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        comps.truncate(n);
+    }
+    comps.iter().collect()
+}
+
+/// Whether any adapter recognizes `path` as a project it can extract from — the
+/// same marker checks `route_facts` routes on.
+fn is_recognized_project(path: &Path) -> bool {
+    rust_adapter::is_cargo_project(path)
+        || ts_adapter::is_ts_project(path)
+        || py_adapter::is_python_project(path)
+        || go_adapter::is_go_project(path)
+}
+
+/// The union source graph: read from `<dir>/union-source-graph.json` when present,
+/// else extract it live over `union_root` and cache it. Keeps the (slow)
+/// monorepo-wide extraction reusable across cross-package `--from` runs.
+fn cached_or_extract_union(
+    cache_dir: Option<&Path>,
+    union_root: &Path,
+) -> Result<hinzu_core::graph::GraphOutput> {
+    if let Some(dir) = cache_dir {
+        let path = dir.join("union-source-graph.json");
+        if path.is_file() {
+            eprintln!("cache hit: {}", path.display());
+            return load_graph(&path);
+        }
+        eprintln!(
+            "extracting union source graph from {}",
+            union_root.display()
+        );
+        let graph = build_graph_from_source(union_root, None, None)?;
+        write_cache(dir, &path, &graph, "graph")?;
+        return Ok(graph);
+    }
+    eprintln!(
+        "extracting union source graph from {}",
+        union_root.display()
+    );
+    build_graph_from_source(union_root, None, None)
 }
 
 /// Extract a package's target graph live from its `target_dir`, requiring the
