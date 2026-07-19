@@ -462,24 +462,11 @@ mod tests {
             waves: Vec::new(),
             ready_frontier: Vec::new(),
             ready_frontier_total: 0,
-            naive_vs_graph: NaiveVsGraph {
-                naive_files_matched: 0,
-                graph_files_matched: 0,
-                recovered_files: Vec::new(),
-                recovered_count: 0,
-            },
-            conformance_crosscheck: ConformanceCrosscheck {
-                native_modules: 0,
-                native_files: Vec::new(),
-                done_band: 0,
-                ported_plus_done: 0,
-                note: String::new(),
-            },
+            naive_vs_graph: NaiveVsGraph::default(),
+            conformance_crosscheck: ConformanceCrosscheck::default(),
             fidelity: Fidelity {
                 structural_not_correctness: true,
-                matchable_denominator: String::new(),
-                cluster_caveat: String::new(),
-                notes: Vec::new(),
+                ..Default::default()
             },
         }
     }

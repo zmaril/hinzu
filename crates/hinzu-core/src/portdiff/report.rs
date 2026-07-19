@@ -158,7 +158,7 @@ pub struct FrontierEntry {
 
 /// The naive-vs-graph delta: what the decomposition-aware clustering recovers
 /// over a naive exact-path baseline.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NaiveVsGraph {
     /// Files a naive pass would map by exact normalized path alone.
     pub naive_files_matched: usize,
@@ -183,7 +183,7 @@ pub struct FileMapSummary {
 
 /// The conformance cross-check: the structural DONE band vs the test-verified
 /// native module count.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConformanceCrosscheck {
     /// Native modules found in the manifest (for the configured package).
     pub native_modules: usize,
@@ -198,7 +198,7 @@ pub struct ConformanceCrosscheck {
 }
 
 /// The honest fidelity block.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Fidelity {
     /// Always true: the matching is structural, not a correctness proof.
     pub structural_not_correctness: bool,
@@ -524,24 +524,16 @@ mod tests {
             ],
             ready_frontier: Vec::new(),
             ready_frontier_total: 0,
-            naive_vs_graph: NaiveVsGraph {
-                naive_files_matched: 0,
-                graph_files_matched: 0,
-                recovered_files: Vec::new(),
-                recovered_count: 0,
-            },
+            naive_vs_graph: NaiveVsGraph::default(),
             conformance_crosscheck: ConformanceCrosscheck {
                 native_modules: native,
-                native_files: Vec::new(),
                 done_band,
                 ported_plus_done: bands.done + bands.ported,
-                note: String::new(),
+                ..Default::default()
             },
             fidelity: Fidelity {
                 structural_not_correctness: true,
-                matchable_denominator: String::new(),
-                cluster_caveat: String::new(),
-                notes: Vec::new(),
+                ..Default::default()
             },
         }
     }
