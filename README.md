@@ -78,7 +78,7 @@ ordering semantics, and how a porting agent walks it.
 `hinzu port-diff` closes the loop: given a source package's graph + plan and a
 target port's graph, it reports — file by file, symbol by symbol — how much has
 actually been ported, in a way that survives file decomposition and relocation.
-It is config-driven (one TOML describes several packages) and emits a JSON report
+It is config-driven (one toml describes several packages) and emits a JSON report
 plus an optional self-contained HTML dashboard. See
 [notes/port-diff.md](notes/port-diff.md) for the config schema, the input modes,
 `--from` closure scoping, and the band definitions.

@@ -95,7 +95,7 @@ scoped to closure of src/providers/all#builtinProviders: 61 symbols across 53 fi
 
 ## The config file
 
-One TOML describes several same-shape package ports with a single shared naming
+One toml describes several same-shape package ports with a single shared naming
 ruleset. See [`notes/port-pi-atilla.toml`](./port-pi-atilla.toml) for the working
 `pi` → `atilla` config. Structure:
 
