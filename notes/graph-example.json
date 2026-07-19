@@ -1,0 +1,217 @@
+{
+  "hinzu_graph_version": 1,
+  "root": "adapters/typescript/tests/fixture",
+  "language": "typescript",
+  "fidelity": {
+    "call_only": true,
+    "notes": [
+      "Edges come from the call/use graph (call-hierarchy style): `from` depends on `to` when it calls or references it.",
+      "Call-only fidelity — higher-order calls, dynamic dispatch through trait objects or function pointers, and unresolved callbacks are approximated or missed. An edge the adapter could not resolve is marked provenance=\"unknown\".",
+      "There is no textDocument/implementation or explicit imports table; file edges are inferred by projecting symbol call edges onto their files, so a file dependency that flows only through types or imports (never a call) is not represented.",
+      "External callees (no local definition) are emitted as leaf nodes with provenance external/unknown; treat them as already-available library calls, not port targets."
+    ],
+    "unknown_edge_count": 0,
+    "external_node_count": 1
+  },
+  "stats": {
+    "symbol_count": 4,
+    "external_count": 1,
+    "file_count": 2,
+    "edge_count": 4,
+    "file_edge_count": 1,
+    "scc_count": 0
+  },
+  "symbols": [
+    {
+      "id": "node:fs::readFileSync",
+      "display": "node:fs::readFileSync",
+      "file": null,
+      "language": null,
+      "line_start": null,
+      "line_end": null,
+      "loc": null,
+      "external": true,
+      "fan_in": 1,
+      "fan_out": 0,
+      "transitive_dep_count": 0,
+      "is_leaf": true,
+      "effect_roots": [],
+      "external_packages": [],
+      "scc": null
+    },
+    {
+      "id": "src/core#countKeys",
+      "display": "countKeys",
+      "file": "src/core.ts",
+      "language": "typescript",
+      "line_start": 15,
+      "line_end": 17,
+      "loc": 3,
+      "external": false,
+      "fan_in": 1,
+      "fan_out": 0,
+      "transitive_dep_count": 0,
+      "is_leaf": true,
+      "effect_roots": [],
+      "external_packages": [],
+      "scc": null
+    },
+    {
+      "id": "src/core#loadAndSummarize",
+      "display": "loadAndSummarize",
+      "file": "src/core.ts",
+      "language": "typescript",
+      "line_start": 20,
+      "line_end": 23,
+      "loc": 4,
+      "external": false,
+      "fan_in": 0,
+      "fan_out": 3,
+      "transitive_dep_count": 4,
+      "is_leaf": false,
+      "effect_roots": [
+        "fs"
+      ],
+      "external_packages": [],
+      "scc": null
+    },
+    {
+      "id": "src/core#parse",
+      "display": "parse",
+      "file": "src/core.ts",
+      "language": "typescript",
+      "line_start": 6,
+      "line_end": 13,
+      "loc": 8,
+      "external": false,
+      "fan_in": 1,
+      "fan_out": 0,
+      "transitive_dep_count": 0,
+      "is_leaf": true,
+      "effect_roots": [],
+      "external_packages": [],
+      "scc": null
+    },
+    {
+      "id": "src/io#readConfig",
+      "display": "readConfig",
+      "file": "src/io.ts",
+      "language": "typescript",
+      "line_start": 4,
+      "line_end": 7,
+      "loc": 4,
+      "external": false,
+      "fan_in": 1,
+      "fan_out": 1,
+      "transitive_dep_count": 1,
+      "is_leaf": true,
+      "effect_roots": [
+        "fs"
+      ],
+      "external_packages": [
+        "node:fs"
+      ],
+      "scc": null
+    }
+  ],
+  "edges": [
+    {
+      "from": "src/io#readConfig",
+      "to": "node:fs::readFileSync",
+      "kind": "call",
+      "resolution": "call",
+      "provenance": "external",
+      "evidence_file": "src/io.ts",
+      "evidence_line": 6
+    },
+    {
+      "from": "src/core#loadAndSummarize",
+      "to": "src/core#parse",
+      "kind": "call",
+      "resolution": "call",
+      "provenance": "resolved",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 21
+    },
+    {
+      "from": "src/core#loadAndSummarize",
+      "to": "src/io#readConfig",
+      "kind": "call",
+      "resolution": "call",
+      "provenance": "resolved",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 21
+    },
+    {
+      "from": "src/core#loadAndSummarize",
+      "to": "src/core#countKeys",
+      "kind": "call",
+      "resolution": "call",
+      "provenance": "resolved",
+      "evidence_file": "src/core.ts",
+      "evidence_line": 22
+    }
+  ],
+  "files": [
+    {
+      "path": "src/core.ts",
+      "symbol_count": 3,
+      "loc": 15,
+      "fan_in": 0,
+      "fan_out": 1,
+      "transitive_dep_count": 1,
+      "is_leaf": false,
+      "effect_roots": [
+        "fs"
+      ],
+      "external_packages": [],
+      "scc": null
+    },
+    {
+      "path": "src/io.ts",
+      "symbol_count": 1,
+      "loc": 4,
+      "fan_in": 1,
+      "fan_out": 0,
+      "transitive_dep_count": 0,
+      "is_leaf": true,
+      "effect_roots": [
+        "fs"
+      ],
+      "external_packages": [
+        "node:fs"
+      ],
+      "scc": null
+    }
+  ],
+  "file_edges": [
+    {
+      "from": "src/core.ts",
+      "to": "src/io.ts",
+      "call_edge_count": 1,
+      "has_unknown": false
+    }
+  ],
+  "condensation": {
+    "symbol_topo_order": [
+      "src/core#countKeys",
+      "src/core#parse",
+      "src/io#readConfig",
+      "src/core#loadAndSummarize"
+    ],
+    "file_topo_order": [
+      "src/io.ts",
+      "src/core.ts"
+    ],
+    "symbol_sccs": [],
+    "file_sccs": [],
+    "symbol_leaves": [
+      "src/core#countKeys",
+      "src/core#parse",
+      "src/io#readConfig"
+    ],
+    "file_leaves": [
+      "src/io.ts"
+    ]
+  }
+}

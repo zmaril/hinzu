@@ -251,14 +251,7 @@ mod tests {
     use crate::effects::{EffectEngine, NaiveEngine};
 
     fn one_def(id: &str, file: &str, line_start: u32) -> Definition {
-        Definition {
-            id: id.to_string(),
-            display: id.rsplit("::").next().unwrap_or(id).to_string(),
-            language: Language::Rust,
-            file: file.to_string(),
-            line_start,
-            line_end: line_start + 4,
-        }
+        crate::facts::make_def(id, file, line_start, line_start + 4)
     }
 
     /// A small graph: `outer` calls `inner`, which references a net root. The

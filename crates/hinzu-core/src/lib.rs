@@ -15,7 +15,10 @@ use anyhow::Result;
 
 pub mod effects;
 pub mod facts;
+pub mod graph;
+pub mod plan;
 pub mod policy;
+pub mod portdiff;
 pub mod roots;
 pub mod store;
 

@@ -16,7 +16,9 @@ hinzu-dbsp = { path = "../hinzu-dbsp" }
 hinzu-lsp = { path = "../hinzu-lsp" }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
