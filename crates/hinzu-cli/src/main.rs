@@ -2,6 +2,8 @@
 
 mod adapter_harness;
 mod go_adapter;
+mod portdiff_config;
+mod portdiff_html;
 mod py_adapter;
 mod rust_adapter;
 mod ts_adapter;
@@ -41,6 +43,13 @@ enum Cmd {
     /// wave is a batch of groups with no dependency between them, portable in
     /// parallel). Reuses `hinzu graph`, or loads a previously emitted graph.json.
     Plan(PlanArgs),
+    /// Cross-language port-progress diff: match a SOURCE package's symbol graph +
+    /// plan against a TARGET port's symbol graph, file by file, and report how
+    /// much has actually been ported — surviving file decomposition & relocation.
+    /// Config-driven and multi-package: `--config` selects the naming rules and
+    /// per-package paths, `--package` picks one. Writes a JSON report and, with
+    /// `--html`, a self-contained dashboard.
+    PortDiff(PortDiffArgs),
 }
 
 #[derive(Parser)]
@@ -114,6 +123,44 @@ struct PlanArgs {
     no_coalesce: bool,
 }
 
+#[derive(Parser)]
+struct PortDiffArgs {
+    /// The multi-package port-diff config TOML (shared naming rules + a table per
+    /// package). See `notes/port-diff.md` for the schema.
+    #[arg(long)]
+    config: PathBuf,
+    /// Which package in the config to diff. Required — if omitted, the available
+    /// package names are listed. (The all-packages sweep is a separate step.)
+    #[arg(long)]
+    package: Option<String>,
+    /// Override: a pre-extracted SOURCE graph JSON (`hinzu graph --out`). Skips
+    /// the live source extraction. Extraction is slow, so pre-extracting once and
+    /// re-running the diff off the JSON is the common path.
+    #[arg(long)]
+    source_graph: Option<PathBuf>,
+    /// Override: a pre-extracted SOURCE plan JSON (`hinzu plan --out`). Used only
+    /// when the source is not `--from`-scoped; a scoped run always rebuilds the
+    /// plan from the scoped graph.
+    #[arg(long)]
+    source_plan: Option<PathBuf>,
+    /// Override: a pre-extracted TARGET graph JSON. Skips the live (slow) Rust
+    /// extraction.
+    #[arg(long)]
+    target_graph: Option<PathBuf>,
+    /// Scope the SOURCE to the dependency closure of an entry point before
+    /// diffing: the report then covers only what this symbol (or file)
+    /// transitively needs, and which of it is unported. Repeatable (the closure
+    /// is the union). Same pattern rules as `hinzu graph --from`.
+    #[arg(long = "from")]
+    from: Vec<String>,
+    /// Where to write the report JSON. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Also write a self-contained HTML dashboard to this file.
+    #[arg(long)]
+    html: Option<PathBuf>,
+}
+
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
 /// sets; `dbsp` is the incremental-capable engine, `naive` the reference BFS.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -156,6 +203,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::Plan(args) => match plan(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::PortDiff(args) => match port_diff_cmd(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -241,6 +292,137 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
     );
     let json = serde_json::to_string_pretty(&plan).context("serializing the plan to JSON")?;
     write_json(args.out.as_deref(), &json, "plan")
+}
+
+/// The `hinzu port-diff` flow. Loads the multi-package config, selects one
+/// package, obtains the source graph + plan and the target graph (each either
+/// loaded from a pre-extracted JSON override or extracted live), optionally
+/// scopes the source to a `--from` closure, reads the conformance manifest text
+/// (the CLI does the file read — core stays a pure functional core), runs
+/// [`hinzu_core::portdiff::port_diff`], writes the JSON report, and — with
+/// `--html` — a self-contained dashboard.
+fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
+    let cfg = portdiff_config::MultiPackageConfig::load(&args.config)?;
+    let package = match &args.package {
+        Some(p) => p.clone(),
+        None => anyhow::bail!(
+            "select a package with --package <name>; available packages: {}",
+            cfg.package_names().join(", ")
+        ),
+    };
+    let resolved = cfg.resolve(&package)?;
+
+    // ---- source graph: load an override, else extract live ----------------
+    let source_graph = match &args.source_graph {
+        Some(p) => load_graph(p)?,
+        None => {
+            eprintln!(
+                "extracting source graph from {}",
+                resolved.source_path.display()
+            );
+            build_graph_from_source(&resolved.source_path, None, None)?
+        }
+    };
+    // Scope the SOURCE to the `--from` closure BEFORE building the plan, so the
+    // plan is "exactly what this entry point needs" and nothing else.
+    let scoped = !args.from.is_empty();
+    let source_graph = scope_to_closure(source_graph, &args.from)?;
+
+    // ---- source plan: override only when unscoped, else derive from the graph
+    let source_plan = match &args.source_plan {
+        Some(p) if !scoped => load_plan(p)?,
+        Some(_) => {
+            eprintln!("note: --from scopes the source, so the plan is rebuilt from the closure");
+            hinzu_core::plan::build_plan(&source_graph, hinzu_core::plan::PlanOpts::default())
+        }
+        None => hinzu_core::plan::build_plan(&source_graph, hinzu_core::plan::PlanOpts::default()),
+    };
+
+    // ---- target graph: load an override, else extract live ----------------
+    let target_graph = match &args.target_graph {
+        Some(p) => load_graph(p)?,
+        None => {
+            if resolved.config.target_kind == "rust"
+                && std::env::var_os("HINZU_RUSTC_DRIVER").is_none()
+            {
+                anyhow::bail!(
+                    "extracting the Rust target graph needs the StableMIR driver: set \
+                     HINZU_RUSTC_DRIVER to a prebuilt hinzu-rustc-driver binary (built on its \
+                     pinned nightly), or pass --target-graph <json> to use a pre-extracted graph"
+                );
+            }
+            eprintln!(
+                "extracting target graph from {}",
+                resolved.target_path.display()
+            );
+            build_graph_from_source(&resolved.target_path, None, None)?
+        }
+    };
+
+    // The conformance manifest is read HERE (the CLI is outside the functional
+    // core, so a filesystem read is allowed); core only parses the text it is
+    // handed. Best-effort: an unreadable manifest bands no file DONE.
+    let manifest_json = read_conformance_manifest(&resolved.manifest_path);
+
+    let report = hinzu_core::portdiff::port_diff(
+        &source_graph,
+        &source_plan,
+        &target_graph,
+        &resolved.config,
+        manifest_json.as_deref(),
+    );
+
+    if let Some(html_path) = &args.html {
+        let meta = portdiff_html::HtmlMeta {
+            package: resolved.name.clone(),
+            source_label: resolved.source_path.display().to_string(),
+            target_label: resolved.target_path.display().to_string(),
+            scoped_from: args.from.clone(),
+            input_mode: if args.source_graph.is_some() || args.target_graph.is_some() {
+                "pre-extracted graphs".to_string()
+            } else {
+                "extracted live".to_string()
+            },
+        };
+        let html = portdiff_html::render_html(&report, &meta);
+        std::fs::write(html_path, html)
+            .with_context(|| format!("writing HTML dashboard to {}", html_path.display()))?;
+        eprintln!("wrote HTML dashboard to {}", html_path.display());
+    }
+
+    let json = serde_json::to_string_pretty(&report)
+        .context("serializing the port-diff report to JSON")?;
+    write_json(args.out.as_deref(), &json, "port-diff report")
+}
+
+/// Read a pre-extracted [`GraphOutput`] JSON.
+fn load_graph(path: &Path) -> Result<hinzu_core::graph::GraphOutput> {
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("reading graph from {}", path.display()))?;
+    serde_json::from_str(&json).with_context(|| format!("parsing graph from {}", path.display()))
+}
+
+/// Read a pre-extracted [`PlanOutput`] JSON.
+fn load_plan(path: &Path) -> Result<hinzu_core::plan::PlanOutput> {
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("reading plan from {}", path.display()))?;
+    serde_json::from_str(&json).with_context(|| format!("parsing plan from {}", path.display()))
+}
+
+/// Read the conformance manifest text, best-effort. An unreadable manifest is a
+/// warning (no file is banded DONE), not a hard error — the structural bands are
+/// still meaningful without the test-verified oracle.
+fn read_conformance_manifest(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!(
+                "warning: conformance manifest {} unreadable ({e}); no file will be banded DONE",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 /// Scope a freshly built graph to the transitive dependency closure of the

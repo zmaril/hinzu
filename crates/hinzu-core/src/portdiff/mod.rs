@@ -358,12 +358,18 @@ struct FileMap {
 /// `source_graph` + `source_plan` describe the codebase being ported *from*
 /// (its symbol graph and wave/group plan); `target_graph` describes the codebase
 /// being ported *to*. `config` supplies the language pair, naming rules, band
-/// thresholds, and the optional conformance oracle. The result is deterministic.
+/// thresholds, and the optional conformance oracle. `conformance_manifest_json`
+/// is the *contents* of the conformance manifest the oracle reads, supplied as
+/// data by the caller: core never opens a file (the functional-core boundary
+/// keeps every filesystem effect out of the analysis engine), it only parses the
+/// text with the trusted-pure `serde_json`. Pass `None` when there is no
+/// manifest — then no file is banded DONE. The result is deterministic.
 pub fn port_diff(
     source_graph: &GraphOutput,
     source_plan: &PlanOutput,
     target_graph: &GraphOutput,
     config: &PortDiffConfig,
+    conformance_manifest_json: Option<&str>,
 ) -> PortDiffReport {
     let rules = &config.naming;
     let mut notes: Vec<String> = Vec::new();
@@ -605,7 +611,8 @@ pub fn port_diff(
     }
 
     // ---- Conformance native oracle (best-effort) --------------------------
-    let (native_files, native_module_count) = load_native_files(&config.conformance, &mut notes);
+    let (native_files, native_module_count) =
+        load_native_files(&config.conformance, conformance_manifest_json, &mut notes);
     let native_set: HashSet<&str> = native_files.iter().map(|s| s.as_str()).collect();
 
     // ---- Aggregate --------------------------------------------------------
@@ -1150,28 +1157,30 @@ struct Manifest {
     modules: Vec<ManifestModule>,
 }
 
-/// Load the native (test-verified) source files from the conformance manifest,
-/// best-effort. Returns the file set and the native-module count. On any failure
-/// the set is empty and a note is recorded.
+/// Resolve the native (test-verified) source files from the conformance manifest
+/// *text*, best-effort. The caller supplies the manifest contents as data
+/// (`manifest_json`) — core does not read files, so the functional-core boundary
+/// stays clean; only the trusted-pure `serde_json` parse and the pure
+/// module-name → source-file mapping happen here. Returns the file set and the
+/// native-module count. On any failure (no config, no text, unparsable) the set
+/// is empty and a note is recorded.
 fn load_native_files(
     conf: &Option<ConformanceConfig>,
+    manifest_json: Option<&str>,
     notes: &mut Vec<String>,
 ) -> (BTreeSet<String>, usize) {
     let Some(conf) = conf else {
         notes.push("no conformance config: no file banded DONE".to_string());
         return (BTreeSet::new(), 0);
     };
-    let text = match std::fs::read_to_string(&conf.manifest_path) {
-        Ok(t) => t,
-        Err(e) => {
-            notes.push(format!(
-                "conformance manifest '{}' unreadable ({e}): no file banded DONE",
-                conf.manifest_path
-            ));
-            return (BTreeSet::new(), 0);
-        }
+    let Some(text) = manifest_json else {
+        notes.push(format!(
+            "conformance manifest '{}' contents not supplied: no file banded DONE",
+            conf.manifest_path
+        ));
+        return (BTreeSet::new(), 0);
     };
-    let manifest: Manifest = match serde_json::from_str(&text) {
+    let manifest: Manifest = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
             notes.push(format!(
@@ -1343,7 +1352,7 @@ mod tests {
             &[],
         );
         let plan = build_plan(&source, PlanOpts::default());
-        let report = port_diff(&source, &plan, &target, &cfg_no_conformance());
+        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
 
         let fe = report
             .files
@@ -1402,7 +1411,7 @@ mod tests {
             ],
         );
         let plan = build_plan(&source, PlanOpts::default());
-        let report = port_diff(&source, &plan, &target, &cfg_no_conformance());
+        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
 
         // Two evaluable matched symbols (alpha, gamma), exactly one confirmed.
         assert_eq!(report.overall.graph.evaluable, 2);
@@ -1460,7 +1469,7 @@ mod tests {
             &[],
         );
         let plan = build_plan(&source, PlanOpts::default());
-        let report = port_diff(&source, &plan, &target, &cfg_no_conformance());
+        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
 
         let lo = report.files.iter().find(|f| f.path == "src/lo.ts").unwrap();
         assert_eq!(lo.band, Band::Ported);

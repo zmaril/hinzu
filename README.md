@@ -59,11 +59,13 @@ cargo install --path crates/hinzu-cli
 ## Usage
 
 ```sh
-hinzu run       # run the engine (placeholder for now)
-hinzu check <p> # check a project's effects against a hinzu.toml policy
-hinzu graph <p> # emit a JSON dependency graph for AI-assisted porting
-hinzu --help    # list commands
-hinzu --version # print the version
+hinzu run        # run the engine (placeholder for now)
+hinzu check <p>  # check a project's effects against a hinzu.toml policy
+hinzu graph <p>  # emit a JSON dependency graph for AI-assisted porting
+hinzu plan <p>   # emit a grouped, wave-ordered porting plan
+hinzu port-diff  # cross-language port-progress diff (source graph vs target port)
+hinzu --help     # list commands
+hinzu --version  # print the version
 ```
 
 `hinzu graph` emits a dependencies-first (leaves-first) port order over the
@@ -72,6 +74,14 @@ call/use graph — the same facts the effect engine consumes, reused to answer
 (mutual recursion); the acyclic SCC-condensation is what makes the order
 well-defined. See [notes/graph.md](notes/graph.md) for the JSON schema, the
 ordering semantics, and how a porting agent walks it.
+
+`hinzu port-diff` closes the loop: given a source package's graph + plan and a
+target port's graph, it reports — file by file, symbol by symbol — how much has
+actually been ported, in a way that survives file decomposition and relocation.
+It is config-driven (one TOML describes several packages) and emits a JSON report
+plus an optional self-contained HTML dashboard. See
+[notes/port-diff.md](notes/port-diff.md) for the config schema, the input modes,
+`--from` closure scoping, and the band definitions.
 
 ## Development
 

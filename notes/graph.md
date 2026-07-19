@@ -247,3 +247,8 @@ what makes an incremental, continuously-testable port possible.
 To port **in parallel** instead of one symbol at a time — grouping files into
 PRs and scheduling them into waves that can each be ported concurrently — layer
 [`hinzu plan`](./plan.md) on top of this graph.
+
+To measure **how far a port has actually gotten** — matching this graph against
+the graph of the target-language port, file by file and symbol by symbol — see
+[`hinzu port-diff`](./port-diff.md). It reuses the same `--from` closure scoping,
+so you can ask "of everything this entry point needs, which is unported?"
