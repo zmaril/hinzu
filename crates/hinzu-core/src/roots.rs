@@ -100,6 +100,17 @@ const RUST_LIBS_ANNOTATIONS: &str = include_str!("../annotations/rust-libs.toml"
 /// rules — there is no `alloc` effect for a garbage-collected runtime.
 const NODE_ANNOTATIONS: &str = include_str!("../annotations/node.toml");
 
+/// hinzu's shipped TypeScript *library* effect-annotation defaults: the common
+/// npm packages the fleet reaches most often (drizzle-orm, @electric-sql/pglite,
+/// elysia, the MCP SDK, bun-types, react, …), merged onto `node.toml` for the
+/// TypeScript base. Same data format as `node.toml` — `[roots]` effect rules
+/// plus `[trust]` pure vouches — graded granularly: drizzle's query builders are
+/// pure while its execution surface is `db`, Bun's test matchers are pure while
+/// `Bun.spawn` / `Bun.file` / `Bun.serve` are effect roots. Editing the library
+/// trust table means editing that file, not this module; a project's own
+/// `hinzu.toml` still overrides it.
+const NODE_LIBS_ANNOTATIONS: &str = include_str!("../annotations/node-libs.toml");
+
 /// hinzu's shipped Python effect-annotation defaults: the CPython standard
 /// library's I/O surface (plus a few well-known effectful third-party packages),
 /// mapped to the same shared vocabulary. The counterpart to `std.toml` /
@@ -148,6 +159,18 @@ impl RootSeeds {
         seeds
     }
 
+    /// The shipped TypeScript base: the Node runtime surface (`node.toml`) plus
+    /// the common-package library pack (`node-libs.toml`), merged. Both are
+    /// built-in TypeScript defaults; a project's own `[trust]` / `[roots]` still
+    /// overrides either (merged later).
+    fn typescript_base() -> Self {
+        let mut seeds = Self::with_base(NODE_ANNOTATIONS);
+        seeds
+            .merge_toml(NODE_LIBS_ANNOTATIONS)
+            .expect("built-in node library pack is valid");
+        seeds
+    }
+
     /// A fresh table built from one built-in annotation file (`std.toml` or
     /// `node.toml`), before any policy overrides.
     fn with_base(base: &str) -> Self {
@@ -168,7 +191,7 @@ impl RootSeeds {
     pub fn for_language(language: Language) -> Self {
         match language {
             Language::Rust => Self::rust_base(),
-            Language::TypeScript => Self::with_base(NODE_ANNOTATIONS),
+            Language::TypeScript => Self::typescript_base(),
             Language::Python => {
                 // The stdlib base plus the shipped third-party library pack,
                 // merged. Both are built-in Python defaults; a project's own
@@ -1063,6 +1086,210 @@ mod tests {
             .roots
             .iter()
             .any(|r| r.effect == Effect::Fs && r.symbol == "node:fs::readFileSync"));
+    }
+
+    #[test]
+    fn node_library_pack_grades_drizzle_granularly() {
+        // The shipped TypeScript library pack (`node-libs.toml`) is merged onto
+        // the node base: drizzle's query builders resolve to `Pure` while its
+        // execution surface resolves to `db`. This granular split is the accuracy
+        // win — `eq(...)` is a pure value, not a database read.
+        let seeds = RootSeeds::for_language(Language::TypeScript);
+        // Query builders / comparison / aggregate helpers: pure, no effect.
+        for callee in [
+            "drizzle-orm::eq",
+            "drizzle-orm::and",
+            "drizzle-orm::or",
+            "drizzle-orm::sql",
+            "drizzle-orm::desc",
+            "drizzle-orm::asc",
+            "drizzle-orm::isNull",
+            "drizzle-orm::inArray",
+            "drizzle-orm::relations",
+            "drizzle-orm::max",
+            "drizzle-orm::getTableName",
+        ] {
+            assert_eq!(
+                seeds.effect_of(callee),
+                None,
+                "{callee} should seed no effect"
+            );
+            assert_eq!(
+                seeds.classify_foreign(callee),
+                Resolution::Pure,
+                "{callee} should be vouched pure"
+            );
+        }
+        // Execution surface: `db`. `effect_of` is what seeding consults, so this
+        // is the effect the pipeline attributes.
+        for callee in [
+            "drizzle-orm::select",
+            "drizzle-orm::from",
+            "drizzle-orm::where",
+            "drizzle-orm::insert",
+            "drizzle-orm::update",
+            "drizzle-orm::delete",
+            "drizzle-orm::transaction",
+            "drizzle-orm::execute",
+            "drizzle-orm::orderBy",
+            "drizzle-orm::all",
+            "drizzle-orm::get",
+        ] {
+            assert_eq!(
+                seeds.effect_of(callee),
+                Some(Effect::Db),
+                "{callee} should be db"
+            );
+        }
+    }
+
+    #[test]
+    fn node_library_pack_drizzle_pipeline_keeps_eq_pure_and_execution_db() {
+        // The faithful end-to-end proof, on a fact set as the adapter emits it: a
+        // function that builds a query with `eq(...)` and runs it with
+        // `.select().from().orderBy()`. After seeding, the execution surface is
+        // `db` roots and `eq` is neither a db root nor an Unknown — the accuracy
+        // win. `orderBy` stays `db` even though the `or` pure vouch is a substring
+        // of it, because seeding runs the effect table before the Unknown pass.
+        let mut facts = FactSet::default();
+        facts.add_def(crate::facts::Definition {
+            id: "src/db#listUsers".to_string(),
+            display: "listUsers".to_string(),
+            language: Language::TypeScript,
+            file: "src/db.ts".to_string(),
+            line_start: 1,
+            line_end: 4,
+        });
+        for callee in [
+            "drizzle-orm::eq",
+            "drizzle-orm::and",
+            "drizzle-orm::select",
+            "drizzle-orm::from",
+            "drizzle-orm::orderBy",
+        ] {
+            facts.add_edge(Edge::call("src/db#listUsers", callee, "src/db.ts", 2));
+        }
+        RootSeeds::for_language(Language::TypeScript).seed_unknowns(&mut facts);
+
+        let db: BTreeSet<&str> = facts
+            .roots
+            .iter()
+            .filter(|r| r.effect == Effect::Db)
+            .map(|r| r.symbol.as_str())
+            .collect();
+        assert_eq!(
+            db,
+            BTreeSet::from([
+                "drizzle-orm::select",
+                "drizzle-orm::from",
+                "drizzle-orm::orderBy",
+            ])
+        );
+        // `eq` / `and` are pure: no root of any kind, and not Unknown.
+        assert!(!facts
+            .roots
+            .iter()
+            .any(|r| r.symbol == "drizzle-orm::eq" || r.symbol == "drizzle-orm::and"));
+    }
+
+    #[test]
+    fn node_library_pack_grades_infra_packages() {
+        // The fleet's infra packages land as real categorized effects, not bare
+        // Unknown: pglite is a database, elysia / eden / the MCP SDK are network,
+        // disponent dispatches subprocesses.
+        let seeds = RootSeeds::for_language(Language::TypeScript);
+        assert_eq!(
+            seeds.effect_of("@electric-sql/pglite::exec"),
+            Some(Effect::Db)
+        );
+        assert_eq!(
+            seeds.effect_of("@electric-sql/pglite::query"),
+            Some(Effect::Db)
+        );
+        assert_eq!(seeds.effect_of("elysia::listen"), Some(Effect::Net));
+        assert_eq!(seeds.effect_of("@elysiajs/eden::post"), Some(Effect::Net));
+        assert_eq!(
+            seeds.effect_of("@modelcontextprotocol/sdk::callTool"),
+            Some(Effect::Net)
+        );
+        assert_eq!(
+            seeds.effect_of("@disponent/node::setEnv"),
+            Some(Effect::Process)
+        );
+    }
+
+    #[test]
+    fn node_library_pack_splits_bun_test_globals_from_bun_io() {
+        // `bun-types` is mixed: the `bun:test` API is pure (it dominates the
+        // Unknown count from test files), while Bun's runtime I/O is effectful.
+        let seeds = RootSeeds::for_language(Language::TypeScript);
+        // Test API: pure, no effect. The `to*` matcher families match by prefix.
+        for callee in [
+            "bun-types::expect",
+            "bun-types::describe",
+            "bun-types::test",
+            "bun-types::toBe",
+            "bun-types::toBeNull",
+            "bun-types::toEqual",
+            "bun-types::toHaveLength",
+            "bun-types::toMatchObject",
+            "bun-types::toThrow",
+            "bun-types::toBeGreaterThanOrEqual",
+        ] {
+            assert_eq!(
+                seeds.effect_of(callee),
+                None,
+                "{callee} should seed no effect"
+            );
+            assert_eq!(
+                seeds.classify_foreign(callee),
+                Resolution::Pure,
+                "{callee} should be vouched pure"
+            );
+        }
+        // Runtime I/O: effect roots, not shadowed by any pure vouch.
+        assert_eq!(seeds.effect_of("bun-types::spawn"), Some(Effect::Process));
+        assert_eq!(
+            seeds.effect_of("bun-types::spawnSync"),
+            Some(Effect::Process)
+        );
+        assert_eq!(seeds.effect_of("bun-types::file"), Some(Effect::Fs));
+        assert_eq!(seeds.effect_of("bun-types::write"), Some(Effect::Fs));
+        assert_eq!(seeds.effect_of("bun-types::serve"), Some(Effect::Net));
+        assert_eq!(
+            seeds.classify_foreign("bun-types::spawn"),
+            Resolution::Effect(Effect::Process)
+        );
+    }
+
+    #[test]
+    fn node_library_pack_vouches_ui_packages_pure() {
+        // The UI / util packages carry nothing in hinzu's vocabulary: react and
+        // friends resolve to `Pure` instead of failing closed on `Unknown`.
+        let seeds = RootSeeds::for_language(Language::TypeScript);
+        for callee in [
+            "react::useState",
+            "react::useEffect",
+            "react-dom::createPortal",
+            "zustand::useStore",
+            "@xterm/xterm::write",
+            "@codemirror/view::dispatch",
+            "@mantine/core::createTheme",
+            "ts-pattern::match",
+            "@sinclair/typebox::Object",
+            "@dnd-kit/core::useSensor",
+        ] {
+            assert_eq!(
+                seeds.effect_of(callee),
+                None,
+                "{callee} should seed no effect"
+            );
+            assert_eq!(
+                seeds.classify_foreign(callee),
+                Resolution::Pure,
+                "{callee} should be vouched pure"
+            );
+        }
     }
 
     #[test]
