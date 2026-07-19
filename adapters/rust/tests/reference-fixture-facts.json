@@ -1,0 +1,220 @@
+{
+  "definitions": [
+    {
+      "id": "reference_fixture::core::schedule_audit",
+      "display": "reference_fixture::core::schedule_audit",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 14,
+      "line_end": 14
+    },
+    {
+      "id": "reference_fixture::core::run_with",
+      "display": "reference_fixture::core::run_with",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 20,
+      "line_end": 20
+    },
+    {
+      "id": "reference_fixture::core::defer_read",
+      "display": "reference_fixture::core::defer_read",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 27,
+      "line_end": 27
+    },
+    {
+      "id": "reference_fixture::core::defer_read::{closure#0}",
+      "display": "reference_fixture::core::defer_read::{closure#0}",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 28,
+      "line_end": 28
+    },
+    {
+      "id": "reference_fixture::core::run_closure",
+      "display": "reference_fixture::core::run_closure",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 32,
+      "line_end": 32
+    },
+    {
+      "id": "reference_fixture::core::BOOT_CONFIG",
+      "display": "reference_fixture::core::BOOT_CONFIG",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 39,
+      "line_end": 39
+    },
+    {
+      "id": "reference_fixture::core::BOOT_CONFIG::{closure#0}",
+      "display": "reference_fixture::core::BOOT_CONFIG::{closure#0}",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 39,
+      "line_end": 39
+    },
+    {
+      "id": "reference_fixture::core::pure_total",
+      "display": "reference_fixture::core::pure_total",
+      "language": "rust",
+      "file": "src/core.rs",
+      "line_start": 43,
+      "line_end": 43
+    },
+    {
+      "id": "reference_fixture::effects::read_audit",
+      "display": "reference_fixture::effects::read_audit",
+      "language": "rust",
+      "file": "src/effects.rs",
+      "line_start": 10,
+      "line_end": 10
+    },
+    {
+      "id": "reference_fixture::run",
+      "display": "reference_fixture::run",
+      "language": "rust",
+      "file": "src/lib.rs",
+      "line_start": 10,
+      "line_end": 10
+    }
+  ],
+  "edges": [
+    {
+      "caller": "reference_fixture::core::schedule_audit",
+      "callee": "reference_fixture::effects::read_audit",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 15
+    },
+    {
+      "caller": "reference_fixture::core::schedule_audit",
+      "callee": "reference_fixture::core::run_with",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 15
+    },
+    {
+      "caller": "reference_fixture::core::run_with",
+      "callee": "<indirect>",
+      "kind": "call",
+      "resolution": "unresolved",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 21
+    },
+    {
+      "caller": "reference_fixture::core::defer_read",
+      "callee": "reference_fixture::core::run_closure::<{closure@src/core.rs:28:15: 28:17}>",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 29
+    },
+    {
+      "caller": "reference_fixture::core::defer_read",
+      "callee": "reference_fixture::core::defer_read::{closure#0}",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 29
+    },
+    {
+      "caller": "reference_fixture::core::defer_read::{closure#0}",
+      "callee": "reference_fixture::effects::read_audit",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 28
+    },
+    {
+      "caller": "reference_fixture::core::BOOT_CONFIG",
+      "callee": "reference_fixture::core::BOOT_CONFIG::{closure#0}",
+      "kind": "reference",
+      "resolution": "reference",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 39
+    },
+    {
+      "caller": "reference_fixture::core::BOOT_CONFIG",
+      "callee": "std::sync::LazyLock::<std::string::String>::new",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 39
+    },
+    {
+      "caller": "reference_fixture::core::BOOT_CONFIG::{closure#0}",
+      "callee": "reference_fixture::effects::read_audit",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/core.rs",
+      "evidence_line": 39
+    },
+    {
+      "caller": "reference_fixture::effects::read_audit",
+      "callee": "std::fs::read_to_string::<&str>",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/effects.rs",
+      "evidence_line": 11
+    },
+    {
+      "caller": "reference_fixture::effects::read_audit",
+      "callee": "std::result::Result::<std::string::String, std::io::Error>::unwrap_or_default",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/effects.rs",
+      "evidence_line": 11
+    },
+    {
+      "caller": "reference_fixture::run",
+      "callee": "reference_fixture::core::schedule_audit",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/lib.rs",
+      "evidence_line": 11
+    },
+    {
+      "caller": "reference_fixture::run",
+      "callee": "reference_fixture::core::defer_read",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/lib.rs",
+      "evidence_line": 12
+    },
+    {
+      "caller": "reference_fixture::run",
+      "callee": "reference_fixture::core::pure_total",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/lib.rs",
+      "evidence_line": 13
+    },
+    {
+      "caller": "reference_fixture::run",
+      "callee": "<std::sync::LazyLock<std::string::String> as std::ops::Deref>::deref",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/lib.rs",
+      "evidence_line": 14
+    },
+    {
+      "caller": "reference_fixture::run",
+      "callee": "std::string::String::len",
+      "kind": "call",
+      "resolution": "call",
+      "evidence_file": "src/lib.rs",
+      "evidence_line": 14
+    }
+  ],
+  "effect_roots": [
+    {
+      "symbol": "std::fs::read_to_string::<&str>",
+      "effect": "fs"
+    }
+  ]
+}
