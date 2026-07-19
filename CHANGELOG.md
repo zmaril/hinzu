@@ -83,7 +83,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dogfood run over hinzu-core surfaced `Store::open`'s `impl AsRef<Path>`
   `with_context` closure, whose `path.as_ref()` was a benign, pure, unmonomorphized
   std trait call, not a real effect.
-
+- **Design note: a language-understanding rule layer — a "straitjacket for
+  semantics."** `notes/rules-design.md` designs the surface that turns hinzu's
+  effect analysis into a general rule engine with straitjacket's ergonomics: a
+  rule is a query over the fact database (plus derived facts) that emits findings
+  with evidence paths, gates CI on a non-zero exit, and reads its config from a
+  `[rules]` section of `hinzu.toml`. Effects become the first rule; three React
+  and TypeScript rules are the first peers — `effect-in-component` (a
+  component-aware view over the existing effect propagation, superseding
+  straitjacket's token-based version by printing the real evidence path to the
+  effect), `prop-drilling`, and `one-component-per-file`. The note specifies the
+  new adapter facts the rules need (a semantic `is_component` flag, `Render`
+  edges for the component tree, and prop-forwarding / prop-usage facts), gives an
+  honest per-rule fidelity read — including prop-drilling's real limits (`{...}`
+  spread, HOC wrappers, context, computed props) — and sets the rollout after PRs
+  #21/#22. Design only; the implementation follows in later pull requests.
 - **The reference-level rung of the precision ladder, for Python: a tree-sitter
   syntactic layer resolved through the LSP.** The generic LSP driver builds its
   graph from `callHierarchy/outgoingCalls`, which is call-only — it misses a
