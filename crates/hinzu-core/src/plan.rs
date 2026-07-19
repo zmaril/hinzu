@@ -613,6 +613,17 @@ mod tests {
         make_def(id, file, 1, line_end)
     }
 
+    /// Three defs `a`/`b`/`c`, each in its own file. The layering tests share
+    /// this base and each adds the edges that shape it into a chain, a diamond,
+    /// or a cycle.
+    fn abc_facts() -> FactSet {
+        let mut facts = FactSet::default();
+        facts.add_def(fdef("a", "a.rs", 3));
+        facts.add_def(fdef("b", "b.rs", 3));
+        facts.add_def(fdef("c", "c.rs", 3));
+        facts
+    }
+
     /// Build a plan from a fact set, going through the real DAG builder so the
     /// plan is exercised over genuine file rollups.
     fn plan_of(facts: &FactSet, opts: PlanOpts) -> PlanOutput {
@@ -630,10 +641,7 @@ mod tests {
     #[test]
     fn chain_layers_leaf_first() {
         // a.rs -> b.rs -> c.rs (a depends on b depends on c).
-        let mut facts = FactSet::default();
-        facts.add_def(fdef("a", "a.rs", 3));
-        facts.add_def(fdef("b", "b.rs", 3));
-        facts.add_def(fdef("c", "c.rs", 3));
+        let mut facts = abc_facts();
         facts.add_edge(Edge::call("a", "b", "a.rs", 2));
         facts.add_edge(Edge::call("b", "c", "b.rs", 2));
 
@@ -671,10 +679,7 @@ mod tests {
     #[test]
     fn diamond_puts_independent_middle_in_one_wave() {
         // a depends on b and c; b and c depend on d.
-        let mut facts = FactSet::default();
-        facts.add_def(fdef("a", "a.rs", 3));
-        facts.add_def(fdef("b", "b.rs", 3));
-        facts.add_def(fdef("c", "c.rs", 3));
+        let mut facts = abc_facts();
         facts.add_def(fdef("d", "d.rs", 3));
         facts.add_edge(Edge::call("a", "b", "a.rs", 2));
         facts.add_edge(Edge::call("a", "c", "a.rs", 3));
@@ -703,10 +708,7 @@ mod tests {
     #[test]
     fn file_cycle_is_one_mandatory_group() {
         // b.rs <-> c.rs (cycle), and a.rs depends on the cycle.
-        let mut facts = FactSet::default();
-        facts.add_def(fdef("a", "a.rs", 3));
-        facts.add_def(fdef("b", "b.rs", 3));
-        facts.add_def(fdef("c", "c.rs", 3));
+        let mut facts = abc_facts();
         facts.add_edge(Edge::call("a", "b", "a.rs", 2));
         facts.add_edge(Edge::call("b", "c", "b.rs", 2));
         facts.add_edge(Edge::call("c", "b", "c.rs", 2));
