@@ -12,6 +12,12 @@ pub enum Band {
     /// Coverage ≥ `ported_threshold`, but not in the native set.
     #[serde(rename = "PORTED")]
     Ported,
+    /// A would-be PORTED/STARTED file whose matched symbols land predominantly
+    /// (> 50%) in a **secondary** target crate — the port moved out of the
+    /// package's primary crate. A variant of matched, reported between PORTED and
+    /// STARTED. Single-crate packages never produce this band.
+    #[serde(rename = "RELOCATED")]
+    Relocated,
     /// At least one symbol matched (or a target subtree was mapped), below
     /// threshold.
     #[serde(rename = "STARTED")]
@@ -26,6 +32,7 @@ pub enum Band {
 pub struct BandCounts {
     pub done: usize,
     pub ported: usize,
+    pub relocated: usize,
     pub started: usize,
     pub not_started: usize,
 }
@@ -35,6 +42,7 @@ impl BandCounts {
         match band {
             Band::Done => self.done += 1,
             Band::Ported => self.ported += 1,
+            Band::Relocated => self.relocated += 1,
             Band::Started => self.started += 1,
             Band::NotStarted => self.not_started += 1,
         }
@@ -287,6 +295,7 @@ impl RollupTotals {
         self.source_files_total += o.source_files_total;
         self.bands.done += o.bands.done;
         self.bands.ported += o.bands.ported;
+        self.bands.relocated += o.bands.relocated;
         self.bands.started += o.bands.started;
         self.bands.not_started += o.bands.not_started;
         self.symbols_total += o.symbols_total;
@@ -479,7 +488,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn tiny(
         files: usize,
-        bands: (usize, usize, usize, usize),
+        bands: (usize, usize, usize, usize, usize),
         sym_total: usize,
         sym_matched: usize,
         native: usize,
@@ -489,8 +498,9 @@ mod tests {
         let bands = BandCounts {
             done: bands.0,
             ported: bands.1,
-            started: bands.2,
-            not_started: bands.3,
+            relocated: bands.2,
+            started: bands.3,
+            not_started: bands.4,
         };
         PortDiffReport {
             source_kind: "ts".to_string(),
@@ -540,10 +550,10 @@ mod tests {
 
     #[test]
     fn aggregate_sums_totals_and_recomputes_overall_pct() {
-        // Two tiny packages: 10 files (D1 P2 S3 N4), 20 symbols 10 matched, and
-        // 6 files (D0 P1 S2 N3), 30 symbols 20 matched.
-        let a = tiny(10, (1, 2, 3, 4), 20, 10, 1, 1, 2);
-        let b = tiny(6, (0, 1, 2, 3), 30, 20, 0, 0, 1);
+        // Two tiny packages: 10 files (D1 P2 R1 S3 N4), 20 symbols 10 matched, and
+        // 6 files (D0 P1 R1 S2 N3), 30 symbols 20 matched.
+        let a = tiny(10, (1, 2, 1, 3, 4), 20, 10, 1, 1, 2);
+        let b = tiny(6, (0, 1, 1, 2, 3), 30, 20, 0, 0, 1);
         let multi = MultiPackageReport::aggregate(
             "ts",
             "rust",
@@ -562,6 +572,7 @@ mod tests {
         assert_eq!(t.source_files_total, 16);
         assert_eq!(t.bands.done, 1);
         assert_eq!(t.bands.ported, 3);
+        assert_eq!(t.bands.relocated, 2);
         assert_eq!(t.bands.started, 5);
         assert_eq!(t.bands.not_started, 7);
         assert_eq!(t.symbols_total, 50);
