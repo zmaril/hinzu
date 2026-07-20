@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod adapter_harness;
+mod api_py;
 mod api_rust;
 mod api_ts;
 mod go_adapter;
@@ -336,18 +337,17 @@ fn graph(args: GraphArgs) -> Result<ExitCode> {
 /// takes `--lang`), dispatches to the per-language extractor, and writes the
 /// public-API JSON to `--out` or stdout. All the file/process effects live in
 /// the extractor (the CLI side); core only normalizes the parsed result. Rust is
-/// extracted via `rustdoc --output-format=json` and TypeScript via the
-/// compiler-API adapter in `--api` mode; the remaining languages fail with an
-/// honest "not yet implemented" rather than faking a surface.
+/// extracted via `rustdoc --output-format=json`, TypeScript via the compiler-API
+/// adapter in `--api` mode, and Python via ty over its LSP; Go is not yet
+/// implemented and fails honestly rather than faking a surface.
 fn api(args: ApiArgs) -> Result<ExitCode> {
     let language = detect_api_language(&args.path, args.lang.as_deref())?;
     let report = match language.as_str() {
         "rust" => api_rust::extract(&args.path, &args.path.display().to_string())?,
         "typescript" => api_ts::extract(&args.path, &args.path.display().to_string())?,
-        "python" | "go" => {
-            anyhow::bail!(
-                "{language} api extraction is not yet implemented (phase 2 covers Rust and TypeScript)"
-            )
+        "python" => api_py::extract(&args.path, &args.path.display().to_string())?,
+        "go" => {
+            anyhow::bail!("go api extraction is not yet implemented")
         }
         other => {
             anyhow::bail!("unknown --lang '{other}'; expected rust, typescript, python, or go")
