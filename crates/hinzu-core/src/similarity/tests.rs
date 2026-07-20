@@ -48,12 +48,26 @@ fn sig(id: &str, file: &str) -> StructuralSignature {
     }
 }
 
+/// Analyze `sigs` with the default params and the conventional `"root"`. Shared
+/// so the tests don't each spell out the same `analyze(…, &default)` call.
+fn analyze_default(sigs: Vec<StructuralSignature>) -> SimilarityOutput {
+    analyze("root", sigs, &AnalyzeParams::default())
+}
+
+/// Analyze with default params, assert exactly one candidate clustered, and
+/// return it — the recurring shape of the clustering tests.
+fn one_candidate(sigs: Vec<StructuralSignature>) -> Finding {
+    let out = analyze_default(sigs);
+    assert_eq!(out.stats.candidates_found, 1);
+    out.candidates.into_iter().next().unwrap()
+}
+
 /// Two structurally identical bodies cluster into one helper_function candidate.
 #[test]
 fn identical_bodies_cluster_as_a_helper() {
     let a = sig("crate::m::alpha", "a.rs");
     let b = sig("crate::m::beta", "a.rs");
-    let out = analyze("root", vec![a, b], &AnalyzeParams::default());
+    let out = analyze_default(vec![a, b]);
 
     assert_eq!(out.stats.candidates_found, 1);
     let f = &out.candidates[0];
@@ -93,9 +107,7 @@ fn same_shell_differing_types_is_a_generic() {
         result: "Option<_>".to_string(),
     };
     // Keep calls + cfg identical (both from `sig`), only types differ.
-    let out = analyze("root", vec![a, b], &AnalyzeParams::default());
-    assert_eq!(out.stats.candidates_found, 1);
-    let f = &out.candidates[0];
+    let f = one_candidate(vec![a, b]);
     assert_eq!(f.likely_abstraction.family, "generic_function");
     // The differing types are surfaced as an abstraction axis.
     assert!(f.differences.iter().any(|d| d.contains("type shapes vary")));
@@ -122,9 +134,7 @@ fn same_shape_differing_callees_is_dispatch() {
         "run_b".to_string(),
         "finish".to_string(),
     ];
-    let out = analyze("root", vec![a, b], &AnalyzeParams::default());
-    assert_eq!(out.stats.candidates_found, 1);
-    let f = &out.candidates[0];
+    let f = one_candidate(vec![a, b]);
     assert_eq!(f.likely_abstraction.family, "enum_dispatch");
     assert!(f
         .differences
@@ -154,9 +164,7 @@ fn dissimilar_body_does_not_cluster() {
     c.shingles = vec![90, 91, 92, 93, 94, 95];
     c.stmt_histogram = BTreeMap::from([("loop".to_string(), 3), ("call".to_string(), 2)]);
 
-    let out = analyze("root", vec![a, b, c], &AnalyzeParams::default());
-    assert_eq!(out.stats.candidates_found, 1);
-    let f = &out.candidates[0];
+    let f = one_candidate(vec![a, b, c]);
     // Only alpha + beta cluster; gamma is left out.
     let ids: Vec<&str> = f.members.iter().map(|m| m.symbol_id.as_str()).collect();
     assert!(ids.contains(&"crate::m::alpha"));
@@ -175,7 +183,7 @@ fn trivial_defs_are_filtered() {
     b.token_len = 4;
     b.stmt_histogram = BTreeMap::from([("call".to_string(), 1)]);
 
-    let out = analyze("root", vec![a, b], &AnalyzeParams::default());
+    let out = analyze_default(vec![a, b]);
     assert_eq!(out.stats.signatures_analyzed, 2);
     assert_eq!(out.stats.signatures_after_filter, 0);
     assert_eq!(out.stats.candidates_found, 0);
@@ -187,9 +195,7 @@ fn three_identical_bodies_suggest_macro_option() {
     let a = sig("crate::m::a", "a.rs");
     let b = sig("crate::m::b", "a.rs");
     let c = sig("crate::m::c", "a.rs");
-    let out = analyze("root", vec![a, b, c], &AnalyzeParams::default());
-    assert_eq!(out.stats.candidates_found, 1);
-    let f = &out.candidates[0];
+    let f = one_candidate(vec![a, b, c]);
     assert_eq!(f.members.len(), 3);
     assert_eq!(f.likely_abstraction.family, "helper_function");
     assert!(f
@@ -350,13 +356,7 @@ fn boilerplate_trio(language: &str) -> Vec<StructuralSignature> {
 /// table / codegen), not a `macro_rules!`.
 #[test]
 fn ts_boilerplate_gets_ts_family_not_macro_rules() {
-    let out = analyze(
-        "root",
-        boilerplate_trio("typescript"),
-        &AnalyzeParams::default(),
-    );
-    assert_eq!(out.stats.candidates_found, 1, "the trio should cluster");
-    let f = &out.candidates[0];
+    let f = one_candidate(boilerplate_trio("typescript"));
     assert_eq!(f.members.len(), 3);
     assert_eq!(
         f.likely_abstraction.family, "object_driven_definition",
@@ -380,9 +380,7 @@ fn ts_boilerplate_gets_ts_family_not_macro_rules() {
 /// per-language routing keeps the Rust label where it is correct.
 #[test]
 fn rust_boilerplate_still_gets_macro_rules() {
-    let out = analyze("root", boilerplate_trio("rust"), &AnalyzeParams::default());
-    assert_eq!(out.stats.candidates_found, 1);
-    let f = &out.candidates[0];
+    let f = one_candidate(boilerplate_trio("rust"));
     assert_eq!(f.likely_abstraction.family, "macro_rules");
 }
 
@@ -392,11 +390,7 @@ fn rust_boilerplate_still_gets_macro_rules() {
 #[test]
 fn every_finding_family_is_in_its_language_profile() {
     for language in ["rust", "typescript"] {
-        let out = analyze(
-            "root",
-            boilerplate_trio(language),
-            &AnalyzeParams::default(),
-        );
+        let out = analyze_default(boilerplate_trio(language));
         let profile = profile_for_language(language).expect("shipped profile");
         for f in &out.candidates {
             assert!(
@@ -425,7 +419,6 @@ fn transitive_pairs_form_one_cluster() {
     b.shingles = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let mut c = sig("t::c", "a.rs");
     c.shingles = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    let out = analyze("root", vec![a, b, c], &AnalyzeParams::default());
-    assert_eq!(out.stats.candidates_found, 1);
-    assert_eq!(out.candidates[0].members.len(), 3);
+    let f = one_candidate(vec![a, b, c]);
+    assert_eq!(f.members.len(), 3);
 }

@@ -1,5 +1,14 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
+// straitjacket-allow-file[:file-size] — this is the CLI's single dispatch shell:
+// one thin arg-struct + handler per subcommand, handed straight to hinzu-core.
+// It grows by a bounded amount with each subcommand and is over the default
+// line budget only because two independently-under-budget features (`ranges`
+// and `similar`) now live side by side here. Splitting a per-command handler
+// into its own module is the eventual cleanup, but the `similar` glue is still
+// actively edited by the stacked `--rust-extractor`/`--libraries` work, so it
+// stays put for now rather than churning those diffs.
+
 mod adapter_harness;
 mod api_fluessig;
 mod api_py;
@@ -657,18 +666,9 @@ fn merge_similarity_outputs(
         candidates.extend(o.candidates);
     }
 
-    // Re-sort by confidence desc, then member count desc, then first symbol id,
-    // and re-mint stable ids across the merged set.
-    candidates.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.members.len().cmp(&a.members.len()))
-            .then(a.members[0].symbol_id.cmp(&b.members[0].symbol_id))
-    });
-    for (n, c) in candidates.iter_mut().enumerate() {
-        c.id = format!("cand-{}", n + 1);
-    }
+    // Re-sort and re-mint stable ids across the merged set, using the same
+    // ordering the core analyzer applies to a single-language run.
+    hinzu_core::similarity::sort_and_number_findings(&mut candidates);
     stats.candidates_found = candidates.len();
 
     hinzu_core::similarity::SimilarityOutput {

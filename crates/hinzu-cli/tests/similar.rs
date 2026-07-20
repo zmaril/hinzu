@@ -27,19 +27,25 @@ fn ts_fixture() -> PathBuf {
     crate_dir().join("tests/fixtures/similar-ts-fixture.json")
 }
 
-/// The `--structural` fixture path: two type-varying `parse_*` functions cluster
-/// into one `generic_function` candidate; the unrelated `sum_list` does not join.
-#[test]
-fn similar_clusters_the_type_varying_parse_functions() {
+/// Run `hinzu similar --structural <fixture>`, assert the process succeeds, and
+/// parse its stdout as JSON. Shared by the two fixture-driven cases.
+fn run_similar_structural(fixture: PathBuf) -> Value {
     let mut cmd = Command::cargo_bin("hinzu").unwrap();
     let assert = cmd
         .arg("similar")
         .arg("--structural")
-        .arg(fixture())
+        .arg(fixture)
         .assert()
         .success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    let doc: Value = serde_json::from_str(&out).expect("stdout is JSON");
+    serde_json::from_str(&out).expect("stdout is JSON")
+}
+
+/// The `--structural` fixture path: two type-varying `parse_*` functions cluster
+/// into one `generic_function` candidate; the unrelated `sum_list` does not join.
+#[test]
+fn similar_clusters_the_type_varying_parse_functions() {
+    let doc = run_similar_structural(fixture());
 
     assert_eq!(doc["hinzu_similarity_version"], 1);
     assert_eq!(doc["stats"]["signatures_analyzed"], 3);
@@ -91,15 +97,7 @@ fn similar_clusters_the_type_varying_parse_functions() {
 /// the Rust profile is bound by, the whole point of the language-profile concept.
 #[test]
 fn similar_clusters_typescript_loaders_via_resolved_types() {
-    let mut cmd = Command::cargo_bin("hinzu").unwrap();
-    let assert = cmd
-        .arg("similar")
-        .arg("--structural")
-        .arg(ts_fixture())
-        .assert()
-        .success();
-    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    let doc: Value = serde_json::from_str(&out).expect("stdout is JSON");
+    let doc = run_similar_structural(ts_fixture());
 
     assert_eq!(doc["hinzu_similarity_version"], 1);
     assert_eq!(doc["languages"][0], "typescript");

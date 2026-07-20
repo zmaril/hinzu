@@ -23,23 +23,26 @@
 import ts from "typescript";
 import path from "node:path";
 import fs from "node:fs";
+import {
+  parseArgs,
+  programFromTsconfig,
+  makeOwnedRel,
+  forEachOwnedSourceFile,
+  isFunctionLike,
+  nameForNode,
+  qualifierChain,
+  lineOf,
+} from "./common.mjs";
 
 // The k in the k-gram shingles, fixed to match the engine + the Rust extractor
 // (`hinzu_core::similarity::SHINGLE_K` / structural_rust.rs).
 const SHINGLE_K = 3;
 
 // --- argument parsing --------------------------------------------------------
-const argv = process.argv.slice(2);
-let projectArg = null;
-let tsconfigArg = null;
-for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === "--tsconfig") tsconfigArg = argv[++i];
-  else if (!projectArg) projectArg = argv[i];
-}
-if (!projectArg) {
-  console.error("usage: node structural.mjs <project-dir> [--tsconfig <path>]");
-  process.exit(2);
-}
+const { projectArg, tsconfigArg } = parseArgs(
+  process.argv.slice(2),
+  "usage: node structural.mjs <project-dir> [--tsconfig <path>]",
+);
 const ROOT = path.resolve(projectArg);
 
 // --- build the Program -------------------------------------------------------
@@ -53,19 +56,9 @@ const tsconfigPath = tsconfigArg
 
 let program;
 if (tsconfigPath && fs.existsSync(tsconfigPath)) {
-  const cfgFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
-  const parsed = ts.parseJsonConfigFileContent(
-    cfgFile.config,
-    ts.sys,
-    path.dirname(tsconfigPath),
-    { noEmit: true },
-  );
-  if (parsed.errors.length) {
-    for (const e of parsed.errors) {
-      console.error("tsconfig:", ts.flattenDiagnosticMessageText(e.messageText, "\n"));
-    }
-  }
-  program = ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options });
+  const built = programFromTsconfig(tsconfigPath);
+  program = built.program;
+  const parsed = built.parsed;
   console.error(
     `hinzu-ts-structural: TypeScript ${ts.version} via ${path.relative(ROOT, tsconfigPath) || "tsconfig.json"} | ` +
       `root files ${parsed.fileNames.length} | program sources ${program.getSourceFiles().length}`,
@@ -113,68 +106,12 @@ function globTsFiles(root) {
 }
 
 // --- which files we own (attribute signatures to) ----------------------------
-// The same ownership filter analyze.mjs uses: real project source, not a
-// dependency, not a declaration file, not build output.
-const IGNORED_DIRS = /(^|\/)(node_modules|dist|build|out|coverage|\.git)(\/|$)/;
-function ownedRel(fileName) {
-  const rel = path.relative(ROOT, fileName);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  const unix = rel.split(path.sep).join("/");
-  if (IGNORED_DIRS.test("/" + unix)) return null;
-  if (unix.endsWith(".d.ts")) return null;
-  return unix;
-}
+// The same ownership filter analyze.mjs uses (see common.mjs): real project
+// source, not a dependency, not a declaration file, not build output.
+const ownedRel = makeOwnedRel(ROOT);
 
-// --- naming (mirrors analyze.mjs) --------------------------------------------
-function nameForNode(n) {
-  if (
-    (ts.isFunctionDeclaration(n) ||
-      ts.isMethodDeclaration(n) ||
-      ts.isGetAccessorDeclaration(n) ||
-      ts.isSetAccessorDeclaration(n)) &&
-    n.name
-  ) {
-    return n.name.getText();
-  }
-  if (ts.isConstructorDeclaration(n)) return "constructor";
-  const p = n.parent;
-  if (p && ts.isVariableDeclaration(p) && p.name) return p.name.getText();
-  if (p && ts.isPropertyAssignment(p) && p.name) return p.name.getText();
-  if (p && ts.isPropertyDeclaration(p) && p.name) return p.name.getText();
-  if (p && ts.isExportAssignment(p)) return "(default)";
-  if (p && (ts.isCallExpression(p) || ts.isNewExpression(p))) return "(callback)";
-  return "(anonymous)";
-}
-
-function qualifierChain(n) {
-  const parts = [];
-  let cur = n.parent;
-  while (cur) {
-    if (ts.isClassDeclaration(cur) || ts.isClassExpression(cur)) {
-      parts.unshift(cur.name ? cur.name.getText() : "(class)");
-    } else if (ts.isModuleDeclaration(cur) && cur.name) {
-      parts.unshift(cur.name.getText());
-    }
-    cur = cur.parent;
-  }
-  return parts;
-}
-
-function lineOf(sf, pos) {
-  return sf.getLineAndCharacterOfPosition(pos).line + 1;
-}
-
-function isFunctionLike(n) {
-  return (
-    ts.isFunctionDeclaration(n) ||
-    ts.isMethodDeclaration(n) ||
-    ts.isArrowFunction(n) ||
-    ts.isFunctionExpression(n) ||
-    ts.isConstructorDeclaration(n) ||
-    ts.isGetAccessorDeclaration(n) ||
-    ts.isSetAccessorDeclaration(n)
-  );
-}
+// Naming (`nameForNode`, `qualifierChain`), `lineOf`, and `isFunctionLike` are
+// shared with analyze.mjs — see common.mjs.
 
 // The def kind, in the engine's vocabulary. A method/accessor/constructor is a
 // "method"; a named function declaration is a "function"; an arrow or function
@@ -574,16 +511,13 @@ function buildSignature(n, sf, rel, relNoExt) {
   });
 }
 
-for (const sf of program.getSourceFiles()) {
-  const rel = ownedRel(sf.fileName);
-  if (!rel) continue;
-  const relNoExt = rel.replace(/\.[cm]?tsx?$/, "");
+forEachOwnedSourceFile(program, ownedRel, (sf, rel, relNoExt) => {
   const walk = (n) => {
     if (isFunctionLike(n)) buildSignature(n, sf, rel, relNoExt);
     ts.forEachChild(n, walk);
   };
   ts.forEachChild(sf, walk);
-}
+});
 
 console.error(`hinzu-ts-structural: signatures ${signatures.length}`);
 
