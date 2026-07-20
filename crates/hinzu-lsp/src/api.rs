@@ -210,27 +210,17 @@ fn python_fidelity(excluded: usize) -> Fidelity {
 }
 
 /// Send `initialize` (advertising documentSymbol + hover) with the config's ty
-/// init options, then `initialized`.
+/// init options, then `initialized`, via the shared LSP handshake.
 fn initialize(lsp: &mut LspClient, project: &Path, init_options: &Value) -> Result<()> {
-    let root_uri = path_to_uri(project);
-    let params = json!({
-        "processId": std::process::id(),
-        "rootUri": root_uri,
-        "initializationOptions": init_options,
-        "capabilities": {
-            "textDocument": {
-                "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
-                "hover": {"contentFormat": ["markdown", "plaintext"]},
-            },
-            "window": {"workDoneProgress": true},
-        },
-        "workspaceFolders": [{"uri": root_uri, "name": project.file_name()
-            .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into())}],
-    });
-    lsp.request("initialize", params, Duration::from_secs(30))
-        .context("LSP initialize")?;
-    lsp.notify("initialized", json!({}))?;
-    Ok(())
+    crate::client::initialize(
+        lsp,
+        project,
+        init_options,
+        json!({
+            "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+            "hover": {"contentFormat": ["markdown", "plaintext"]},
+        }),
+    )
 }
 
 /// Discover the package's `.py` source files, skipping the usual non-source
@@ -422,25 +412,10 @@ fn base_item(
     rel: &str,
     s: &DocSym,
 ) -> ApiItem {
-    ApiItem {
-        kind: kind.to_string(),
-        id: id.to_string(),
-        name: name.to_string(),
-        visibility: "public".to_string(),
-        module_path: module_path.to_string(),
-        file: Some(rel.to_string()),
-        line: Some(s.selection_range.start.line + 1),
-        doc: None,
-        generics: Vec::new(),
-        deprecated: false,
-        signature: None,
-        fields: Vec::new(),
-        variants: Vec::new(),
-        implements: Vec::new(),
-        alias_target: None,
-        const_type: None,
-        const_value: None,
-    }
+    let mut item = ApiItem::new(kind, id, name, module_path);
+    item.file = Some(rel.to_string());
+    item.line = Some(s.selection_range.start.line + 1);
+    item
 }
 
 /// `documentSymbol` for one uri, retried a few times against a cold server.

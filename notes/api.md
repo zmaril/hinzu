@@ -194,13 +194,13 @@ apply to the kinds noted.
 `kind` is a plain string so it can carry any language's spelling. The values in
 use today:
 
-- `function` — a free function (or a function-typed constant in TS/Python).
-- `method` — a method or associated function; its owning type is in `receiver`.
-- `struct`, `enum`, `trait` — Rust aggregates and the trait interface.
-- `class`, `interface` — TS/Python classes and TS interfaces.
-- `typeAlias` — a type alias (`aliasTarget` holds the aliased type).
-- `const` — a constant or module-level value (`constType` / `constValue`).
-- `namespace` — a TS/Python namespace or module value.
+- `function`: a free function (or a function-typed constant in TS/Python).
+- `method`: a method or associated function; its owning type is in `receiver`.
+- `struct`, `enum`, `trait`: Rust aggregates and the trait interface.
+- `class`, `interface`: TS/Python classes and TS interfaces.
+- `typeAlias`: a type alias (`aliasTarget` holds the aliased type).
+- `const`: a constant or module-level value (`constType` / `constValue`).
+- `namespace`: a TS/Python namespace or module value.
 
 Types are **rendered strings** (`Vec<String>`, `Option<Bar>`, `dict[str, str]`) —
 honest and portable for v1. Structured, cross-referenced type references are a

@@ -373,25 +373,32 @@ fn collect_type_members(
             if !imp.get("trait").map(Value::is_null).unwrap_or(true) {
                 continue;
             }
-            for m_id in imp
-                .get("items")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(m) = method_item(owner_id, module_path, &Id(m_id.clone()).key(), index)
-                {
-                    out.push(m);
-                }
-            }
+            push_methods(imp.get("items"), owner_id, module_path, index, out);
         }
     }
     // Trait's own methods.
-    if let Some(items) = inner.get("trait").and_then(|v| v.get("items")) {
-        for m_id in items.as_array().into_iter().flatten() {
-            if let Some(m) = method_item(owner_id, module_path, &Id(m_id.clone()).key(), index) {
-                out.push(m);
-            }
+    push_methods(
+        inner.get("trait").and_then(|v| v.get("items")),
+        owner_id,
+        module_path,
+        index,
+        out,
+    );
+}
+
+/// Push a `method` item for each id in `ids` (an impl's or trait's `items` list)
+/// that resolves to a public function. Shared by the inherent-impl and trait
+/// method walks.
+fn push_methods(
+    ids: Option<&Value>,
+    owner_id: &str,
+    module_path: &str,
+    index: &BTreeMap<String, Value>,
+    out: &mut Vec<ApiItem>,
+) {
+    for m_id in ids.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(m) = method_item(owner_id, module_path, &Id(m_id.clone()).key(), index) {
+            out.push(m);
         }
     }
 }
@@ -458,32 +465,30 @@ fn simple_item(
     }
 }
 
+/// Resolve a rustdoc id to its `index` item and the named `inner` payload
+/// (`"variant"`, `"impl"`, …), or `None` when the id is absent or carries a
+/// different payload. The shared front of the variant/impl walks.
+fn resolve_inner<'a>(
+    index: &'a BTreeMap<String, Value>,
+    id: &Value,
+    tag: &str,
+) -> Option<(&'a Value, &'a Value)> {
+    let item = index.get(&Id(id.clone()).key())?;
+    let inner = item.get("inner")?.get(tag)?;
+    Some((item, inner))
+}
+
 /// The common item metadata every kind shares. Payload fields (signature,
 /// fields, …) start empty and are filled by the caller for the item's kind.
 fn base_item(kind: &str, full_id: &str, module_path: &str, item: &Value) -> ApiItem {
-    ApiItem {
-        kind: kind.to_string(),
-        id: full_id.to_string(),
-        name: item
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        visibility: visibility_of(item),
-        module_path: module_path.to_string(),
-        file: span_file(item),
-        line: span_line(item),
-        doc: doc_of(item),
-        generics: Vec::new(),
-        deprecated: !item.get("deprecation").map(Value::is_null).unwrap_or(true),
-        signature: None,
-        fields: Vec::new(),
-        variants: Vec::new(),
-        implements: Vec::new(),
-        alias_target: None,
-        const_type: None,
-        const_value: None,
-    }
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    let mut api = ApiItem::new(kind, full_id, name, module_path);
+    api.visibility = visibility_of(item);
+    api.file = span_file(item);
+    api.line = span_line(item);
+    api.doc = doc_of(item);
+    api.deprecated = !item.get("deprecation").map(Value::is_null).unwrap_or(true);
+    api
 }
 
 /// Whether a rustdoc item's own visibility is public.
@@ -645,10 +650,7 @@ fn enum_variants(en: Option<&Value>, index: &BTreeMap<String, Value>) -> Vec<Var
     };
     let mut out = Vec::new();
     for id in ids {
-        let Some(item) = index.get(&Id(id.clone()).key()) else {
-            continue;
-        };
-        let Some(var) = item.get("inner").and_then(|v| v.get("variant")) else {
+        let Some((item, var)) = resolve_inner(index, id, "variant") else {
             continue;
         };
         out.push(Variant {
@@ -696,10 +698,7 @@ fn implemented_traits(ty: Option<&Value>, index: &BTreeMap<String, Value>) -> Ve
     };
     let mut out = Vec::new();
     for id in ids {
-        let Some(item) = index.get(&Id(id.clone()).key()) else {
-            continue;
-        };
-        let Some(imp) = item.get("inner").and_then(|v| v.get("impl")) else {
+        let Some((_item, imp)) = resolve_inner(index, id, "impl") else {
             continue;
         };
         if imp.get("is_synthetic").and_then(Value::as_bool) == Some(true)

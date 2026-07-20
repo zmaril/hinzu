@@ -152,6 +152,35 @@ pub struct ApiItem {
     pub const_value: Option<String>,
 }
 
+impl ApiItem {
+    /// A bare item with the given identity and an empty payload: `public`
+    /// visibility, no file/line/doc, not deprecated, and every kind-specific
+    /// field (`signature`, `fields`, `variants`, `implements`, alias/const) left
+    /// empty. Each language extractor calls this and then fills only the fields
+    /// its item kind carries — the one place the empty-item shape is written.
+    pub fn new(kind: &str, id: &str, name: &str, module_path: &str) -> Self {
+        ApiItem {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            visibility: "public".to_string(),
+            module_path: module_path.to_string(),
+            file: None,
+            line: None,
+            doc: None,
+            generics: Vec::new(),
+            deprecated: false,
+            signature: None,
+            fields: Vec::new(),
+            variants: Vec::new(),
+            implements: Vec::new(),
+            alias_target: None,
+            const_type: None,
+            const_value: None,
+        }
+    }
+}
+
 /// A callable's signature: its parameters (in order), rendered return type,
 /// async-ness, receiver, a knowable error type, and its own generics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,28 +275,10 @@ pub fn build_api(package: PackageInfo, fidelity: Fidelity, mut modules: Vec<Modu
 mod tests {
     use super::*;
 
-    /// A minimal item with only the fields a test cares about; the rest take
-    /// neutral empty/`None` defaults so each test states just its own shape.
+    /// A minimal item with only the fields a test cares about; the rest take the
+    /// neutral empty/`None` defaults from [`ApiItem::new`].
     fn item(kind: &str, name: &str) -> ApiItem {
-        ApiItem {
-            kind: kind.to_string(),
-            id: format!("m::{name}"),
-            name: name.to_string(),
-            visibility: "public".to_string(),
-            module_path: "m".to_string(),
-            file: None,
-            line: None,
-            doc: None,
-            generics: Vec::new(),
-            deprecated: false,
-            signature: None,
-            fields: Vec::new(),
-            variants: Vec::new(),
-            implements: Vec::new(),
-            alias_target: None,
-            const_type: None,
-            const_value: None,
-        }
+        ApiItem::new(kind, &format!("m::{name}"), name, "m")
     }
 
     fn module(path: &str, items: Vec<ApiItem>) -> Module {
