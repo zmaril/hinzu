@@ -1282,87 +1282,51 @@ impl ClusterFeatures {
     }
 
     /// The likely abstraction family for the cluster, with rationale and the
-    /// language mechanisms that could express it. Rust-flavoured mechanisms; the
-    /// family names all come from the shipped profile's `abstraction_families`.
+    /// language mechanisms that could express it.
+    ///
+    /// The structural reasoning about **what** differs (types vs callees vs
+    /// boilerplate) is language-neutral; the family label and mechanisms are then
+    /// routed per language through [`family_for`], keyed on the cluster's language
+    /// (a v1 candidate is single-language, so `members[0].language` is the
+    /// cluster's language). The routing NEVER names a family absent from that
+    /// language's profile `abstraction_families` — e.g. a TypeScript boilerplate
+    /// cluster is labelled `object_driven_definition`, never Rust's `macro_rules`.
     fn classify(&self, members: &[&StructuralSignature]) -> LikelyAbstraction {
         let n = members.len();
-        // Near-duplicate: same calls, same types, same skeleton.
+        let language = members[0].language.as_str();
+        let case = self.abstraction_case(n);
+        let (family, language_mechanisms) = family_for(language, &case, n);
+        debug_assert!(
+            family_in_profile(language, &family),
+            "classify emitted family `{family}`, absent from the `{language}` profile's \
+             abstraction_families"
+        );
+        LikelyAbstraction {
+            family,
+            rationale: case.rationale(n),
+            language_mechanisms,
+        }
+    }
+
+    /// Which structural case this cluster falls into — **what** varies across its
+    /// members, decided language-neutrally. The priority order mirrors the
+    /// original classifier: near-duplicate, then types-only, then callees-only,
+    /// then boilerplate, then a diffuse fallback.
+    fn abstraction_case(&self, n: usize) -> AbstractionCase {
         if self.calls_identical && self.types_identical && self.cfg_identical {
-            let mut mechanisms = vec!["extract a shared helper function".to_string()];
-            if n >= 3 {
-                mechanisms.push(
-                    "a `macro_rules!` if the repetition is item-level boilerplate".to_string(),
-                );
-            }
-            return LikelyAbstraction {
-                family: "helper_function".to_string(),
-                rationale: format!(
-                    "{n} bodies with the same control flow, the same signature shape, and the same \
-                     call sequence — they look near-duplicated, so a single shared function would \
-                     cover them."
-                ),
-                language_mechanisms: mechanisms,
-            };
-        }
-        // Only the types vary (calls + skeleton constant): a generic.
-        if self.calls_identical && self.cfg_identical && !self.types_identical {
-            return LikelyAbstraction {
-                family: "generic_function".to_string(),
-                rationale: format!(
-                    "{n} bodies with the same control flow and the same call sequence, differing \
-                     only in the types in their signatures — the classic shape of one generic \
-                     function (or a trait) parameterized over the varying type."
-                ),
-                language_mechanisms: vec![
-                    "a generic function `fn f<T>(...)`".to_string(),
-                    "a trait with the operation as a method".to_string(),
-                ],
-            };
-        }
-        // Same shape, callees vary in matching slots: dispatch over a set of cases.
-        if self.cfg_identical
+            AbstractionCase::NearDuplicate
+        } else if self.calls_identical && self.cfg_identical && !self.types_identical {
+            AbstractionCase::TypesVary
+        } else if self.cfg_identical
             && self.arity_identical
             && self.calls_same_shape
             && !self.calls_identical
         {
-            return LikelyAbstraction {
-                family: "enum_dispatch".to_string(),
-                rationale: format!(
-                    "{n} bodies with the same skeleton and the same call *shape*, but different \
-                     callees in matching positions — each looks like one case of a dispatch, so a \
-                     trait method per case or an enum matched over its variants would unify them."
-                ),
-                language_mechanisms: vec![
-                    "a trait method with one impl per case".to_string(),
-                    "an enum plus a `match` that dispatches".to_string(),
-                    "a higher-order function taking the varying operation as a parameter"
-                        .to_string(),
-                ],
-            };
-        }
-        // Three-plus with a constant skeleton but varying detail: macro-shaped.
-        if n >= 3 && self.cfg_identical {
-            return LikelyAbstraction {
-                family: "macro_rules".to_string(),
-                rationale: format!(
-                    "{n} bodies sharing one control-flow skeleton with the varying parts confined \
-                     to a few slots — a declarative `macro_rules!` that stamps out the skeleton is \
-                     often the lowest-friction way to remove the repetition."
-                ),
-                language_mechanisms: vec![
-                    "a `macro_rules!` generating the repeated item".to_string(),
-                    "a generic function if the variation is only in types".to_string(),
-                ],
-            };
-        }
-        // Fallback: a helper, but weaker.
-        LikelyAbstraction {
-            family: "helper_function".to_string(),
-            rationale: format!(
-                "{n} structurally similar bodies; the shared part could likely be pulled into a \
-                 helper, though the variation is not confined to a single clean axis."
-            ),
-            language_mechanisms: vec!["a shared helper function for the common part".to_string()],
+            AbstractionCase::CalleesVary
+        } else if n >= 3 && self.cfg_identical {
+            AbstractionCase::Boilerplate
+        } else {
+            AbstractionCase::Diffuse
         }
     }
 
@@ -1441,6 +1405,167 @@ impl ClusterFeatures {
                 .to_string(),
         );
         out
+    }
+}
+
+/// The structural case a cluster falls into — **what** differs across its
+/// members — decided language-neutrally. The label and mechanisms for each case
+/// are then routed per language in [`family_for`], so the same structural finding
+/// is named in Rust terms for a Rust cluster and TypeScript terms for a TS one.
+enum AbstractionCase {
+    /// Same calls, same types, same skeleton — the members look near-duplicated.
+    NearDuplicate,
+    /// Only the signature types vary; calls and skeleton are constant.
+    TypesVary,
+    /// Same skeleton and same call *shape*, but different callees in matching
+    /// positions — each looks like one case of a dispatch.
+    CalleesVary,
+    /// 3+ bodies sharing one skeleton with the variation confined to a few slots
+    /// — a boilerplate skeleton begging to be generated from one source.
+    Boilerplate,
+    /// Structurally similar, but the variation is not confined to a single clean
+    /// axis — the weaker, catch-all case.
+    Diffuse,
+}
+
+impl AbstractionCase {
+    /// The language-neutral rationale for this case — it describes *what* is
+    /// shared and *what* varies, without naming a language-specific mechanism
+    /// (those live in the routed `language_mechanisms`).
+    fn rationale(&self, n: usize) -> String {
+        match self {
+            AbstractionCase::NearDuplicate => format!(
+                "{n} bodies with the same control flow, the same signature shape, and the same \
+                 call sequence — they look near-duplicated, so a single shared function would \
+                 cover them."
+            ),
+            AbstractionCase::TypesVary => format!(
+                "{n} bodies with the same control flow and the same call sequence, differing only \
+                 in the types in their signatures — the classic shape of one abstraction \
+                 parameterized over the varying type."
+            ),
+            AbstractionCase::CalleesVary => format!(
+                "{n} bodies with the same skeleton and the same call *shape*, but different callees \
+                 in matching positions — each looks like one case of a dispatch, so parameterizing \
+                 over the varying operation would unify them."
+            ),
+            AbstractionCase::Boilerplate => format!(
+                "{n} bodies sharing one control-flow skeleton with the varying parts confined to a \
+                 few slots — generating the skeleton from a single source is often the \
+                 lowest-friction way to remove the repetition."
+            ),
+            AbstractionCase::Diffuse => format!(
+                "{n} structurally similar bodies; the shared part could likely be pulled into a \
+                 helper, though the variation is not confined to a single clean axis."
+            ),
+        }
+    }
+}
+
+/// Route a structural [`AbstractionCase`] to the abstraction family and the
+/// concrete mechanisms appropriate for `language`. This is the language-aware
+/// table: the same structural case yields a Rust family for a Rust cluster and a
+/// TypeScript family for a TS cluster.
+///
+/// It **guarantees** it never returns a family absent from the language's profile
+/// `abstraction_families`: any language/case that would fall through, plus any
+/// unshipped language, resolves to `helper_function` (which every profile ships).
+fn family_for(language: &str, case: &AbstractionCase, n: usize) -> (String, Vec<String>) {
+    let (family, mechanisms): (&str, Vec<&str>) = match (language, case) {
+        // Near-duplicate: a shared helper, in every language.
+        ("rust", AbstractionCase::NearDuplicate) => {
+            let mut m = vec!["extract a shared helper function"];
+            if n >= 3 {
+                m.push("a `macro_rules!` if the repetition is item-level boilerplate");
+            }
+            ("helper_function", m)
+        }
+        ("typescript", AbstractionCase::NearDuplicate) => {
+            let mut m = vec!["extract a shared function"];
+            if n >= 3 {
+                m.push("a data-driven table if the repetition is declaration boilerplate");
+            }
+            ("helper_function", m)
+        }
+
+        // Types vary → a generic (both languages), plus the language's type-level
+        // knob (a trait bound in Rust, a mapped type in TS).
+        ("rust", AbstractionCase::TypesVary) => (
+            "generic_function",
+            vec![
+                "a generic function `fn f<T>(...)`",
+                "a trait bound expressing the operation over the varying type",
+            ],
+        ),
+        ("typescript", AbstractionCase::TypesVary) => (
+            "generic_function",
+            vec![
+                "a generic function `function f<T>(...)`",
+                "a mapped type where the variation ranges over a key set",
+            ],
+        ),
+
+        // Callees vary in matching slots → dispatch. Rust reaches for a
+        // trait/enum; TS for a higher-order function or a dispatch table.
+        ("rust", AbstractionCase::CalleesVary) => (
+            "enum_dispatch",
+            vec![
+                "a trait method with one impl per case",
+                "an enum plus a `match` that dispatches",
+                "a higher-order function taking the varying operation as a parameter",
+            ],
+        ),
+        ("typescript", AbstractionCase::CalleesVary) => (
+            "higher_order_function",
+            vec![
+                "a higher-order function taking the varying operation as a callback parameter",
+                "an object/dispatch table keyed on the varying case",
+            ],
+        ),
+
+        // 3+ boilerplate bodies → Rust generates with a macro; TS has no macros,
+        // so it reaches for a data-driven definition or codegen (NEVER macros).
+        ("rust", AbstractionCase::Boilerplate) => (
+            "macro_rules",
+            vec![
+                "a `macro_rules!` generating the repeated item",
+                "a generic function if the variation is only in types",
+            ],
+        ),
+        ("typescript", AbstractionCase::Boilerplate) => (
+            "object_driven_definition",
+            vec![
+                "a data-driven definition table the code iterates over",
+                "code generation (a generated declaration) for the mechanical boilerplate",
+            ],
+        ),
+
+        // Diffuse, or any unshipped language: a shared helper — listed by every
+        // shipped profile and a safe honest default otherwise.
+        _ => (
+            "helper_function",
+            vec!["a shared helper function for the common part"],
+        ),
+    };
+    let mechanisms: Vec<String> = mechanisms.into_iter().map(String::from).collect();
+    // Belt-and-braces: never emit a family the language's profile does not list.
+    if family_in_profile(language, family) {
+        (family.to_string(), mechanisms)
+    } else {
+        (
+            "helper_function".to_string(),
+            vec!["a shared helper function for the common part".to_string()],
+        )
+    }
+}
+
+/// Whether `family` is one the `language`'s shipped profile is willing to name.
+/// A language with no shipped profile has no families to violate, so this is
+/// vacuously `true` for it (the finding carries no profile block in that case).
+fn family_in_profile(language: &str, family: &str) -> bool {
+    match profile_for_language(language) {
+        Some(p) => p.abstraction_families.iter().any(|f| f == family),
+        None => true,
     }
 }
 

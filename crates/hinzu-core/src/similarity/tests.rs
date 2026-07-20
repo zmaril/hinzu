@@ -312,6 +312,107 @@ fn unsplittable_loose_chain_is_rejected_and_counted() {
     assert!(out.stats.clusters_rejected_low_cohesion >= 1);
 }
 
+/// Build three signatures that land in the `Boilerplate` case: identical cfg /
+/// shingles / histogram (so they cluster), but differing type shapes *and*
+/// call-sequence lengths (so they are not near-duplicate, not types-only, and not
+/// same-call-shape — the only case left is boilerplate).
+fn boilerplate_trio(language: &str) -> Vec<StructuralSignature> {
+    let shapes = [
+        (vec!["_".to_string()], vec!["x".to_string()]),
+        (
+            vec!["A<_>".to_string()],
+            vec!["y".to_string(), "z".to_string()],
+        ),
+        (
+            vec!["B<_,_>".to_string()],
+            vec!["p".to_string(), "q".to_string(), "r".to_string()],
+        ),
+    ];
+    ["m::a", "m::b", "m::c"]
+        .iter()
+        .zip(shapes)
+        .map(|(id, (params, calls))| {
+            let mut s = sig(id, "a.rs");
+            s.language = language.to_string();
+            s.type_shape = TypeShape {
+                params,
+                result: "_".to_string(),
+            };
+            s.call_sequence = calls;
+            s
+        })
+        .collect()
+}
+
+/// A TypeScript boilerplate cluster is labelled with a TS family
+/// (`object_driven_definition`) and NEVER Rust's `macro_rules` — the core of the
+/// language-aware-classifier fix. It also carries a TS mechanism (a data-driven
+/// table / codegen), not a `macro_rules!`.
+#[test]
+fn ts_boilerplate_gets_ts_family_not_macro_rules() {
+    let out = analyze(
+        "root",
+        boilerplate_trio("typescript"),
+        &AnalyzeParams::default(),
+    );
+    assert_eq!(out.stats.candidates_found, 1, "the trio should cluster");
+    let f = &out.candidates[0];
+    assert_eq!(f.members.len(), 3);
+    assert_eq!(
+        f.likely_abstraction.family, "object_driven_definition",
+        "TS boilerplate should get a TS family"
+    );
+    assert_ne!(
+        f.likely_abstraction.family, "macro_rules",
+        "TS must never be labelled with Rust's macro_rules"
+    );
+    assert!(
+        !f.likely_abstraction
+            .language_mechanisms
+            .iter()
+            .any(|m| m.contains("macro_rules")),
+        "TS mechanisms must not mention macro_rules: {:?}",
+        f.likely_abstraction.language_mechanisms
+    );
+}
+
+/// The same structural boilerplate shape in Rust still gets `macro_rules` — the
+/// per-language routing keeps the Rust label where it is correct.
+#[test]
+fn rust_boilerplate_still_gets_macro_rules() {
+    let out = analyze("root", boilerplate_trio("rust"), &AnalyzeParams::default());
+    assert_eq!(out.stats.candidates_found, 1);
+    let f = &out.candidates[0];
+    assert_eq!(f.likely_abstraction.family, "macro_rules");
+}
+
+/// Defensive invariant: for every finding, its `likely_abstraction.family` is one
+/// its language's profile actually lists in `abstraction_families`. Run over both
+/// a Rust and a TypeScript boilerplate cluster.
+#[test]
+fn every_finding_family_is_in_its_language_profile() {
+    for language in ["rust", "typescript"] {
+        let out = analyze(
+            "root",
+            boilerplate_trio(language),
+            &AnalyzeParams::default(),
+        );
+        let profile = profile_for_language(language).expect("shipped profile");
+        for f in &out.candidates {
+            assert!(
+                profile
+                    .abstraction_families
+                    .contains(&f.likely_abstraction.family),
+                "finding {} in {language} named family `{}`, absent from the profile's \
+                 abstraction_families {:?}",
+                f.id,
+                f.likely_abstraction.family,
+                profile.abstraction_families,
+            );
+        }
+    }
+}
+
 /// Union-find clusters a transitive chain a~b~c into one cluster even if a and c
 /// were never directly compared.
 #[test]
