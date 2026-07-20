@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 pub mod profile;
-pub use profile::{profile_for_language, rust_syn_profile, LanguageProfile};
+pub use profile::{profile_for_language, rust_syn_profile, ts_tsc_profile, LanguageProfile};
 
 /// The schema version embedded in every emitted similarity document, so a
 /// consumer can branch on shape changes.
@@ -273,6 +273,10 @@ pub struct Finding {
 pub struct SimilarityParams {
     /// The clustering threshold: a pair at or above this similarity is an edge.
     pub min_similarity: f64,
+    /// The minimum mean pairwise similarity a cluster must reach to be reported
+    /// (the cohesion gate). A loose, transitively-chained cluster below this is
+    /// split at this higher bar or rejected — never emitted as a mega-blob.
+    pub min_cohesion: f64,
     /// The minimum normalized size (`token_len`) a signature must have to be
     /// considered — trivial defs are filtered out.
     pub min_size: u32,
@@ -286,6 +290,7 @@ impl Default for SimilarityParams {
     fn default() -> Self {
         SimilarityParams {
             min_similarity: 0.55,
+            min_cohesion: 0.6,
             min_size: 12,
             min_statements: 2,
             language_filter: None,
@@ -299,6 +304,10 @@ impl Default for SimilarityParams {
 pub struct AnalyzeParams {
     /// The clustering threshold (default 0.55).
     pub min_similarity: f64,
+    /// The cohesion gate: the minimum mean pairwise similarity a reported cluster
+    /// must reach (default 0.6). Loose clusters below it are split at this higher
+    /// bar or rejected.
+    pub min_cohesion: f64,
     /// The minimum normalized size gate (default 12).
     pub min_size: u32,
     /// The minimum statement count gate (default 2).
@@ -312,6 +321,7 @@ impl Default for AnalyzeParams {
         let p = SimilarityParams::default();
         AnalyzeParams {
             min_similarity: p.min_similarity,
+            min_cohesion: p.min_cohesion,
             min_size: p.min_size,
             min_statements: p.min_statements,
             language_filter: p.language_filter,
@@ -331,6 +341,11 @@ pub struct SimilarityStats {
     pub pairs_compared: usize,
     /// Pairs that scored at or above `min_similarity`.
     pub pairs_over_threshold: usize,
+    /// Loose clusters dropped by the cohesion gate: a transitively-chained
+    /// component whose mean pairwise similarity stayed below `min_cohesion` and
+    /// that could not be split into a tighter sub-cluster. Reported honestly
+    /// rather than emitted as a low-cohesion mega-blob.
+    pub clusters_rejected_low_cohesion: usize,
     /// Clusters of >= 2 reported.
     pub candidates_found: usize,
 }
@@ -421,17 +436,10 @@ pub fn analyze(
         .collect();
     let pairs_over_threshold = over.len();
 
-    // Step 3: union-find into clusters over the over-threshold edges.
+    // Step 3: union-find into primary components over the over-threshold edges.
     let mut uf = UnionFind::new(kept.len());
     for (i, j, _) in &over {
         uf.union(*i, *j);
-    }
-    let mut clusters: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for idx in 0..kept.len() {
-        // Only nodes that took part in an edge can be in a non-trivial cluster;
-        // a singleton root is skipped below by the size >= 2 gate.
-        let root_id = uf.find(idx);
-        clusters.entry(root_id).or_default().push(idx);
     }
 
     // A quick lookup of pairwise scores for cluster-level aggregation.
@@ -440,9 +448,47 @@ pub fn analyze(
         pair_score.insert((*i, *j), s.clone());
     }
 
-    // Step 4: explain each cluster of >= 2.
+    // Group the primary components and the aggregate edges internal to each,
+    // keyed by the component root. The cohesion metric divides the edge-weight
+    // sum by *all* possible member pairs, so a transitively-chained component
+    // (few strong edges spread over many members) reads as low-cohesion even when
+    // every edge it does have is strong — which is exactly the mega-blob shape.
+    let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for idx in 0..kept.len() {
+        components.entry(uf.find(idx)).or_default().push(idx);
+    }
+    let mut component_edges: BTreeMap<usize, Vec<(usize, usize, f64)>> = BTreeMap::new();
+    for (i, j, s) in &over {
+        let root = uf.find(*i);
+        component_edges
+            .entry(root)
+            .or_default()
+            .push((*i, *j, s.aggregate));
+    }
+
+    // Step 4: refine each primary component into cohesive clusters. A dense
+    // component is emitted whole; a loose one is split at the higher
+    // `min_cohesion` bar into tighter sub-clusters; a loose component with no weak
+    // link to cut is rejected honestly (counted, never silently trimmed).
+    let mut final_clusters: Vec<Vec<usize>> = Vec::new();
+    let mut clusters_rejected_low_cohesion = 0usize;
+    for (root, members) in &components {
+        if members.len() < 2 {
+            continue;
+        }
+        let edges = component_edges.get(root).cloned().unwrap_or_default();
+        refine_cohesive(
+            members,
+            &edges,
+            params.min_cohesion,
+            &mut final_clusters,
+            &mut clusters_rejected_low_cohesion,
+        );
+    }
+
+    // Step 5: explain each cohesive cluster of >= 2.
     let mut findings: Vec<Finding> = Vec::new();
-    for members in clusters.values() {
+    for members in &final_clusters {
         if members.len() < 2 {
             continue;
         }
@@ -471,6 +517,7 @@ pub fn analyze(
         profiles,
         params: SimilarityParams {
             min_similarity: params.min_similarity,
+            min_cohesion: params.min_cohesion,
             min_size: params.min_size,
             min_statements: params.min_statements,
             language_filter: params.language_filter.clone(),
@@ -480,6 +527,7 @@ pub fn analyze(
             signatures_after_filter,
             pairs_compared,
             pairs_over_threshold,
+            clusters_rejected_low_cohesion,
             candidates_found: findings.len(),
         },
         candidates: findings,
@@ -817,6 +865,101 @@ impl UnionFind {
         self.parent[small] = big;
         self.size[big] += self.size[small];
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cohesion refinement: keep dense clusters, split or reject loose ones.
+// ---------------------------------------------------------------------------
+
+/// Refine a primary component into cohesive clusters. A component whose mean
+/// pairwise similarity meets `min_cohesion` is emitted whole; a looser one is
+/// split by keeping only its strong (`>= min_cohesion`) edges and recursing on
+/// each resulting sub-component; a loose component with no weak link to cut is
+/// rejected honestly (counted in `rejected`, never silently trimmed to a smaller
+/// list). This is what stops a transitively-chained mega-blob — many members
+/// linked by a sparse web of just-over-threshold edges — from being reported as a
+/// single junk cluster.
+///
+/// `edges` are the over-threshold aggregate similarities *internal* to `members`;
+/// a member pair absent from `edges` contributes 0 to cohesion, so a sparse
+/// component is correctly seen as loose.
+fn refine_cohesive(
+    members: &[usize],
+    edges: &[(usize, usize, f64)],
+    min_cohesion: f64,
+    out: &mut Vec<Vec<usize>>,
+    rejected: &mut usize,
+) {
+    if members.len() < 2 {
+        return;
+    }
+    if cluster_cohesion(members.len(), edges) >= min_cohesion {
+        out.push(members.to_vec());
+        return;
+    }
+    // Loose: cut the weak links by re-clustering at the higher cohesion bar.
+    let subs = split_by_threshold(members, edges, min_cohesion);
+    if subs.len() <= 1 {
+        // The higher bar separated nothing — a solid low-cohesion blob. Reject it
+        // rather than emit it or trim it silently. (Also guarantees progress, so
+        // the recursion terminates.)
+        *rejected += 1;
+        return;
+    }
+    let mut progressed = false;
+    for sub in subs {
+        if sub.len() < 2 {
+            continue; // a peeled-off singleton is simply not a candidate
+        }
+        progressed = true;
+        let sub_set: BTreeSet<usize> = sub.iter().copied().collect();
+        let sub_edges: Vec<(usize, usize, f64)> = edges
+            .iter()
+            .filter(|(i, j, _)| sub_set.contains(i) && sub_set.contains(j))
+            .copied()
+            .collect();
+        refine_cohesive(&sub, &sub_edges, min_cohesion, out, rejected);
+    }
+    if !progressed {
+        // The component dissolved entirely into singletons at the higher bar — no
+        // dense sub-cluster survived, so report it rejected rather than dropped.
+        *rejected += 1;
+    }
+}
+
+/// The cohesion of a cluster: the sum of its edge similarities divided by the
+/// number of *all* possible member pairs. A clique of near-duplicates scores near
+/// 1; a sparse chain of the same member count scores near 0.
+fn cluster_cohesion(n: usize, edges: &[(usize, usize, f64)]) -> f64 {
+    if n < 2 {
+        return 1.0;
+    }
+    let possible = (n * (n - 1) / 2) as f64;
+    let sum: f64 = edges.iter().map(|(_, _, s)| *s).sum();
+    sum / possible
+}
+
+/// Split a member set into connected sub-components, keeping only edges at or
+/// above `threshold` — a local union-find over the member indices.
+fn split_by_threshold(
+    members: &[usize],
+    edges: &[(usize, usize, f64)],
+    threshold: f64,
+) -> Vec<Vec<usize>> {
+    let index: BTreeMap<usize, usize> = members.iter().enumerate().map(|(k, &m)| (m, k)).collect();
+    let mut uf = UnionFind::new(members.len());
+    for (i, j, s) in edges {
+        if *s >= threshold {
+            if let (Some(&a), Some(&b)) = (index.get(i), index.get(j)) {
+                uf.union(a, b);
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (k, &m) in members.iter().enumerate() {
+        groups.entry(uf.find(k)).or_default().push(m);
+    }
+    groups.into_values().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,12 +1464,14 @@ fn finding_profile(profiles: &[LanguageProfile], cmp: &ClusterFeatures) -> Findi
             }
         }
         // Always cite the type-comparison caveat when types matter to the finding.
-        for lim in &p.limitations {
+        for (i, lim) in p.limitations.iter().enumerate() {
             let touches_types = lim.contains("type") && !cmp.types_identical;
             let touches_macro = lim.contains("Macro") && cmp.any_macro;
             let touches_calls = lim.contains("Call") && !cmp.calls_identical;
-            // The syntactic-only umbrella limitation (first) always applies.
-            let is_umbrella = lim.starts_with("Syntactic only");
+            // Each profile's first limitation is its umbrella caveat (the
+            // syntactic-only caveat for Rust, the structural-typing caveat for
+            // TypeScript) and always applies.
+            let is_umbrella = i == 0;
             if is_umbrella || touches_types || touches_macro || touches_calls {
                 limitations.push(lim.clone());
             }

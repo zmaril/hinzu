@@ -116,13 +116,76 @@ pub fn rust_syn_profile() -> LanguageProfile {
     }
 }
 
+/// The TypeScript/`tsc-checker` profile: a structural extractor built on the
+/// TypeScript compiler API, driving the **type checker**.
+///
+/// It is honestly *richer* than the Rust/syn profile: because the checker
+/// resolves parameter/return types before they are erased, two functions with the
+/// same shape but different concrete types (`Promise<User>` vs `Promise<Order>`)
+/// are seen as the same shape — `types_resolved` is `yes`, not `syntactic`. Call
+/// targets are likewise resolved through the checker where they are statically
+/// resolvable, and generics are visible. But the asymmetry cuts both ways and the
+/// profile says so: `any`/`unknown` collapse type-shape distinctions, structural
+/// typing means two nominally-different types can share a shape (a source of
+/// over-merging), and dynamic dispatch / duck typing is not modeled. This
+/// contrast with Rust is the whole point of the language-profile concept — the
+/// capability edges are made visible, per `(language, extractor)`.
+pub fn ts_tsc_profile() -> LanguageProfile {
+    LanguageProfile {
+        language: "typescript".to_string(),
+        extractor: "tsc-checker".to_string(),
+        capabilities: caps(&[
+            ("types_resolved", "yes"),
+            ("call_targets_known", "partial"),
+            ("macro_expansion_visible", "n/a"),
+            ("control_flow_available", "yes"),
+            ("generics_visible", "yes"),
+            ("dynamic_dispatch_understood", "no"),
+            ("suggestion_scope", "language_specific"),
+        ]),
+        abstraction_families: vec![
+            "helper_function".to_string(),
+            "generic_function".to_string(),
+            "higher_order_function".to_string(),
+            "mapped_type".to_string(),
+            "conditional_type".to_string(),
+            "shared_schema".to_string(),
+            "decorator".to_string(),
+            "object_driven_definition".to_string(),
+            "generated_client".to_string(),
+            "generated_declaration".to_string(),
+        ],
+        limitations: vec![
+            "Structural typing: two nominally-different types can share the same erased shape, so \
+             signatures that look identical may model unrelated domains — the analysis may \
+             over-merge."
+                .to_string(),
+            "`any` and `unknown` collapse type-shape distinctions: a parameter typed `any` erases \
+             to the same `_` as a precise type, so type resolution silently degrades where the \
+             project is loosely typed."
+                .to_string(),
+            "Call targets are resolved by the checker only where they are statically resolvable; \
+             dynamic dispatch and duck typing (a call through an `any`-typed or structurally-typed \
+             receiver) are not modeled, so the call sequence records the syntactic callee only."
+                .to_string(),
+            "Declaration merging and ambient types can distort call resolution: a name may resolve \
+             to a merged or ambient declaration rather than the intended one."
+                .to_string(),
+            "No macros (`n/a`), but code generation and decorators can produce structurally \
+             identical bodies whose origin (a generator or a decorator) is not visible in the \
+             signature."
+                .to_string(),
+        ],
+    }
+}
+
 /// The profile for a language spelling, or `None` when no extractor profile is
 /// shipped for it yet (the honest capability edge — an unshipped language is
-/// reported as absent, never faked). Phase 1 ships only Rust/syn; TypeScript
-/// drops in here.
+/// reported as absent, never faked). Ships Rust/syn and TypeScript/tsc-checker.
 pub fn profile_for_language(language: &str) -> Option<LanguageProfile> {
     match language {
         "rust" => Some(rust_syn_profile()),
+        "typescript" => Some(ts_tsc_profile()),
         _ => None,
     }
 }

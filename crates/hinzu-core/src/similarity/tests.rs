@@ -214,8 +214,11 @@ fn language_filter_scopes_analysis() {
     // Only the TS signature survives the filter → nothing to cluster with.
     assert_eq!(out.stats.signatures_after_filter, 1);
     assert_eq!(out.languages, vec!["typescript".to_string()]);
-    // No shipped profile for TS yet → the profiles block is honestly empty.
-    assert!(out.profiles.is_empty());
+    // TypeScript ships a profile, and it is honestly type-resolved (unlike the
+    // syntactic Rust profile) — the language-profile asymmetry, as data.
+    assert_eq!(out.profiles.len(), 1);
+    assert_eq!(out.profiles[0].extractor, "tsc-checker");
+    assert_eq!(out.profiles[0].capability("types_resolved"), "yes");
 }
 
 /// The scoring breakdown is exposed and the aggregate honors the weights: two
@@ -231,6 +234,82 @@ fn identical_signatures_score_one_on_every_signal() {
     assert!((s.call_seq - 1.0).abs() < 1e-9);
     assert!((s.histogram - 1.0).abs() < 1e-9);
     assert!((s.aggregate - 1.0).abs() < 1e-9);
+}
+
+/// A transitively-linked blob is split by the cohesion gate into its two tight
+/// sub-clusters, rather than surviving as one loose mega-cluster. Six signatures
+/// are identical in every signal but their shingles: two groups of three with
+/// disjoint shingle sets. Every cross pair still scores 0.60 (the non-shingle
+/// signals all match), so a loose linking threshold pulls all six into one
+/// union-find component — but its mean pairwise similarity is only ~0.76, below a
+/// 0.90 cohesion gate, so the gate must break it into the two 3-cliques.
+#[test]
+fn low_cohesion_blob_splits_into_tight_subclusters() {
+    let group = |ids: &[&str], shingles: Vec<u64>| -> Vec<StructuralSignature> {
+        ids.iter()
+            .map(|id| {
+                let mut s = sig(id, "a.rs");
+                s.shingles = shingles.clone();
+                s
+            })
+            .collect()
+    };
+    let mut sigs = group(&["m::a1", "m::a2", "m::a3"], vec![1, 2, 3, 4]);
+    sigs.extend(group(&["m::b1", "m::b2", "m::b3"], vec![5, 6, 7, 8]));
+
+    // Gate ON (min_cohesion 0.90): the loose 6-blob splits into two 3-cliques and
+    // nothing survives as a >= 6-member cluster.
+    let strict = AnalyzeParams {
+        min_similarity: 0.5,
+        min_cohesion: 0.9,
+        ..AnalyzeParams::default()
+    };
+    let out = analyze("root", sigs.clone(), &strict);
+    assert_eq!(
+        out.stats.candidates_found, 2,
+        "the blob should split into two candidates"
+    );
+    assert!(out.candidates.iter().all(|c| c.members.len() == 3));
+    assert!(!out.candidates.iter().any(|c| c.members.len() >= 6));
+    assert_eq!(out.stats.clusters_rejected_low_cohesion, 0);
+
+    // Gate effectively OFF (min_cohesion 0.5): the same six survive as one loose
+    // cluster — proving it is the gate, not the scoring, that split them.
+    let loose = AnalyzeParams {
+        min_similarity: 0.5,
+        min_cohesion: 0.5,
+        ..AnalyzeParams::default()
+    };
+    let out2 = analyze("root", sigs, &loose);
+    assert_eq!(out2.stats.candidates_found, 1);
+    assert_eq!(out2.candidates[0].members.len(), 6);
+}
+
+/// A sparse chain with no dense sub-region is rejected by the cohesion gate
+/// (counted honestly), not emitted as a low-cohesion cluster. Three signatures
+/// form a chain a~b~c where the linking edges are just strong enough to connect
+/// but a~c is never a strong edge, so no tight sub-cluster survives the split.
+#[test]
+fn unsplittable_loose_chain_is_rejected_and_counted() {
+    // a and b share one shingle window; b and c share a different one; a and c
+    // share none. All other signals match, so a~b and b~c are edges but the
+    // component is sparse (2 edges over 3 possible pairs).
+    let mut a = sig("m::a", "a.rs");
+    a.shingles = vec![1, 2, 3, 4];
+    let mut b = sig("m::b", "a.rs");
+    b.shingles = vec![3, 4, 5, 6];
+    let mut c = sig("m::c", "a.rs");
+    c.shingles = vec![5, 6, 7, 8];
+
+    let params = AnalyzeParams {
+        min_similarity: 0.5,
+        min_cohesion: 0.95,
+        ..AnalyzeParams::default()
+    };
+    let out = analyze("root", vec![a, b, c], &params);
+    // No cohesive cluster emerges, and the loose component is reported rejected.
+    assert_eq!(out.stats.candidates_found, 0);
+    assert!(out.stats.clusters_rejected_low_cohesion >= 1);
 }
 
 /// Union-find clusters a transitive chain a~b~c into one cluster even if a and c

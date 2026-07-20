@@ -23,6 +23,10 @@ fn fixture() -> PathBuf {
     crate_dir().join("tests/fixtures/similar-fixture.json")
 }
 
+fn ts_fixture() -> PathBuf {
+    crate_dir().join("tests/fixtures/similar-ts-fixture.json")
+}
+
 /// The `--structural` fixture path: two type-varying `parse_*` functions cluster
 /// into one `generic_function` candidate; the unrelated `sum_list` does not join.
 #[test]
@@ -79,6 +83,59 @@ fn similar_clusters_the_type_varying_parse_functions() {
     assert!(confidence <= 0.85 + 1e-9, "confidence was {confidence}");
 }
 
+/// The committed TypeScript `--structural` fixture (produced by
+/// `adapters/typescript/structural.mjs`, so this test needs no Node toolchain)
+/// drives the same engine: two structurally near-identical async loaders cluster
+/// into one candidate, and the TypeScript/`tsc-checker` profile is present and
+/// honestly *type-resolved* — which lifts the confidence above the syntactic cap
+/// the Rust profile is bound by, the whole point of the language-profile concept.
+#[test]
+fn similar_clusters_typescript_loaders_via_resolved_types() {
+    let mut cmd = Command::cargo_bin("hinzu").unwrap();
+    let assert = cmd
+        .arg("similar")
+        .arg("--structural")
+        .arg(ts_fixture())
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let doc: Value = serde_json::from_str(&out).expect("stdout is JSON");
+
+    assert_eq!(doc["hinzu_similarity_version"], 1);
+    assert_eq!(doc["languages"][0], "typescript");
+    assert_eq!(doc["stats"]["candidates_found"], 1);
+
+    // The TypeScript/tsc-checker profile is present and honestly type-resolved.
+    let profiles = doc["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0]["language"], "typescript");
+    assert_eq!(profiles[0]["extractor"], "tsc-checker");
+    assert_eq!(profiles[0]["capabilities"]["types_resolved"], "yes");
+
+    let cand = &doc["candidates"][0];
+    let members: Vec<String> = cand["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["display"].as_str().unwrap().to_string())
+        .collect();
+    assert!(members.iter().any(|m| m == "loadUser"));
+    assert!(members.iter().any(|m| m == "loadOrder"));
+    assert!(!members.iter().any(|m| m == "sumTotals"));
+
+    // The resolved return types (`Promise<User>` / `Promise<Order>`) erased to the
+    // same shape `Promise<_>` and are cited as a shared feature.
+    let shared = cand["pattern"]["shared_features"].as_array().unwrap();
+    assert!(shared
+        .iter()
+        .any(|f| f.as_str().unwrap().contains("Promise<_>")));
+
+    // Because the profile resolves types (`types_resolved=yes`), the confidence is
+    // NOT bound by the 0.85 syntactic cap the Rust profile carries.
+    let confidence = cand["confidence"].as_f64().unwrap();
+    assert!(confidence > 0.85, "confidence was {confidence}");
+}
+
 /// A non-cargo path without `--structural` fails honestly rather than faking an
 /// analysis.
 #[test]
@@ -88,5 +145,8 @@ fn similar_without_cargo_or_structural_fails_honestly() {
     let mut cmd = Command::cargo_bin("hinzu").unwrap();
     let assert = cmd.arg("similar").arg(&tmp).assert().failure();
     let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    assert!(err.contains("not a cargo project"), "stderr was:\n{err}");
+    assert!(
+        err.contains("neither a cargo project nor a TypeScript project"),
+        "stderr was:\n{err}"
+    );
 }

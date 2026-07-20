@@ -1,0 +1,283 @@
+{
+  "language": "typescript",
+  "extractor": "tsc-checker",
+  "signatures": [
+    {
+      "symbol_id": "src/loaders#fetchRow",
+      "display": "fetchRow",
+      "language": "typescript",
+      "kind": "function",
+      "file": "src/loaders.ts",
+      "line_start": 14,
+      "line_end": 16,
+      "arity": {
+        "params": 1,
+        "results": 1,
+        "generics": 0
+      },
+      "cfg": {
+        "branch_count": 1,
+        "match_arms": 0,
+        "loop_count": 0,
+        "try_count": 0,
+        "return_points": 1,
+        "max_nesting": 1
+      },
+      "stmt_histogram": {
+        "return": 1,
+        "if": 1,
+        "binary": 1,
+        "field": 1,
+        "path": 2,
+        "lit": 2,
+        "struct": 1
+      },
+      "call_sequence": [],
+      "type_shape": {
+        "params": [
+          "_"
+        ],
+        "result": "Promise<_ | object>"
+      },
+      "shingles": [
+        2919378932335131,
+        831839835384219,
+        745830949537719,
+        8554417273695601,
+        2097213216789072,
+        4881486668954432,
+        2000909518116774
+      ],
+      "token_len": 9,
+      "features": {
+        "is_async": "true"
+      }
+    },
+    {
+      "symbol_id": "src/loaders#parse",
+      "display": "parse",
+      "language": "typescript",
+      "kind": "function",
+      "file": "src/loaders.ts",
+      "line_start": 18,
+      "line_end": 20,
+      "arity": {
+        "params": 1,
+        "results": 1,
+        "generics": 0
+      },
+      "cfg": {
+        "branch_count": 0,
+        "match_arms": 0,
+        "loop_count": 0,
+        "try_count": 0,
+        "return_points": 1,
+        "max_nesting": 1
+      },
+      "stmt_histogram": {
+        "return": 1,
+        "path": 1
+      },
+      "call_sequence": [],
+      "type_shape": {
+        "params": [
+          "object"
+        ],
+        "result": "_"
+      },
+      "shingles": [
+        5212592422500034
+      ],
+      "token_len": 2,
+      "features": {}
+    },
+    {
+      "symbol_id": "src/loaders#loadUser",
+      "display": "loadUser",
+      "language": "typescript",
+      "kind": "function",
+      "file": "src/loaders.ts",
+      "line_start": 22,
+      "line_end": 28,
+      "arity": {
+        "params": 1,
+        "results": 1,
+        "generics": 0
+      },
+      "cfg": {
+        "branch_count": 1,
+        "match_arms": 0,
+        "loop_count": 0,
+        "try_count": 1,
+        "return_points": 1,
+        "max_nesting": 2
+      },
+      "stmt_histogram": {
+        "let": 1,
+        "path": 7,
+        "await": 1,
+        "call": 3,
+        "if": 1,
+        "unary": 1,
+        "throw": 1,
+        "lit": 1,
+        "return": 1
+      },
+      "call_sequence": [
+        "fetchRow",
+        "Error",
+        "parse"
+      ],
+      "type_shape": {
+        "params": [
+          "_"
+        ],
+        "result": "Promise<_>"
+      },
+      "shingles": [
+        6449055277492215,
+        3993099092833996,
+        1758015276201438,
+        2444082301010843,
+        5211054233409056,
+        3119464703470110,
+        2520351531479808,
+        1836104123411191,
+        7070330824409146,
+        7378461081508196,
+        171397484773789,
+        113637549445503,
+        7948911117844364,
+        4479165590255924,
+        2444082301010843
+      ],
+      "token_len": 17,
+      "features": {
+        "is_async": "true",
+        "has_await": "true",
+        "has_throw": "true"
+      }
+    },
+    {
+      "symbol_id": "src/loaders#loadOrder",
+      "display": "loadOrder",
+      "language": "typescript",
+      "kind": "function",
+      "file": "src/loaders.ts",
+      "line_start": 30,
+      "line_end": 36,
+      "arity": {
+        "params": 1,
+        "results": 1,
+        "generics": 0
+      },
+      "cfg": {
+        "branch_count": 1,
+        "match_arms": 0,
+        "loop_count": 0,
+        "try_count": 1,
+        "return_points": 1,
+        "max_nesting": 2
+      },
+      "stmt_histogram": {
+        "let": 1,
+        "path": 7,
+        "await": 1,
+        "call": 3,
+        "if": 1,
+        "unary": 1,
+        "throw": 1,
+        "lit": 1,
+        "return": 1
+      },
+      "call_sequence": [
+        "fetchRow",
+        "Error",
+        "parse"
+      ],
+      "type_shape": {
+        "params": [
+          "_"
+        ],
+        "result": "Promise<_>"
+      },
+      "shingles": [
+        6449055277492215,
+        3993099092833996,
+        1758015276201438,
+        2444082301010843,
+        5211054233409056,
+        3119464703470110,
+        2520351531479808,
+        1836104123411191,
+        7070330824409146,
+        7378461081508196,
+        171397484773789,
+        113637549445503,
+        7948911117844364,
+        4479165590255924,
+        2444082301010843
+      ],
+      "token_len": 17,
+      "features": {
+        "is_async": "true",
+        "has_await": "true",
+        "has_throw": "true"
+      }
+    },
+    {
+      "symbol_id": "src/loaders#sumTotals",
+      "display": "sumTotals",
+      "language": "typescript",
+      "kind": "function",
+      "file": "src/loaders.ts",
+      "line_start": 38,
+      "line_end": 44,
+      "arity": {
+        "params": 1,
+        "results": 1,
+        "generics": 0
+      },
+      "cfg": {
+        "branch_count": 0,
+        "match_arms": 0,
+        "loop_count": 1,
+        "try_count": 0,
+        "return_points": 1,
+        "max_nesting": 2
+      },
+      "stmt_histogram": {
+        "let": 2,
+        "path": 7,
+        "lit": 1,
+        "loop": 1,
+        "assign": 1,
+        "field": 1,
+        "return": 1
+      },
+      "call_sequence": [],
+      "type_shape": {
+        "params": [
+          "Array<_>"
+        ],
+        "result": "_"
+      },
+      "shingles": [
+        1308914224927908,
+        5931351990778123,
+        4485395412109997,
+        2489715941289953,
+        6923996877870432,
+        4937571848935218,
+        4813389501604442,
+        7432666983464251,
+        8314713660047425,
+        8554417273695601,
+        7179040105579033,
+        2677830323419819
+      ],
+      "token_len": 14,
+      "features": {}
+    }
+  ]
+}
