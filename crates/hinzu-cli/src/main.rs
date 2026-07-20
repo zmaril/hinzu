@@ -251,9 +251,11 @@ struct PortDiffArgs {
     /// UNION of all target crates (only with `--all`). Each package's source files
     /// are matched against the merged target graph of every crate, so a source file
     /// that landed in *another* package's crate is visible — the combined
-    /// `merges.package_merges` then flags target files that received source files
-    /// from ≥ 2 distinct packages (a cross-package merge). Heavier than a plain
-    /// `--all` (every package sees every crate's symbols), so it is opt-in.
+    /// `merges` then flags both file-merges (a target file drawing substantial
+    /// content from ≥ 2 source files, cross-package when they span packages) and
+    /// misplacements (a source file ported into a crate owned by another package).
+    /// Heavier than a plain `--all` (every package sees every crate's symbols), so
+    /// it is opt-in.
     #[arg(long)]
     merge_check: bool,
 }
@@ -726,10 +728,30 @@ fn port_diff_all(
         reports.push((name, report));
     }
 
+    // Map each target crate to the package that owns it (config's per-package
+    // primary/secondary crates), so the misplacement detector uses the declared
+    // ownership rather than plurality. Crate name = the segment after `crates/`
+    // in the package's `target_src_prefix` (`crates/pidgin-ai/src` → `pidgin-ai`).
+    let mut owning_override: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for g in &gathered {
+        let pkg = g.resolved.name.clone();
+        for prefix in &g.resolved.config.naming.target_src_prefix {
+            if let Some(cr) = prefix
+                .strip_prefix("crates/")
+                .and_then(|rest| rest.split('/').next())
+            {
+                if !cr.is_empty() {
+                    owning_override.insert(cr.to_string(), pkg.clone());
+                }
+            }
+        }
+    }
     let multi = hinzu_core::portdiff::MultiPackageReport::aggregate(
         &cfg.source_kind,
         &cfg.target_kind,
         reports,
+        &owning_override,
     );
 
     if let Some(html_path) = &args.html {

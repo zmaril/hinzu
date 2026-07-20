@@ -442,6 +442,7 @@ mod tests {
             map_votes: None,
             dominant_target_file: None,
             dominant_target_symbols: 0,
+            target_file_contributions: Vec::new(),
             total_symbols: total,
             matched_symbols: matched,
             tier_breakdown: FileTierBreakdown::default(),

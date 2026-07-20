@@ -6,8 +6,8 @@
 //! inline and no asset is fetched, so the file renders offline.
 
 use hinzu_core::portdiff::{
-    Band, BandCounts, FileEntry, MergeEntry, MergeReport, MultiPackageReport, PackageRollup,
-    PortDiffReport, RollupTotals,
+    Band, BandCounts, FileEntry, MergeEntry, MergeReport, Misplacement, MultiPackageReport,
+    PackageRollup, PortDiffReport, RollupTotals,
 };
 
 /// Presentation metadata that is not in the report itself.
@@ -152,54 +152,71 @@ pub fn render_html(report: &PortDiffReport, meta: &HtmlMeta) -> String {
     h
 }
 
-/// The split-not-merge panel: target files that ≥ 2 source files merged into.
-/// Package-merges (contributors span ≥ 2 packages — the high-severity case) are
-/// listed first, then the remaining same-package file-merges. Renders nothing
-/// when the report is clean.
+/// The split-not-merge panel. Two violation types, high-severity first:
+/// **misplacements** (a source file ported into a crate owned by another package)
+/// and **cross-package file-merges** (a target file drawing substantial content
+/// from source files of ≥ 2 packages), then the lower-severity same-package
+/// file-merges. Renders nothing when the report is clean.
 fn merges_panel(merges: &MergeReport) -> String {
-    if merges.file_merges.is_empty() {
+    if merges.file_merges.is_empty() && merges.misplacements.is_empty() {
         return String::new();
     }
-    let pkg_rows: String = merges.package_merges.iter().map(merge_row).collect();
-    // The file-merges that are not already shown as package-merges.
-    let file_only: Vec<&MergeEntry> = merges
+    let cross: Vec<&MergeEntry> = merges
+        .file_merges
+        .iter()
+        .filter(|e| e.cross_package)
+        .collect();
+    let same: Vec<&MergeEntry> = merges
         .file_merges
         .iter()
         .filter(|e| !e.cross_package)
         .collect();
-    let file_rows: String = file_only.iter().copied().map(merge_row).collect();
 
-    let pkg_section = if merges.package_merges.is_empty() {
+    let misplace_rows: String = merges.misplacements.iter().map(misplacement_row).collect();
+    let cross_rows: String = cross.iter().copied().map(merge_row).collect();
+    let same_rows: String = same.iter().copied().map(merge_row).collect();
+
+    let misplace_section = if merges.misplacements.is_empty() {
         String::new()
     } else {
         format!(
-            r#"<div class="dim sm" style="margin:6px 0 4px">PACKAGE-MERGES <span class="q">high severity — a target file drew source files from ≥ 2 packages</span></div>
-    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → matched symbols</th></tr></thead><tbody>{pkg_rows}</tbody></table>"#,
+            r#"<div class="dim sm" style="margin:6px 0 4px">MISPLACEMENTS <span class="q">high severity — a source file ported into a crate owned by another package</span></div>
+    <table><thead><tr><th>source file → target file</th><th>package → owning package</th><th>strong / total</th></tr></thead><tbody>{misplace_rows}</tbody></table>"#,
         )
     };
-    let file_section = if file_only.is_empty() {
+    let cross_section = if cross.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim sm" style="margin:14px 0 4px">CROSS-PACKAGE FILE-MERGES <span class="q">high severity — a target file drew substantial content from source files of ≥ 2 packages</span></div>
+    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → strong / total</th></tr></thead><tbody>{cross_rows}</tbody></table>"#,
+        )
+    };
+    let same_section = if same.is_empty() {
         String::new()
     } else {
         format!(
             r#"<div class="dim sm" style="margin:14px 0 4px">FILE-MERGES <span class="q">≥ 2 source files of one package merged into one target file</span></div>
-    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → matched symbols</th></tr></thead><tbody>{file_rows}</tbody></table>"#,
+    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → strong / total</th></tr></thead><tbody>{same_rows}</tbody></table>"#,
         )
     };
     format!(
         r#"<div class="panel">
-    <h2>Split-not-merge violations <span class="q">graph-derived: a target file is the dominant destination of ≥ 2 distinct source files</span></h2>
-    <div class="callout">A faithful port keeps each source file's identity. {np} package-merge(s) and {nf} file-merge(s) collapse a boundary — separate source files landed predominantly in one target file. Package-merges cross a package boundary and are the high-severity ones.</div>
-    {pkg_section}
-    {file_section}
+    <h2>Split-not-merge violations <span class="q">graph-derived: substantial-contributor file-merges + package misplacements</span></h2>
+    <div class="callout">A faithful port keeps each source file's identity and each package's boundary. {nm} misplacement(s) and {nf} file-merge(s) ({nc} cross-package) collapse a boundary — a source file landed in another package's crate, or ≥ 2 source files were merged into one target file. Misplacements and cross-package file-merges are the high-severity ones.</div>
+    {misplace_section}
+    {cross_section}
+    {same_section}
   </div>
 "#,
-        np = merges.package_merges.len(),
+        nm = merges.misplacements.len(),
         nf = merges.file_merges.len(),
+        nc = cross.len(),
     )
 }
 
-/// One split-not-merge table row: the merged target file, the packages it spans,
-/// and each contributing source file with its matched-symbol count.
+/// One file-merge table row: the merged target file, the packages it spans, and
+/// each contributing source file with its strong / total matched-symbol counts.
 fn merge_row(e: &MergeEntry) -> String {
     let contribs: String = e
         .contributors
@@ -211,9 +228,10 @@ fn merge_row(e: &MergeEntry) -> String {
                 format!(r#"<span class="dim">[{}]</span> "#, esc(&c.package))
             };
             format!(
-                r#"<div class="mono sm">{pkg}{sf} <span class="dim">→ {n}</span></div>"#,
+                r#"<div class="mono sm">{pkg}{sf} <span class="dim">→ {s} / {t}</span></div>"#,
                 sf = esc(short_path(&c.source_file)),
-                n = c.matched_symbols,
+                s = c.strong_matched,
+                t = c.total_matched,
             )
         })
         .collect();
@@ -221,6 +239,21 @@ fn merge_row(e: &MergeEntry) -> String {
         r#"<tr><td class="mono sm">{tf}</td><td class="sm">{pkgs}</td><td>{contribs}</td></tr>"#,
         tf = esc(&e.target_file),
         pkgs = esc(&e.packages.join(", ")),
+    )
+}
+
+/// One misplacement table row: the misplaced source file → target file, the
+/// source package → the crate's owning package, and the strong / total weight.
+fn misplacement_row(m: &Misplacement) -> String {
+    format!(
+        r#"<tr><td class="mono sm">{sf} <span class="dim">→</span> {tf}</td><td class="sm">{sp} <span class="dim">→</span> {op} <span class="dim">({cr})</span></td><td class="sm">{s} / {t}</td></tr>"#,
+        sf = esc(short_path(&m.source_file)),
+        tf = esc(&m.target_file),
+        sp = esc(&m.source_package),
+        op = esc(&m.owning_package),
+        cr = esc(&m.target_crate),
+        s = m.strong_matched,
+        t = m.total_matched,
     )
 }
 

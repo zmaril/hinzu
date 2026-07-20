@@ -103,6 +103,24 @@ pub struct FileTierBreakdown {
     pub unmatched: usize,
 }
 
+/// One target **file** a source file's matched symbols landed in, split by tier
+/// strength. A source file usually contributes to several target files (its
+/// symbols decomposed across the target subtree); each destination is one of
+/// these rows. The split-not-merge detector reads these — a *substantial*
+/// contribution (≥ 2 strong-tier symbols, or ≥ 3 matched with ≥ 1 strong) is
+/// what marks a real merge, distinct from a one-or-two-symbol name coincidence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TargetFileContribution {
+    /// The target file the symbols landed in (`crates/pidgin-ai/src/...rs`).
+    pub file: String,
+    /// How many of this source file's symbols landed here via a STRONG tier
+    /// (exact-module or subtree) — the structural, non-coincidental matches.
+    pub strong_matched: usize,
+    /// How many of this source file's symbols landed here across all tiers
+    /// (strong plus bare global-name / leaf coincidences).
+    pub total_matched: usize,
+}
+
 /// One source file's port status.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -136,6 +154,14 @@ pub struct FileEntry {
     /// the weight this file carries into any merge it participates in.
     #[serde(default)]
     pub dominant_target_symbols: usize,
+    /// Every target **file** this source file's matched symbols landed in, split
+    /// by tier strength, sorted by descending total then path. The split-not-merge
+    /// detector reads these per-destination tallies to find target files that ≥ 2
+    /// distinct source files *substantially* contribute to (a file-merge) and
+    /// source files ported into a crate owned by another package (a
+    /// misplacement) — a strictly richer signal than the single dominant target.
+    #[serde(default)]
+    pub target_file_contributions: Vec<TargetFileContribution>,
     /// Matchable symbols in the file.
     pub total_symbols: usize,
     /// Of those, how many matched.
@@ -362,12 +388,16 @@ impl MultiPackageReport {
         source_kind: &str,
         target_kind: &str,
         reports: Vec<(String, PortDiffReport)>,
+        owning_override: &std::collections::BTreeMap<String, String>,
     ) -> MultiPackageReport {
         let mut packages = Vec::with_capacity(reports.len());
         let mut totals = RollupTotals::default();
-        // Invert every package's dominant-target-file relation together, tagging
-        // each contribution with its package, so a target file drawing source
-        // files from several packages surfaces as a cross-package merge.
+        // Gather every package's per-target-file contributions, tagged with its
+        // package, so a target file drawing substantial content from several source
+        // files (a file-merge) — or a source file ported into another package's
+        // crate (a misplacement) — surfaces across the whole port. `owning_override`
+        // maps each target crate to the package that owns it (config's per-package
+        // primary crate); an empty map falls back to plurality.
         let mut contributions = Vec::new();
         for (name, report) in reports {
             contributions.extend(super::merge::contributions_from_files(&report.files, &name));
@@ -380,7 +410,7 @@ impl MultiPackageReport {
             target_kind: target_kind.to_string(),
             packages,
             totals,
-            merges: MergeReport::from_contributions(contributions),
+            merges: MergeReport::from_contributions(contributions, owning_override),
         }
     }
 }
@@ -483,7 +513,10 @@ impl RootedCrossPackageReport {
             target_kind: self.target_kind.clone(),
             packages: self.packages.iter().map(|p| p.rollup.clone()).collect(),
             totals: self.totals.clone(),
-            merges: MergeReport::from_contributions(contributions),
+            merges: MergeReport::from_contributions(
+                contributions,
+                &std::collections::BTreeMap::new(),
+            ),
         }
     }
 }
@@ -602,6 +635,7 @@ mod tests {
             "ts",
             "rust",
             vec![("ai".to_string(), a), ("agent".to_string(), b)],
+            &std::collections::BTreeMap::new(),
         );
 
         // Per-package rollups preserve order + headline numbers + wave counts.
