@@ -145,11 +145,34 @@ fn effect_category(name: &str) -> Option<&'static str> {
 /// statically-known trait-method name). Shared by the call path
 /// ([`CallCollector::visit_terminator`]) and the reference path
 /// ([`CallCollector::reference_operand`]) so both resolve a callee identically.
-fn fndef_name(def: FnDef, args: &GenericArgs) -> String {
-    match Instance::resolve(def, args) {
-        Ok(inst) => inst.name(),
-        Err(_) => def.name(),
-    }
+fn fndef_name(def: FnDef, _args: &GenericArgs) -> String {
+    // Derive the callee name from its polymorphic def path rather than resolving a
+    // monomorphic `Instance`.
+    //
+    // `Instance::resolve(def, args)` monomorphizes the callee, which forces
+    // codegen-mode normalization of its generic arguments. For some instances
+    // (observed with an `impl IntoIterator<Item = …>` argument in
+    // `pidgin-agent`) rustc's `normalize_erasing_regions` cannot normalize an
+    // opaque projection and raises `bug!` — a fatal *diagnostic* plus a panic.
+    // Catching the panic is not enough: the emitted `bug!` diagnostic poisons the
+    // whole crate's compilation, so cargo never writes the crate's `.rmeta`, and
+    // every dependent crate then fails to build ("extern location … does not
+    // exist"), taking its own extraction down with it. The only reliable fix is
+    // to never trigger that normalization.
+    //
+    // The def-path name is also the correct granularity for a *dependency* graph:
+    //   * a local generic fn is only ever represented by its polymorphic def name
+    //     (it comes back from `all_local_items` un-monomorphized and is keyed by
+    //     `item.name()`), so a callee keyed by `def.name()` matches its definition
+    //     node, where a `foo::<Concrete>` mono name would miss it;
+    //   * a local concrete fn has `inst.name() == def.name()`, so nothing changes;
+    //   * an external mono call (`Vec::<T>::new`) is a foreign leaf either way, and
+    //     effect classification strips generics before matching, so it is
+    //     unaffected.
+    // This mirrors the pre-existing `Err(_) => def.name()` fallback, now taken
+    // unconditionally so a single unnormalizable instance can never abort — nor
+    // silently corrupt — an extraction.
+    def.name()
 }
 
 /// A span's file and 1-based start line.
