@@ -198,8 +198,14 @@ fn source_file_to_module(file: &str, rules: &NamingRules) -> String {
 /// trailing `/mod`.
 fn target_file_to_module(file: &str, rules: &NamingRules) -> String {
     let mut f = file;
-    let pref = format!("{}/", rules.target_src_prefix);
-    if let Some(rest) = f.strip_prefix(&pref) {
+    // Try each configured target crate's src prefix (a package may map to several
+    // crates); the first that matches wins. Fall back to the generic
+    // `crates/<x>/src/` shape for any crate not spelled out in the config.
+    let stripped = rules.target_src_prefix.iter().find_map(|p| {
+        let pref = format!("{p}/");
+        f.strip_prefix(&pref)
+    });
+    if let Some(rest) = stripped {
         f = rest;
     } else if let Some(rest) = strip_generic_crate_src(f) {
         f = rest;
@@ -1380,6 +1386,41 @@ mod tests {
             .naive_vs_graph
             .recovered_files
             .contains(&"src/api/simple-options.ts".to_string()));
+    }
+
+    #[test]
+    fn cross_crate_symbol_is_matched_when_graphs_merged() {
+        // A source package ported across two crates: `keep.ts#stays` landed in
+        // crate `a`, but `moved.ts#relocated` was ported into a DIFFERENT crate
+        // `b`. When both crates' symbols share one (merged) target graph, the
+        // file whose symbol only exists in crate `b` still matches — it is not
+        // banded NOT-STARTED. This is the cross-crate visibility fix.
+        let source = graph_of(
+            &[
+                ("src/keep.ts#stays", "src/keep.ts"),
+                ("src/moved.ts#relocated", "src/moved.ts"),
+            ],
+            &[],
+        );
+        // `stays` is in crate a; `relocated` is only in crate b.
+        let target = graph_of(
+            &[
+                ("a::keep::stays", "crates/a/src/keep.rs"),
+                ("b::moved::relocated", "crates/b/src/moved.rs"),
+            ],
+            &[],
+        );
+        let plan = build_plan(&source, PlanOpts::default());
+        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+        let moved = report
+            .files
+            .iter()
+            .find(|f| f.path == "src/moved.ts")
+            .unwrap();
+        // The symbol in the other crate is visible: matched, not NOT-STARTED.
+        assert_eq!(moved.matched_symbols, 1);
+        assert_ne!(moved.band, Band::NotStarted);
     }
 
     // ---- 3. Graph-confirm -------------------------------------------------
