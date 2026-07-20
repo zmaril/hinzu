@@ -83,6 +83,12 @@ pub struct PortDiffConfig {
     /// The optional test-verified DONE oracle. When `None`, no file is banded
     /// DONE (all would-be-DONE files fall to their structural band).
     pub conformance: Option<ConformanceConfig>,
+    /// The package name this config diffs (`ai`, `coding-agent`, …), used to tag
+    /// merge contributions so the whole-port rollup can tell which package a
+    /// contested target file drew each source file from. `None` in synthetic /
+    /// single-package uses where the package split is irrelevant.
+    #[serde(default)]
+    pub package: Option<String>,
 }
 
 impl PortDiffConfig {
@@ -110,6 +116,7 @@ impl PortDiffConfig {
                 package: "ai".to_string(),
                 src_prefix_strip: "packages/ai/".to_string(),
             }),
+            package: Some("ai".to_string()),
         }
     }
 }

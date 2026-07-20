@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::merge::MergeReport;
+
 /// The band a file lands in. Ordered from most to least ported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Band {
@@ -123,6 +125,17 @@ pub struct FileEntry {
     pub map_method: Option<String>,
     /// The clustering vote mass, when the mapping came from `"graph-cluster"`.
     pub map_votes: Option<f64>,
+    /// The single target **file** holding the plurality of this source file's
+    /// matched symbols (`crates/pidgin-ai/src/...rs`), or `None` when nothing
+    /// matched. Where `mapped_target` is a (possibly multi-module) cluster subtree,
+    /// this is the concrete dominant file — the anchor the split-not-merge detector
+    /// inverts to find target files that ≥ 2 source files merged into.
+    #[serde(default)]
+    pub dominant_target_file: Option<String>,
+    /// How many of this file's matched symbols landed in `dominant_target_file` —
+    /// the weight this file carries into any merge it participates in.
+    #[serde(default)]
+    pub dominant_target_symbols: usize,
     /// Matchable symbols in the file.
     pub total_symbols: usize,
     /// Of those, how many matched.
@@ -327,6 +340,15 @@ pub struct MultiPackageReport {
     pub packages: Vec<PackageRollup>,
     /// The summed totals across every package.
     pub totals: RollupTotals,
+    /// The whole-port split-not-merge detector: every package's source files
+    /// inverted together, so a target file receiving source files from ≥ 2
+    /// packages surfaces as a `package_merge`. Cross-package detection is only
+    /// complete when each package was matched against the **union** of every target
+    /// crate (the `--merge-check` path); a plain `--all` run matches each package
+    /// against its own crate, so it catches only merges whose contributors already
+    /// resolve into that crate.
+    #[serde(default)]
+    pub merges: MergeReport,
 }
 
 impl MultiPackageReport {
@@ -343,7 +365,12 @@ impl MultiPackageReport {
     ) -> MultiPackageReport {
         let mut packages = Vec::with_capacity(reports.len());
         let mut totals = RollupTotals::default();
+        // Invert every package's dominant-target-file relation together, tagging
+        // each contribution with its package, so a target file drawing source
+        // files from several packages surfaces as a cross-package merge.
+        let mut contributions = Vec::new();
         for (name, report) in reports {
+            contributions.extend(super::merge::contributions_from_files(&report.files, &name));
             totals.add_report(&report);
             packages.push(PackageRollup::from_report(name, report));
         }
@@ -353,6 +380,7 @@ impl MultiPackageReport {
             target_kind: target_kind.to_string(),
             packages,
             totals,
+            merges: MergeReport::from_contributions(contributions),
         }
     }
 }
@@ -443,11 +471,19 @@ impl RootedCrossPackageReport {
     /// can be reused for the cross-package closure dashboard. The per-package
     /// slices become the rollup's packages and the summed totals carry over.
     pub fn as_multi(&self) -> MultiPackageReport {
+        let mut contributions = Vec::new();
+        for p in &self.packages {
+            contributions.extend(super::merge::contributions_from_files(
+                &p.rollup.report.files,
+                &p.package,
+            ));
+        }
         MultiPackageReport {
             source_kind: self.source_kind.clone(),
             target_kind: self.target_kind.clone(),
             packages: self.packages.iter().map(|p| p.rollup.clone()).collect(),
             totals: self.totals.clone(),
+            merges: MergeReport::from_contributions(contributions),
         }
     }
 }
@@ -474,6 +510,13 @@ pub struct PortDiffReport {
     pub naive_vs_graph: NaiveVsGraph,
     /// The conformance cross-check.
     pub conformance_crosscheck: ConformanceCrosscheck,
+    /// The split-not-merge detector: target files that ≥ 2 of this package's
+    /// source files merged into (and, when tagged, the cross-package subset). In a
+    /// single-package report the contributors all share one package, so only
+    /// same-package file-merges surface here; cross-package merges need the
+    /// union-target rollup in [`MultiPackageReport::merges`].
+    #[serde(default)]
+    pub merges: MergeReport,
     /// The honest fidelity block.
     pub fidelity: Fidelity,
 }
@@ -541,6 +584,7 @@ mod tests {
                 ported_plus_done: bands.done + bands.ported,
                 ..Default::default()
             },
+            merges: MergeReport::default(),
             fidelity: Fidelity {
                 structural_not_correctness: true,
                 ..Default::default()

@@ -58,12 +58,14 @@ use crate::plan::PlanOutput;
 
 mod config;
 mod delta;
+mod merge;
 mod report;
 pub use config::{ConformanceConfig, NamingRules, PortDiffConfig};
 pub use delta::{
     band_rank, diff_cross_reports, diff_multi_reports, diff_reports, BandNetMovement,
     BandTransition, DeltaTotals, Direction, FileDelta, PortDiffDelta, Verdict,
 };
+pub use merge::{MergeContributor, MergeEntry, MergeReport};
 pub use report::{
     Band, BandCounts, ConformanceCrosscheck, Fidelity, FileEntry, FileMapSummary,
     FileTierBreakdown, FrontierEntry, GraphConfirmSummary, MultiPackageReport, NaiveVsGraph,
@@ -339,6 +341,11 @@ struct AtSym {
     /// in a non-primary crate drive the RELOCATED band. Always `true` for
     /// single-crate packages, so they never produce RELOCATED.
     in_primary_crate: bool,
+    /// The target symbol's defining file, workspace-relative
+    /// (`crates/<crate>/src/x.rs`) — the concrete destination the split-not-merge
+    /// detector inverts (a source file's dominant target file is the plurality of
+    /// its matched symbols' `file`s).
+    file: String,
 }
 
 /// A normalized, matched source symbol.
@@ -427,6 +434,7 @@ pub fn port_diff(
             leaf_norm: norm_leaf(&leaf_raw, rules),
             is_impl: s.id.starts_with('<'),
             in_primary_crate: target_file_in_primary_crate(file, rules),
+            file: file.to_string(),
             id: s.id.clone(),
         });
     }
@@ -730,6 +738,11 @@ pub fn port_diff(
         // packages have no secondary crate, so `secondary` stays 0 and the band
         // is untouched.
         let (mut resolved, mut secondary) = (0usize, 0usize);
+        // Tally which target FILE each matched symbol resolved to, so the file's
+        // dominant target file (the plurality) can anchor the split-not-merge
+        // detector. Keyed by target file path, insertion order irrelevant (the
+        // winner is chosen by count with a deterministic path tie-break).
+        let mut tf_counts: HashMap<&str, usize> = HashMap::new();
         for s in syms {
             if !s.tier.matched() {
                 continue;
@@ -739,8 +752,16 @@ pub fn port_diff(
                 if !at_syms[*idx].in_primary_crate {
                     secondary += 1;
                 }
+                *tf_counts.entry(at_syms[*idx].file.as_str()).or_default() += 1;
             }
         }
+        // Plurality target file; ties broken by the lexicographically smallest
+        // path so the choice is deterministic.
+        let dominant = tf_counts
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)));
+        let dominant_target_file = dominant.map(|(f, _)| f.to_string());
+        let dominant_target_symbols = dominant.map(|(_, &c)| c).unwrap_or(0);
         let band = if matches!(band, Band::Ported | Band::Started)
             && resolved > 0
             && secondary * 2 > resolved
@@ -779,6 +800,8 @@ pub fn port_diff(
             mapped_target: fm.and_then(|m| m.subtree.clone()),
             map_method,
             map_votes: fm.and_then(|m| m.votes),
+            dominant_target_file,
+            dominant_target_symbols,
             total_symbols: total,
             matched_symbols: matched,
             tier_breakdown: tb,
@@ -917,6 +940,16 @@ pub fn port_diff(
             .to_string(),
     };
 
+    // ---- Split-not-merge detector -----------------------------------------
+    // Invert this package's `source_file -> dominant_target_file` relation. Every
+    // contributor shares the package label, so only same-package file-merges can
+    // surface here; the cross-package rollup (`MultiPackageReport::merges`) tags
+    // each package and matches against the union of target crates.
+    let merges = merge::MergeReport::from_contributions(merge::contributions_from_files(
+        &file_entries,
+        config.package.as_deref().unwrap_or(""),
+    ));
+
     PortDiffReport {
         source_kind: config.source_kind.clone(),
         target_kind: config.target_kind.clone(),
@@ -953,6 +986,7 @@ pub fn port_diff(
             recovered_files,
         },
         conformance_crosscheck,
+        merges,
         fidelity: Fidelity {
             structural_not_correctness: true,
             matchable_denominator:

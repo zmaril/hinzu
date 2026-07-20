@@ -6,7 +6,8 @@
 //! inline and no asset is fetched, so the file renders offline.
 
 use hinzu_core::portdiff::{
-    Band, BandCounts, FileEntry, MultiPackageReport, PackageRollup, PortDiffReport, RollupTotals,
+    Band, BandCounts, FileEntry, MergeEntry, MergeReport, MultiPackageReport, PackageRollup,
+    PortDiffReport, RollupTotals,
 };
 
 /// Presentation metadata that is not in the report itself.
@@ -143,11 +144,84 @@ pub fn render_html(report: &PortDiffReport, meta: &HtmlMeta) -> String {
     h.push_str(&naive_panel(report, &by_path));
     h.push_str(&conformance_panel(report));
     h.push_str("</div>");
+    h.push_str(&merges_panel(&report.merges));
     h.push_str(&waves_panel(report));
     h.push_str(&frontier_panel(report));
     h.push_str(&graph_confirm_panel(report));
     h.push_str("</body></html>");
     h
+}
+
+/// The split-not-merge panel: target files that ≥ 2 source files merged into.
+/// Package-merges (contributors span ≥ 2 packages — the high-severity case) are
+/// listed first, then the remaining same-package file-merges. Renders nothing
+/// when the report is clean.
+fn merges_panel(merges: &MergeReport) -> String {
+    if merges.file_merges.is_empty() {
+        return String::new();
+    }
+    let pkg_rows: String = merges.package_merges.iter().map(merge_row).collect();
+    // The file-merges that are not already shown as package-merges.
+    let file_only: Vec<&MergeEntry> = merges
+        .file_merges
+        .iter()
+        .filter(|e| !e.cross_package)
+        .collect();
+    let file_rows: String = file_only.iter().copied().map(merge_row).collect();
+
+    let pkg_section = if merges.package_merges.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim sm" style="margin:6px 0 4px">PACKAGE-MERGES <span class="q">high severity — a target file drew source files from ≥ 2 packages</span></div>
+    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → matched symbols</th></tr></thead><tbody>{pkg_rows}</tbody></table>"#,
+        )
+    };
+    let file_section = if file_only.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim sm" style="margin:14px 0 4px">FILE-MERGES <span class="q">≥ 2 source files of one package merged into one target file</span></div>
+    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → matched symbols</th></tr></thead><tbody>{file_rows}</tbody></table>"#,
+        )
+    };
+    format!(
+        r#"<div class="panel">
+    <h2>Split-not-merge violations <span class="q">graph-derived: a target file is the dominant destination of ≥ 2 distinct source files</span></h2>
+    <div class="callout">A faithful port keeps each source file's identity. {np} package-merge(s) and {nf} file-merge(s) collapse a boundary — separate source files landed predominantly in one target file. Package-merges cross a package boundary and are the high-severity ones.</div>
+    {pkg_section}
+    {file_section}
+  </div>
+"#,
+        np = merges.package_merges.len(),
+        nf = merges.file_merges.len(),
+    )
+}
+
+/// One split-not-merge table row: the merged target file, the packages it spans,
+/// and each contributing source file with its matched-symbol count.
+fn merge_row(e: &MergeEntry) -> String {
+    let contribs: String = e
+        .contributors
+        .iter()
+        .map(|c| {
+            let pkg = if c.package.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<span class="dim">[{}]</span> "#, esc(&c.package))
+            };
+            format!(
+                r#"<div class="mono sm">{pkg}{sf} <span class="dim">→ {n}</span></div>"#,
+                sf = esc(short_path(&c.source_file)),
+                n = c.matched_symbols,
+            )
+        })
+        .collect();
+    format!(
+        r#"<tr><td class="mono sm">{tf}</td><td class="sm">{pkgs}</td><td>{contribs}</td></tr>"#,
+        tf = esc(&e.target_file),
+        pkgs = esc(&e.packages.join(", ")),
+    )
 }
 
 // ===========================================================================
@@ -184,6 +258,7 @@ pub fn render_multi_html(report: &MultiPackageReport, meta: &MultiHtmlMeta) -> S
     h.push_str(&multi_overall_bar(t));
     h.push_str(&multi_pkg_bars(&report.packages));
     h.push_str(&multi_summary_table(report));
+    h.push_str(&merges_panel(&report.merges));
     for pkg in &report.packages {
         h.push_str(&multi_pkg_section(pkg));
     }

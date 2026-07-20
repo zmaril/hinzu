@@ -384,3 +384,134 @@ fn single_crate_package_never_relocates() {
     assert_eq!(only.band, Band::Ported);
     assert_eq!(report.overall.bands.relocated, 0);
 }
+
+// ---- 6. Split-not-merge detector --------------------------------------
+
+#[test]
+fn file_merge_flags_two_source_files_into_one_target() {
+    // Two distinct source files whose symbols were both ported into ONE target
+    // file `merged.rs`. The dominant target file of each is `merged.rs`, so
+    // inverting flags it as a file-merge. Same package → not a package-merge.
+    let source = graph_of(
+        &[
+            ("src/a.ts#foo", "src/a.ts"),
+            ("src/a.ts#bar", "src/a.ts"),
+            ("src/b.ts#baz", "src/b.ts"),
+            ("src/b.ts#qux", "src/b.ts"),
+        ],
+        &[],
+    );
+    let target = graph_of(
+        &[
+            ("atilla_ai::merged::foo", "crates/atilla-ai/src/merged.rs"),
+            ("atilla_ai::merged::bar", "crates/atilla-ai/src/merged.rs"),
+            ("atilla_ai::merged::baz", "crates/atilla-ai/src/merged.rs"),
+            ("atilla_ai::merged::qux", "crates/atilla-ai/src/merged.rs"),
+        ],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+    // Both source files resolve to the same dominant target file.
+    let dom = |p: &str| {
+        report
+            .files
+            .iter()
+            .find(|f| f.path == p)
+            .unwrap()
+            .dominant_target_file
+            .clone()
+    };
+    assert_eq!(
+        dom("src/a.ts").as_deref(),
+        Some("crates/atilla-ai/src/merged.rs")
+    );
+    assert_eq!(
+        dom("src/b.ts").as_deref(),
+        Some("crates/atilla-ai/src/merged.rs")
+    );
+
+    // Exactly one file-merge, spanning both source files; no package-merge.
+    assert_eq!(report.merges.file_merges.len(), 1);
+    assert!(report.merges.package_merges.is_empty());
+    let m = &report.merges.file_merges[0];
+    assert_eq!(m.target_file, "crates/atilla-ai/src/merged.rs");
+    let mut srcs: Vec<&str> = m
+        .contributors
+        .iter()
+        .map(|c| c.source_file.as_str())
+        .collect();
+    srcs.sort();
+    assert_eq!(srcs, vec!["src/a.ts", "src/b.ts"]);
+    assert!(!m.cross_package);
+}
+
+#[test]
+fn package_merge_flags_contributors_from_two_packages() {
+    // Two packages port a file each into the SAME target file `shared.rs`. The
+    // whole-port rollup tags each contribution with its package, so inverting the
+    // union flags a package-merge (contributors span 2 packages).
+    let target = graph_of(
+        &[
+            ("atilla_ai::shared::foo", "crates/atilla-ai/src/shared.rs"),
+            ("atilla_ai::shared::bar", "crates/atilla-ai/src/shared.rs"),
+        ],
+        &[],
+    );
+    let src_a = graph_of(&[("src/a.ts#foo", "src/a.ts")], &[]);
+    let src_b = graph_of(&[("src/b.ts#bar", "src/b.ts")], &[]);
+    let report_a = port_diff(
+        &src_a,
+        &build_plan(&src_a, PlanOpts::default()),
+        &target,
+        &cfg_no_conformance(),
+        None,
+    );
+    let report_b = port_diff(
+        &src_b,
+        &build_plan(&src_b, PlanOpts::default()),
+        &target,
+        &cfg_no_conformance(),
+        None,
+    );
+    let multi = MultiPackageReport::aggregate(
+        "ts",
+        "rust",
+        vec![
+            ("ai".to_string(), report_a),
+            ("coding-agent".to_string(), report_b),
+        ],
+    );
+
+    assert_eq!(multi.merges.package_merges.len(), 1);
+    let m = &multi.merges.package_merges[0];
+    assert_eq!(m.target_file, "crates/atilla-ai/src/shared.rs");
+    assert!(m.cross_package);
+    assert_eq!(
+        m.packages,
+        vec!["ai".to_string(), "coding-agent".to_string()]
+    );
+}
+
+#[test]
+fn clean_one_to_one_mapping_is_not_flagged() {
+    // Two source files ported to two distinct target files: no target file is the
+    // dominant destination of ≥ 2 source files, so nothing is flagged.
+    let source = graph_of(
+        &[("src/a.ts#foo", "src/a.ts"), ("src/b.ts#bar", "src/b.ts")],
+        &[],
+    );
+    let target = graph_of(
+        &[
+            ("atilla_ai::a::foo", "crates/atilla-ai/src/a.rs"),
+            ("atilla_ai::b::bar", "crates/atilla-ai/src/b.rs"),
+        ],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+    assert!(report.merges.file_merges.is_empty());
+    assert!(report.merges.package_merges.is_empty());
+}
