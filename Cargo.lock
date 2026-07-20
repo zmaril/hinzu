@@ -1688,8 +1688,10 @@ dependencies = [
  "hinzu-core",
  "hinzu-dbsp",
  "hinzu-lsp",
+ "proc-macro2",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tempfile",
  "toml",
 ]

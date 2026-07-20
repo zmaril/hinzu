@@ -11,6 +11,7 @@ mod portdiff_config;
 mod portdiff_html;
 mod py_adapter;
 mod rust_adapter;
+mod structural_rust;
 mod ts_adapter;
 
 use std::path::{Path, PathBuf};
@@ -93,6 +94,16 @@ enum Cmd {
     /// degrading honestly (an unmodelable type falls back to `Json`) and writing
     /// a coverage-stats sidecar so the lossy edges are visible, not silent.
     ApiFluessig(ApiFluessigArgs),
+    /// Find places where several implementations are structurally similar enough
+    /// that a shared abstraction is worth investigating. ADVISORY and
+    /// evidence-based: it locates clusters, explains what they share and what
+    /// differs (the abstraction axes), names a likely abstraction family with a
+    /// confidence, cites the per-language capability/limitations, and lists
+    /// reasons NOT to consolidate. It never refactors and never claims an
+    /// abstraction is definitely correct. Extracts Rust signatures with syn
+    /// (syntactic — types/macros/call-targets are read, not resolved), or reads a
+    /// pre-extracted `--structural` signatures JSON.
+    Similar(SimilarArgs),
 }
 
 #[derive(Parser)]
@@ -298,6 +309,32 @@ struct ApiFluessigArgs {
     out_stats: Option<PathBuf>,
 }
 
+#[derive(Parser)]
+struct SimilarArgs {
+    /// The project to analyze (a cargo project). Defaults to the current
+    /// directory. Ignored when `--structural` is given.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Pre-extracted structural signatures JSON (an extractor's
+    /// `{language, extractor, signatures}` document), in place of a live
+    /// extraction. This is the offline path — it needs no toolchain.
+    #[arg(long)]
+    structural: Option<PathBuf>,
+    /// The clustering threshold: a pair at or above this similarity is an edge.
+    #[arg(long, default_value_t = 0.55)]
+    min_similarity: f64,
+    /// The minimum normalized size (node-kind count) a signature must have to be
+    /// considered — trivial defs are filtered out.
+    #[arg(long, default_value_t = 12)]
+    min_size: u32,
+    /// Only analyze signatures in this language (`rust` today).
+    #[arg(long)]
+    language: Option<String>,
+    /// Where to write the similarity JSON. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
 /// sets; `dbsp` is the incremental-capable engine, `naive` the reference BFS.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -360,6 +397,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::ApiFluessig(args) => match api_fluessig_cmd(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::Similar(args) => match similar(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -532,6 +573,99 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
 
     let json = serde_json::to_string_pretty(&plan).context("serializing the plan to JSON")?;
     write_json(args.out.as_deref(), &json, "plan")
+}
+
+/// The `hinzu similar` flow. Resolves structural signatures (from a
+/// pre-extracted `--structural` JSON, else a live `syn` extraction over a cargo
+/// project), runs the pure similarity engine, writes the JSON document to `--out`
+/// or stdout, and prints a human summary to stderr (mirroring `port-diff` /
+/// `graph`). When the path is not a cargo project and no `--structural` is given,
+/// it fails honestly rather than faking an analysis.
+fn similar(args: SimilarArgs) -> Result<ExitCode> {
+    let doc = load_signatures(&args)?;
+    let root = match &args.structural {
+        Some(p) => p.display().to_string(),
+        None => args.path.display().to_string(),
+    };
+
+    let params = hinzu_core::similarity::AnalyzeParams {
+        min_similarity: args.min_similarity,
+        min_size: args.min_size,
+        min_statements: hinzu_core::similarity::SimilarityParams::default().min_statements,
+        language_filter: args.language.clone(),
+    };
+    let output = hinzu_core::similarity::analyze(&root, doc.signatures, &params);
+
+    print_similarity_summary(&output);
+
+    let json = serde_json::to_string_pretty(&output)
+        .context("serializing the similarity report to JSON")?;
+    write_json(args.out.as_deref(), &json, "similarity report")
+}
+
+/// Resolve structural signatures for `hinzu similar`: read the pre-extracted
+/// `--structural` document when given, else extract live from a cargo project
+/// with the `syn` structural extractor. A non-cargo path without `--structural`
+/// fails honestly (no faked analysis), like the other subcommands.
+fn load_signatures(args: &SimilarArgs) -> Result<hinzu_core::similarity::SignatureDoc> {
+    if let Some(path) = &args.structural {
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("reading structural signatures from {}", path.display()))?;
+        return serde_json::from_str(&json)
+            .with_context(|| format!("parsing structural signatures from {}", path.display()));
+    }
+    if rust_adapter::is_cargo_project(&args.path) {
+        return structural_rust::extract(&args.path)
+            .with_context(|| format!("extracting Rust signatures from {}", args.path.display()));
+    }
+    anyhow::bail!(
+        "{} is not a cargo project — pass --structural <json> to analyze pre-extracted \
+         signatures (TypeScript extraction is a later phase)",
+        args.path.display()
+    )
+}
+
+/// Print the human-readable similarity summary to stderr: the header count, the
+/// capability edge (which languages had a profile), and a couple of lines per
+/// candidate. Mirrors `port-diff`'s `=== … ===` convention.
+fn print_similarity_summary(output: &hinzu_core::similarity::SimilarityOutput) {
+    eprintln!(
+        "=== similarity: {} candidates ===",
+        output.stats.candidates_found
+    );
+    eprintln!(
+        "analyzed {} signatures ({} after the trivial-def filter), compared {} pairs",
+        output.stats.signatures_analyzed,
+        output.stats.signatures_after_filter,
+        output.stats.pairs_compared,
+    );
+    let langs_with_profiles: Vec<&str> = output
+        .profiles
+        .iter()
+        .map(|p| p.language.as_str())
+        .collect();
+    if langs_with_profiles.is_empty() && !output.languages.is_empty() {
+        eprintln!(
+            "note: no shipped structural profile for {} — findings are unprofiled",
+            output.languages.join(", ")
+        );
+    }
+    for c in &output.candidates {
+        eprintln!(
+            "  {} [{:.2} confidence, {:.2} similarity] {} → {}",
+            c.id,
+            c.confidence,
+            c.pattern.similarity,
+            c.likely_abstraction.family,
+            c.pattern.summary,
+        );
+        for m in &c.members {
+            eprintln!(
+                "      {} ({}:{}-{})",
+                m.display, m.file, m.line_start, m.line_end
+            );
+        }
+    }
 }
 
 /// The `hinzu port-diff` flow. Loads the multi-package config, selects one

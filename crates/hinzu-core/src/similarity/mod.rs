@@ -1,0 +1,1419 @@
+//! Structural similarity analysis: find places where several implementations are
+//! structurally alike enough that a human or an agent should investigate a shared
+//! abstraction. This is the pure engine behind `hinzu similar`.
+//!
+//! It is **advisory and evidence-based**, in the same spirit as the rest of
+//! hinzu. It never performs a refactor and never claims an abstraction is
+//! definitely correct. For each cluster of similar code it reports: where the
+//! members are, what they *share*, what *differs* (the axes an abstraction would
+//! have to range over), the likely abstraction family, a confidence, the
+//! per-language capability/limitations that bear on the finding, and explicit
+//! reasons **not** to consolidate. Uncertainty is fail-closed: a syntactic-only
+//! extractor caps confidence and shows up as limitations and counter-evidence,
+//! never as a faked claim.
+//!
+//! ## The seam, stated honestly
+//!
+//! The core reads no files. An extractor (the CLI/adapter layer) parses source
+//! into [`StructuralSignature`]s — one per function/def, a language-neutral
+//! structural fingerprint — and hands them here. [`analyze`] buckets, scores,
+//! clusters, and explains, returning a [`SimilarityOutput`]. Everything the
+//! analysis can and cannot see is carried in the [`profile::LanguageProfile`]
+//! block, so a consumer reads the caveats next to the data. The types are
+//! language-neutral by design: a TypeScript extractor drops in by emitting the
+//! same signatures and a TS profile, with no change to this engine.
+//!
+//! ## What it captures, and what it does not
+//!
+//! Similarity is measured over structure only: a k-gram (shingle) fingerprint of
+//! the normalized AST-node-kind sequence, the control-flow skeleton, the
+//! statement mix, the ordered call sequence, and the *shape* of the signature
+//! types (identifiers erased, so "same shape, different types" is a strong
+//! signal). It does **not** understand semantics: two functions can be
+//! structurally identical and behave differently, and two behaviourally
+//! equivalent functions written in different styles will not match. That is why
+//! the output is a set of *candidates to investigate*, not a verdict.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+pub mod profile;
+pub use profile::{profile_for_language, rust_syn_profile, LanguageProfile};
+
+/// The schema version embedded in every emitted similarity document, so a
+/// consumer can branch on shape changes.
+pub const HINZU_SIMILARITY_VERSION: u32 = 1;
+
+/// The k in the k-gram shingles an extractor hashes over the AST-node-kind
+/// sequence. Fixed here so extractor and engine agree.
+pub const SHINGLE_K: usize = 3;
+
+// ---------------------------------------------------------------------------
+// The structural signature (extractor → engine).
+// ---------------------------------------------------------------------------
+
+/// The arity of a callable: how many parameters, results, and generic
+/// parameters it declares. A coarse but language-neutral size/shape signal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Arity {
+    /// Declared parameters (including a receiver like `self`).
+    pub params: u32,
+    /// Declared results (0 for a unit return, 1 otherwise — a tuple counts once).
+    pub results: u32,
+    /// Declared generic type parameters.
+    pub generics: u32,
+}
+
+/// The control-flow skeleton of a body: counts that summarize its branching and
+/// looping shape without any of its contents. Two bodies with the same skeleton
+/// have the same control-flow structure even if every identifier differs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cfg {
+    /// `if` / conditional branch points.
+    pub branch_count: u32,
+    /// Total `match`/`switch` arms across the body.
+    pub match_arms: u32,
+    /// Loops (`for`/`while`/`loop`).
+    pub loop_count: u32,
+    /// `?`/try operators (error-propagation points).
+    pub try_count: u32,
+    /// Explicit `return` statements.
+    pub return_points: u32,
+    /// Maximum block-nesting depth.
+    pub max_nesting: u32,
+}
+
+impl Cfg {
+    /// The skeleton as an ordered vector, for distance math.
+    fn vector(&self) -> [f64; 6] {
+        [
+            self.branch_count as f64,
+            self.match_arms as f64,
+            self.loop_count as f64,
+            self.try_count as f64,
+            self.return_points as f64,
+            self.max_nesting as f64,
+        ]
+    }
+}
+
+/// The structural shape of a signature's types, with identifiers erased. A
+/// nominal leaf type erases to `_`; constructors are kept (`Result<_,_>`,
+/// `Vec<_>`, `&_`), so two signatures with the same shape but different concrete
+/// types match — the strong "same shape, different types" signal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeShape {
+    /// The erased parameter type shapes, in order.
+    pub params: Vec<String>,
+    /// The erased result type shape (`"_"` for unit).
+    pub result: String,
+}
+
+/// One function/def's language-neutral structural fingerprint. Produced by an
+/// extractor, consumed by [`analyze`]. Every field is structure only — no
+/// identifiers, no literals, no semantics — so it is comparable across bodies
+/// and (by design) across languages.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StructuralSignature {
+    /// A stable id. For Rust, the file-and-item-qualified path.
+    pub symbol_id: String,
+    /// The human name.
+    pub display: String,
+    /// The source language (`"rust"`, `"typescript"`, …).
+    pub language: String,
+    /// The def kind (`"function"`, `"impl_method"`, `"trait_method"`,
+    /// `"closure"`, …).
+    pub kind: String,
+    /// The defining file.
+    pub file: String,
+    /// First source line.
+    pub line_start: u32,
+    /// Last source line.
+    pub line_end: u32,
+    /// Parameter/result/generic arity.
+    pub arity: Arity,
+    /// The control-flow skeleton.
+    pub cfg: Cfg,
+    /// Node-kind counts (`let`, `call`, `if`, `match`, `loop`, `return`,
+    /// `assign`, `macro`, `await`, …).
+    pub stmt_histogram: BTreeMap<String, u32>,
+    /// The ordered, normalized callee simple-names (generics/paths stripped).
+    pub call_sequence: Vec<String>,
+    /// The structural type shape of the signature.
+    pub type_shape: TypeShape,
+    /// k-gram (k=[`SHINGLE_K`]) hashes over the normalized AST-node-kind
+    /// sequence, for Jaccard / MinHash.
+    pub shingles: Vec<u64>,
+    /// The normalized size (node-kind sequence length), for length filtering.
+    pub token_len: u32,
+    /// Optional language-specific extras (`has_macro`, `is_async`, …).
+    #[serde(default)]
+    pub features: BTreeMap<String, String>,
+}
+
+impl StructuralSignature {
+    /// The distinct shingle set (Jaccard/MinHash treat shingles as a set).
+    fn shingle_set(&self) -> BTreeSet<u64> {
+        self.shingles.iter().copied().collect()
+    }
+
+    /// The number of statement-ish nodes (histogram total) — the min-statements
+    /// gate reads this.
+    fn stmt_total(&self) -> u32 {
+        self.stmt_histogram.values().copied().sum()
+    }
+
+    /// Whether a feature flag is set to `"true"`.
+    fn feature_true(&self, key: &str) -> bool {
+        self.features.get(key).map(String::as_str) == Some("true")
+    }
+}
+
+/// The document an extractor emits: a language/extractor stamp plus the
+/// signatures. `hinzu similar --structural` reads exactly this shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignatureDoc {
+    /// The language these signatures are for.
+    pub language: String,
+    /// The extractor that produced them.
+    pub extractor: String,
+    /// The signatures.
+    pub signatures: Vec<StructuralSignature>,
+}
+
+// ---------------------------------------------------------------------------
+// The finding (engine output).
+// ---------------------------------------------------------------------------
+
+/// One member of a candidate cluster: where a similar implementation lives.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Member {
+    /// The member's stable symbol id.
+    pub symbol_id: String,
+    /// The human name.
+    pub display: String,
+    /// The source language.
+    pub language: String,
+    /// The defining file.
+    pub file: String,
+    /// First source line.
+    pub line_start: u32,
+    /// Last source line.
+    pub line_end: u32,
+}
+
+/// The shared structural pattern of a cluster: a human summary, the concrete
+/// features the members share, the aggregate similarity, and its breakdown.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pattern {
+    /// A one-line human summary of what the members share.
+    pub summary: String,
+    /// The concrete features that are ~identical across members.
+    pub shared_features: Vec<String>,
+    /// The aggregate similarity, 0..1.
+    pub similarity: f64,
+    /// The per-signal similarity breakdown (`shingle_jaccard`, `cfg`,
+    /// `type_shape`, `call_seq`, `histogram`).
+    pub similarity_breakdown: BTreeMap<String, f64>,
+}
+
+/// The abstraction a cluster likely wants, named honestly with its rationale and
+/// the language mechanisms that could express it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LikelyAbstraction {
+    /// The abstraction family (from the profile's `abstraction_families`).
+    pub family: String,
+    /// Why this family, in prose.
+    pub rationale: String,
+    /// The concrete language mechanisms that could express it.
+    pub language_mechanisms: Vec<String>,
+}
+
+/// The subset of a profile's capabilities and limitations that bear on a
+/// specific finding — the fidelity block, scoped to this candidate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindingProfile {
+    /// The capability grades that shaped this finding (e.g.
+    /// `"types_resolved=syntactic"`).
+    pub capabilities_used: Vec<String>,
+    /// The limitations that bear on this finding.
+    pub limitations: Vec<String>,
+}
+
+/// A candidate cluster: a place worth investigating for a shared abstraction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Finding {
+    /// The candidate id (`"cand-1"`, …).
+    pub id: String,
+    /// The cluster members (always >= 2).
+    pub members: Vec<Member>,
+    /// The shared structural pattern.
+    pub pattern: Pattern,
+    /// What *varies* across members — the axes an abstraction must range over.
+    pub differences: Vec<String>,
+    /// The likely abstraction family, with rationale.
+    pub likely_abstraction: LikelyAbstraction,
+    /// The confidence, 0..1 — bounded by how resolved the inputs are.
+    pub confidence: f64,
+    /// One line explaining how the confidence was arrived at.
+    pub confidence_basis: String,
+    /// Reasons **not** to consolidate — the honest counter-case.
+    pub counter_evidence: Vec<String>,
+    /// The capability/limitation block relevant to this finding.
+    pub profile: FindingProfile,
+}
+
+// ---------------------------------------------------------------------------
+// The output document.
+// ---------------------------------------------------------------------------
+
+/// The parameters a run was executed with, echoed into the output.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarityParams {
+    /// The clustering threshold: a pair at or above this similarity is an edge.
+    pub min_similarity: f64,
+    /// The minimum normalized size (`token_len`) a signature must have to be
+    /// considered — trivial defs are filtered out.
+    pub min_size: u32,
+    /// The minimum statement count a signature must have to be considered.
+    pub min_statements: u32,
+    /// The language filter applied, if any.
+    pub language_filter: Option<String>,
+}
+
+impl Default for SimilarityParams {
+    fn default() -> Self {
+        SimilarityParams {
+            min_similarity: 0.55,
+            min_size: 12,
+            min_statements: 2,
+            language_filter: None,
+        }
+    }
+}
+
+/// The knobs [`analyze`] takes. Kept separate from the echoed
+/// [`SimilarityParams`] so a caller constructs it directly.
+#[derive(Clone, Debug)]
+pub struct AnalyzeParams {
+    /// The clustering threshold (default 0.55).
+    pub min_similarity: f64,
+    /// The minimum normalized size gate (default 12).
+    pub min_size: u32,
+    /// The minimum statement count gate (default 2).
+    pub min_statements: u32,
+    /// Only analyze signatures in this language, if set.
+    pub language_filter: Option<String>,
+}
+
+impl Default for AnalyzeParams {
+    fn default() -> Self {
+        let p = SimilarityParams::default();
+        AnalyzeParams {
+            min_similarity: p.min_similarity,
+            min_size: p.min_size,
+            min_statements: p.min_statements,
+            language_filter: p.language_filter,
+        }
+    }
+}
+
+/// Aggregate counts for a run, reported honestly (including how many pairs were
+/// actually scored — the bucketing/LSH cost, not a hidden O(N²)).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarityStats {
+    /// Signatures handed to the engine.
+    pub signatures_analyzed: usize,
+    /// Signatures that passed the trivial-def filter.
+    pub signatures_after_filter: usize,
+    /// Distinct candidate pairs actually scored.
+    pub pairs_compared: usize,
+    /// Pairs that scored at or above `min_similarity`.
+    pub pairs_over_threshold: usize,
+    /// Clusters of >= 2 reported.
+    pub candidates_found: usize,
+}
+
+/// The complete similarity document, ready to serialize as JSON. Mirrors the
+/// `graph` convention: version, root, languages, a fidelity/capability block
+/// (the profiles), the params, the stats, and the candidates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarityOutput {
+    /// The schema version ([`HINZU_SIMILARITY_VERSION`]).
+    pub hinzu_similarity_version: u32,
+    /// The analyzed target (a label — usually the project path).
+    pub root: String,
+    /// The languages present in the analyzed signatures.
+    pub languages: Vec<String>,
+    /// The capability/limitation blocks — one per language present that has a
+    /// shipped profile. The fidelity block for this analysis.
+    pub profiles: Vec<LanguageProfile>,
+    /// The parameters this run used.
+    pub params: SimilarityParams,
+    /// Aggregate counts.
+    pub stats: SimilarityStats,
+    /// The candidate clusters, sorted by confidence descending.
+    pub candidates: Vec<Finding>,
+}
+
+// ---------------------------------------------------------------------------
+// The analysis.
+// ---------------------------------------------------------------------------
+
+/// Analyze a set of structural signatures for clusters worth investigating.
+///
+/// Pure: it reads no files and has no effects. `root` is a free-form label for
+/// the analyzed target (usually the project path). The pipeline is:
+/// 1. filter out trivial defs (`token_len < min_size`, or too few statements);
+/// 2. generate candidate pairs by coarse bucketing **and** a MinHash/LSH pass
+///    over the shingles (so cross-bucket structural matches are caught), scoring
+///    each distinct pair once (`pairs_compared` counts them honestly);
+/// 3. union-find over the pairs at or above `min_similarity` into clusters;
+/// 4. explain each cluster of >= 2: shared features, differences, likely
+///    abstraction, confidence (capped by the profile's resolution), and
+///    counter-evidence.
+pub fn analyze(
+    root: &str,
+    signatures: Vec<StructuralSignature>,
+    params: &AnalyzeParams,
+) -> SimilarityOutput {
+    let signatures_analyzed = signatures.len();
+
+    // Language filter (honest: a filter that matches nothing yields no findings,
+    // never a faked result).
+    let signatures: Vec<StructuralSignature> = match &params.language_filter {
+        Some(lang) => signatures
+            .into_iter()
+            .filter(|s| &s.language == lang)
+            .collect(),
+        None => signatures,
+    };
+
+    // Languages present + their shipped profiles (the fidelity block).
+    let mut languages: Vec<String> = signatures.iter().map(|s| s.language.clone()).collect();
+    languages.sort();
+    languages.dedup();
+    let profiles: Vec<LanguageProfile> = languages
+        .iter()
+        .filter_map(|l| profile_for_language(l))
+        .collect();
+
+    // Step 1: filter trivial defs.
+    let kept: Vec<StructuralSignature> = signatures
+        .into_iter()
+        .filter(|s| s.token_len >= params.min_size && s.stmt_total() >= params.min_statements)
+        .collect();
+    let signatures_after_filter = kept.len();
+
+    // Step 2: candidate pairs (bucketing + LSH), scored once each.
+    let candidate_pairs = candidate_pairs(&kept);
+    let pairs_compared = candidate_pairs.len();
+
+    let mut scored: Vec<(usize, usize, Score)> = Vec::new();
+    for &(i, j) in &candidate_pairs {
+        let score = score_pair(&kept[i], &kept[j]);
+        scored.push((i, j, score));
+    }
+    let over: Vec<&(usize, usize, Score)> = scored
+        .iter()
+        .filter(|(_, _, s)| s.aggregate >= params.min_similarity)
+        .collect();
+    let pairs_over_threshold = over.len();
+
+    // Step 3: union-find into clusters over the over-threshold edges.
+    let mut uf = UnionFind::new(kept.len());
+    for (i, j, _) in &over {
+        uf.union(*i, *j);
+    }
+    let mut clusters: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for idx in 0..kept.len() {
+        // Only nodes that took part in an edge can be in a non-trivial cluster;
+        // a singleton root is skipped below by the size >= 2 gate.
+        let root_id = uf.find(idx);
+        clusters.entry(root_id).or_default().push(idx);
+    }
+
+    // A quick lookup of pairwise scores for cluster-level aggregation.
+    let mut pair_score: BTreeMap<(usize, usize), Score> = BTreeMap::new();
+    for (i, j, s) in &scored {
+        pair_score.insert((*i, *j), s.clone());
+    }
+
+    // Step 4: explain each cluster of >= 2.
+    let mut findings: Vec<Finding> = Vec::new();
+    for members in clusters.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        if let Some(finding) = explain_cluster(members, &kept, &pair_score, &profiles) {
+            findings.push(finding);
+        }
+    }
+
+    // Sort by confidence desc, then by member count desc, then by id for
+    // determinism, and mint stable ids.
+    findings.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.members.len().cmp(&a.members.len()))
+            .then(a.members[0].symbol_id.cmp(&b.members[0].symbol_id))
+    });
+    for (n, f) in findings.iter_mut().enumerate() {
+        f.id = format!("cand-{}", n + 1);
+    }
+
+    SimilarityOutput {
+        hinzu_similarity_version: HINZU_SIMILARITY_VERSION,
+        root: root.to_string(),
+        languages,
+        profiles,
+        params: SimilarityParams {
+            min_similarity: params.min_similarity,
+            min_size: params.min_size,
+            min_statements: params.min_statements,
+            language_filter: params.language_filter.clone(),
+        },
+        stats: SimilarityStats {
+            signatures_analyzed,
+            signatures_after_filter,
+            pairs_compared,
+            pairs_over_threshold,
+            candidates_found: findings.len(),
+        },
+        candidates: findings,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Candidate-pair generation: coarse bucketing + MinHash/LSH.
+// ---------------------------------------------------------------------------
+
+/// The number of MinHash functions used for the LSH pass.
+const MINHASH_K: usize = 32;
+/// The number of LSH bands (`MINHASH_K` must be divisible by this). More, wider
+/// bands catch looser matches; `8 x 4` is a middle ground.
+const LSH_BANDS: usize = 8;
+
+/// Generate the distinct candidate pairs to score: the union of coarse-bucket
+/// pairs and MinHash/LSH pairs. A pair is `(i, j)` with `i < j`. This keeps the
+/// comparison off the full O(N^2) surface while still catching cross-bucket
+/// structural matches, and the returned count is what `pairs_compared` reports.
+fn candidate_pairs(sigs: &[StructuralSignature]) -> Vec<(usize, usize)> {
+    let mut pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
+
+    // Coarse buckets: signatures that share a coarse key are compared. The key is
+    // deliberately loose (param band, cfg-shape band, size band) so genuinely
+    // similar code lands together without exploding the buckets.
+    let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (idx, s) in sigs.iter().enumerate() {
+        buckets.entry(coarse_key(s)).or_default().push(idx);
+    }
+    for members in buckets.values() {
+        add_all_pairs(members, &mut pairs);
+    }
+
+    // MinHash/LSH: signatures sharing any band-bucket are compared. This catches
+    // structurally similar bodies that landed in different coarse buckets.
+    let minhashes: Vec<Option<[u64; MINHASH_K]>> = sigs.iter().map(minhash).collect();
+    let rows = MINHASH_K / LSH_BANDS;
+    for band in 0..LSH_BANDS {
+        let mut band_buckets: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (idx, mh) in minhashes.iter().enumerate() {
+            let Some(mh) = mh else { continue };
+            let start = band * rows;
+            let key = fnv1a64_words(&mh[start..start + rows]);
+            band_buckets.entry(key).or_default().push(idx);
+        }
+        for members in band_buckets.values() {
+            add_all_pairs(members, &mut pairs);
+        }
+    }
+
+    pairs.into_iter().collect()
+}
+
+/// Add every `i < j` pair among `members` to `pairs`.
+fn add_all_pairs(members: &[usize], pairs: &mut BTreeSet<(usize, usize)>) {
+    for a in 0..members.len() {
+        for b in (a + 1)..members.len() {
+            let (i, j) = (members[a], members[b]);
+            pairs.insert(if i < j { (i, j) } else { (j, i) });
+        }
+    }
+}
+
+/// The coarse bucket key: a loose banding of param arity, control-flow shape, and
+/// size, so similar signatures collide without over-splitting.
+fn coarse_key(s: &StructuralSignature) -> String {
+    let param_band = band(s.arity.params, 2);
+    let branch_band = band(s.cfg.branch_count + s.cfg.match_arms, 3);
+    let loop_band = s.cfg.loop_count.min(3);
+    let size_band = band(s.token_len, 20);
+    format!("{param_band}:{branch_band}:{loop_band}:{size_band}")
+}
+
+/// Band a count into buckets of width `width`.
+fn band(value: u32, width: u32) -> u32 {
+    value / width.max(1)
+}
+
+/// The MinHash signature over a signature's shingle set, or `None` when it has no
+/// shingles. Deterministic: seeded xorshift mixes each shingle per hash function.
+fn minhash(s: &StructuralSignature) -> Option<[u64; MINHASH_K]> {
+    let shingles = s.shingle_set();
+    if shingles.is_empty() {
+        return None;
+    }
+    let mut mh = [u64::MAX; MINHASH_K];
+    for &sh in &shingles {
+        for (k, slot) in mh.iter_mut().enumerate() {
+            let h = mix64(sh ^ SEEDS[k]);
+            if h < *slot {
+                *slot = h;
+            }
+        }
+    }
+    Some(mh)
+}
+
+/// Fixed per-hash seeds for MinHash, derived from a splitmix walk so they are
+/// well-spread and deterministic across runs.
+static SEEDS: [u64; MINHASH_K] = {
+    let mut seeds = [0u64; MINHASH_K];
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut i = 0;
+    while i < MINHASH_K {
+        // splitmix64 step.
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        seeds[i] = z;
+        i += 1;
+    }
+    seeds
+};
+
+/// A 64-bit avalanche mix (splitmix64 finalizer), for MinHash slot hashing.
+fn mix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// FNV-1a over a word slice, for hashing an LSH band into a bucket.
+fn fnv1a64_words(words: &[u64]) -> u64 {
+    let mut hash: u64 = 0xCBF29CE484222325;
+    for &w in words {
+        for b in w.to_le_bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001B3);
+        }
+    }
+    hash
+}
+
+// ---------------------------------------------------------------------------
+// Pairwise scoring.
+// ---------------------------------------------------------------------------
+
+/// A pairwise similarity score with its per-signal breakdown.
+#[derive(Clone, Debug)]
+struct Score {
+    aggregate: f64,
+    shingle_jaccard: f64,
+    cfg: f64,
+    type_shape: f64,
+    call_seq: f64,
+    histogram: f64,
+}
+
+/// The signal weights in the aggregate score. Shingles are the primary signal;
+/// type-shape is weighted highly because "same shape, different types" is the
+/// strongest generic-abstraction cue. They sum to 1.
+const W_SHINGLE: f64 = 0.40;
+const W_TYPE: f64 = 0.20;
+const W_CALL: f64 = 0.15;
+const W_CFG: f64 = 0.15;
+const W_HIST: f64 = 0.10;
+
+/// Score a pair of signatures: a weighted combination of shingle Jaccard,
+/// control-flow-skeleton closeness, type-shape structural match, ordered
+/// call-sequence overlap, and statement-histogram cosine. Every signal is
+/// exposed in the breakdown.
+fn score_pair(a: &StructuralSignature, b: &StructuralSignature) -> Score {
+    let shingle_jaccard = jaccard(&a.shingle_set(), &b.shingle_set());
+    let cfg = cfg_similarity(&a.cfg, &b.cfg);
+    let type_shape = type_shape_similarity(&a.type_shape, &b.type_shape);
+    let call_seq = call_sequence_similarity(&a.call_sequence, &b.call_sequence);
+    let histogram = histogram_cosine(&a.stmt_histogram, &b.stmt_histogram);
+    let aggregate = W_SHINGLE * shingle_jaccard
+        + W_TYPE * type_shape
+        + W_CALL * call_seq
+        + W_CFG * cfg
+        + W_HIST * histogram;
+    Score {
+        aggregate,
+        shingle_jaccard,
+        cfg,
+        type_shape,
+        call_seq,
+        histogram,
+    }
+}
+
+/// Jaccard similarity of two sets: `|A n B| / |A u B|` (1.0 for two empty sets).
+fn jaccard(a: &BTreeSet<u64>, b: &BTreeSet<u64>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// Control-flow-skeleton similarity: `1 - normalized L1 distance` over the six
+/// cfg counts, so identical skeletons score 1 and wildly different ones score
+/// near 0.
+fn cfg_similarity(a: &Cfg, b: &Cfg) -> f64 {
+    let (va, vb) = (a.vector(), b.vector());
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for k in 0..va.len() {
+        num += (va[k] - vb[k]).abs();
+        den += va[k].max(vb[k]);
+    }
+    if den == 0.0 {
+        1.0
+    } else {
+        1.0 - (num / den)
+    }
+}
+
+/// Type-shape structural similarity: the fraction of positionally-matching
+/// parameter shapes plus the result-shape match, averaged. Identifiers are
+/// already erased in a [`TypeShape`], so this is 1.0 exactly when two signatures
+/// have the same shape regardless of concrete types.
+fn type_shape_similarity(a: &TypeShape, b: &TypeShape) -> f64 {
+    let max_params = a.params.len().max(b.params.len());
+    let param_score = if max_params == 0 {
+        1.0
+    } else {
+        let matches = a
+            .params
+            .iter()
+            .zip(b.params.iter())
+            .filter(|(x, y)| x == y)
+            .count();
+        matches as f64 / max_params as f64
+    };
+    let result_score = if a.result == b.result { 1.0 } else { 0.0 };
+    // Weight params and result together; a nullary function is all-result.
+    0.7 * param_score + 0.3 * result_score
+}
+
+/// Ordered call-sequence similarity via the longest common subsequence:
+/// `2*LCS / (|A| + |B|)`. Ordered so a reordered call list scores lower than an
+/// identical one (1.0 for two empty sequences).
+fn call_sequence_similarity(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let lcs = lcs_len(a, b);
+    (2.0 * lcs as f64) / (a.len() + b.len()) as f64
+}
+
+/// Longest-common-subsequence length over two string sequences (classic DP).
+fn lcs_len(a: &[String], b: &[String]) -> usize {
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            cur[j] = if a[i - 1] == b[j - 1] {
+                prev[j - 1] + 1
+            } else {
+                prev[j].max(cur[j - 1])
+            };
+        }
+        std::mem::swap(&mut prev, &mut cur);
+        for v in cur.iter_mut() {
+            *v = 0;
+        }
+    }
+    prev[b.len()]
+}
+
+/// Cosine similarity of two statement histograms over their shared key space.
+fn histogram_cosine(a: &BTreeMap<String, u32>, b: &BTreeMap<String, u32>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for k in keys {
+        let x = *a.get(k).unwrap_or(&0) as f64;
+        let y = *b.get(k).unwrap_or(&0) as f64;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Union-find.
+// ---------------------------------------------------------------------------
+
+/// A disjoint-set forest with path compression + union by size, for clustering
+/// the over-threshold pairs.
+struct UnionFind {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        UnionFind {
+            parent: (0..n).collect(),
+            size: vec![1; n],
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        let (big, small) = if self.size[ra] >= self.size[rb] {
+            (ra, rb)
+        } else {
+            (rb, ra)
+        };
+        self.parent[small] = big;
+        self.size[big] += self.size[small];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster explanation.
+// ---------------------------------------------------------------------------
+
+/// The confidence ceiling for a syntactic-only profile: a syntactic extractor
+/// can never be fully certain two signatures share types or behaviour, so
+/// confidence is capped here regardless of how high the structural similarity
+/// runs. A fully type-resolved profile would lift this.
+const SYNTACTIC_CONFIDENCE_CAP: f64 = 0.85;
+
+/// Turn a cluster of member indices into a [`Finding`]: compute the aggregate
+/// similarity and breakdown, the shared features, the differences, the likely
+/// abstraction, the confidence (capped by profile resolution), and the
+/// counter-evidence. Returns `None` only for a degenerate (<2) cluster.
+fn explain_cluster(
+    member_idx: &[usize],
+    sigs: &[StructuralSignature],
+    pair_score: &BTreeMap<(usize, usize), Score>,
+    profiles: &[LanguageProfile],
+) -> Option<Finding> {
+    if member_idx.len() < 2 {
+        return None;
+    }
+    let members: Vec<&StructuralSignature> = member_idx.iter().map(|&i| &sigs[i]).collect();
+
+    // Aggregate similarity + breakdown: the mean over every member pair that was
+    // scored (a pair inside a transitively-linked cluster may not have a direct
+    // score; those are simply not averaged in).
+    let mut agg = Accum::default();
+    for a in 0..member_idx.len() {
+        for b in (a + 1)..member_idx.len() {
+            let (i, j) = ordered(member_idx[a], member_idx[b]);
+            if let Some(s) = pair_score.get(&(i, j)) {
+                agg.add(s);
+            }
+        }
+    }
+    let (similarity, breakdown) = agg.finish();
+
+    // Feature comparison across the cluster.
+    let cmp = ClusterFeatures::of(&members);
+
+    let shared_features = cmp.shared_features(&members);
+    let differences = cmp.differences(&members);
+    let likely_abstraction = cmp.classify(&members);
+    let summary = cmp.summary(&members, &similarity_breakdown_key(&breakdown));
+
+    // Confidence: start from similarity, cap by profile resolution, and dock for
+    // the honest doubts (small size, macro opacity, superficiality).
+    let types_resolved = profiles.iter().all(|p| p.types_are_resolved());
+    let cap = if types_resolved {
+        1.0
+    } else {
+        SYNTACTIC_CONFIDENCE_CAP
+    };
+    let mut confidence = similarity.min(cap);
+    let mut basis_parts: Vec<String> = vec![format!("structural similarity {similarity:.2}")];
+    if !types_resolved {
+        basis_parts.push(format!("capped at {cap:.2} (syntactic extractor)"));
+    }
+
+    let counter_evidence = cmp.counter_evidence(&members, &breakdown);
+    // Each counter-evidence class docks confidence a little, fail-closed.
+    if cmp.min_token_len < cmp.max_token_len.min(24) {
+        confidence *= 0.9;
+        basis_parts.push("small members".to_string());
+    }
+    if cmp.any_macro {
+        confidence *= 0.9;
+        basis_parts.push("opaque macro bodies".to_string());
+    }
+    if cmp.file_count > 1 {
+        confidence *= 0.95;
+        basis_parts.push(format!("spans {} files", cmp.file_count));
+    }
+    if breakdown.get("call_seq").copied().unwrap_or(0.0) < 0.34
+        && breakdown.get("shingle_jaccard").copied().unwrap_or(0.0) > 0.6
+    {
+        confidence *= 0.9;
+        basis_parts.push("shells match but calls diverge".to_string());
+    }
+    let confidence = (confidence * 100.0).round() / 100.0;
+
+    // Profile capabilities/limitations that bear on this finding.
+    let profile = finding_profile(profiles, &cmp);
+
+    Some(Finding {
+        id: String::new(), // minted after sorting
+        members: members.iter().map(|s| to_member(s)).collect(),
+        pattern: Pattern {
+            summary,
+            shared_features,
+            similarity: round2(similarity),
+            similarity_breakdown: breakdown
+                .iter()
+                .map(|(k, v)| (k.clone(), round2(*v)))
+                .collect(),
+        },
+        differences,
+        likely_abstraction,
+        confidence,
+        confidence_basis: basis_parts.join("; "),
+        counter_evidence,
+        profile,
+    })
+}
+
+/// Order a pair so the smaller index is first (the key convention).
+fn ordered(a: usize, b: usize) -> (usize, usize) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Round to two decimals for stable JSON.
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// A running mean of the per-signal breakdown across a cluster's scored pairs.
+#[derive(Default)]
+struct Accum {
+    n: usize,
+    aggregate: f64,
+    shingle: f64,
+    cfg: f64,
+    type_shape: f64,
+    call_seq: f64,
+    histogram: f64,
+}
+
+impl Accum {
+    fn add(&mut self, s: &Score) {
+        self.n += 1;
+        self.aggregate += s.aggregate;
+        self.shingle += s.shingle_jaccard;
+        self.cfg += s.cfg;
+        self.type_shape += s.type_shape;
+        self.call_seq += s.call_seq;
+        self.histogram += s.histogram;
+    }
+
+    fn finish(&self) -> (f64, BTreeMap<String, f64>) {
+        let n = self.n.max(1) as f64;
+        let mut m = BTreeMap::new();
+        m.insert("shingle_jaccard".to_string(), self.shingle / n);
+        m.insert("cfg".to_string(), self.cfg / n);
+        m.insert("type_shape".to_string(), self.type_shape / n);
+        m.insert("call_seq".to_string(), self.call_seq / n);
+        m.insert("histogram".to_string(), self.histogram / n);
+        (self.aggregate / n, m)
+    }
+}
+
+/// The dominant signal name in a breakdown, for the summary line.
+fn similarity_breakdown_key(breakdown: &BTreeMap<String, f64>) -> String {
+    breakdown
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default()
+}
+
+/// A [`Member`] view of a signature.
+fn to_member(s: &StructuralSignature) -> Member {
+    Member {
+        symbol_id: s.symbol_id.clone(),
+        display: s.display.clone(),
+        language: s.language.clone(),
+        file: s.file.clone(),
+        line_start: s.line_start,
+        line_end: s.line_end,
+    }
+}
+
+/// The cross-member feature comparison a cluster's explanation is built from:
+/// which structural features are identical across every member and which vary.
+struct ClusterFeatures {
+    cfg_identical: bool,
+    types_identical: bool,
+    calls_identical: bool,
+    arity_identical: bool,
+    /// Call sequences all have the same length (same call-shape) even if the
+    /// callees differ — the enum-dispatch / higher-order cue.
+    calls_same_shape: bool,
+    any_macro: bool,
+    file_count: usize,
+    min_token_len: u32,
+    max_token_len: u32,
+    /// One representative cfg (they may not be identical; used for the summary).
+    rep_cfg: Cfg,
+}
+
+impl ClusterFeatures {
+    fn of(members: &[&StructuralSignature]) -> Self {
+        let first = members[0];
+        let cfg_identical = members.iter().all(|m| m.cfg == first.cfg);
+        let types_identical = members.iter().all(|m| m.type_shape == first.type_shape);
+        let calls_identical = members
+            .iter()
+            .all(|m| m.call_sequence == first.call_sequence);
+        let arity_identical = members.iter().all(|m| m.arity == first.arity);
+        let calls_same_shape = members
+            .iter()
+            .all(|m| m.call_sequence.len() == first.call_sequence.len());
+        let any_macro = members.iter().any(|m| m.feature_true("has_macro"));
+        let files: BTreeSet<&str> = members.iter().map(|m| m.file.as_str()).collect();
+        let min_token_len = members.iter().map(|m| m.token_len).min().unwrap_or(0);
+        let max_token_len = members.iter().map(|m| m.token_len).max().unwrap_or(0);
+        ClusterFeatures {
+            cfg_identical,
+            types_identical,
+            calls_identical,
+            arity_identical,
+            calls_same_shape,
+            any_macro,
+            file_count: files.len(),
+            min_token_len,
+            max_token_len,
+            rep_cfg: first.cfg.clone(),
+        }
+    }
+
+    /// The concrete features that are ~identical across every member.
+    fn shared_features(&self, members: &[&StructuralSignature]) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.cfg_identical {
+            out.push(format!(
+                "identical control-flow skeleton ({} branch(es), {} match arm(s), {} loop(s), {} ?/try, {} return(s), max nesting {})",
+                self.rep_cfg.branch_count,
+                self.rep_cfg.match_arms,
+                self.rep_cfg.loop_count,
+                self.rep_cfg.try_count,
+                self.rep_cfg.return_points,
+                self.rep_cfg.max_nesting,
+            ));
+        }
+        if self.types_identical {
+            let ts = &members[0].type_shape;
+            out.push(format!(
+                "same type shape ({}) -> {}",
+                ts.params.join(", "),
+                ts.result
+            ));
+        }
+        if self.calls_identical && !members[0].call_sequence.is_empty() {
+            out.push(format!(
+                "same call sequence [{}]",
+                members[0].call_sequence.join(", ")
+            ));
+        }
+        if self.arity_identical {
+            let a = &members[0].arity;
+            out.push(format!(
+                "same arity (params={}, results={}, generics={})",
+                a.params, a.results, a.generics
+            ));
+        }
+        if out.is_empty() {
+            out.push("closely matching AST-node-kind fingerprint".to_string());
+        }
+        out
+    }
+
+    /// What varies across members — the axes an abstraction must range over.
+    fn differences(&self, members: &[&StructuralSignature]) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.types_identical {
+            let shapes = distinct_type_shapes(members);
+            out.push(format!(
+                "type shapes vary across members: {}",
+                shapes.join("  |  ")
+            ));
+        }
+        if !self.calls_identical {
+            if self.calls_same_shape {
+                out.push(format!(
+                    "same call shape but differing callees in matching positions: {}",
+                    positional_call_diff(members)
+                ));
+            } else {
+                out.push(format!(
+                    "call sequences vary in length/content: {}",
+                    distinct_call_seqs(members).join("  |  ")
+                ));
+            }
+        }
+        if !self.arity_identical {
+            let arities: BTreeSet<String> = members
+                .iter()
+                .map(|m| {
+                    format!(
+                        "p{}/r{}/g{}",
+                        m.arity.params, m.arity.results, m.arity.generics
+                    )
+                })
+                .collect();
+            out.push(format!(
+                "arity varies: {}",
+                arities.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if self.min_token_len != self.max_token_len {
+            out.push(format!(
+                "normalized size ranges {}..{} tokens",
+                self.min_token_len, self.max_token_len
+            ));
+        }
+        if out.is_empty() {
+            out.push(
+                "no structural axis varies materially — the members look near-duplicated"
+                    .to_string(),
+            );
+        }
+        out
+    }
+
+    /// The likely abstraction family for the cluster, with rationale and the
+    /// language mechanisms that could express it. Rust-flavoured mechanisms; the
+    /// family names all come from the shipped profile's `abstraction_families`.
+    fn classify(&self, members: &[&StructuralSignature]) -> LikelyAbstraction {
+        let n = members.len();
+        // Near-duplicate: same calls, same types, same skeleton.
+        if self.calls_identical && self.types_identical && self.cfg_identical {
+            let mut mechanisms = vec!["extract a shared helper function".to_string()];
+            if n >= 3 {
+                mechanisms.push(
+                    "a `macro_rules!` if the repetition is item-level boilerplate".to_string(),
+                );
+            }
+            return LikelyAbstraction {
+                family: "helper_function".to_string(),
+                rationale: format!(
+                    "{n} bodies with the same control flow, the same signature shape, and the same \
+                     call sequence — they look near-duplicated, so a single shared function would \
+                     cover them."
+                ),
+                language_mechanisms: mechanisms,
+            };
+        }
+        // Only the types vary (calls + skeleton constant): a generic.
+        if self.calls_identical && self.cfg_identical && !self.types_identical {
+            return LikelyAbstraction {
+                family: "generic_function".to_string(),
+                rationale: format!(
+                    "{n} bodies with the same control flow and the same call sequence, differing \
+                     only in the types in their signatures — the classic shape of one generic \
+                     function (or a trait) parameterized over the varying type."
+                ),
+                language_mechanisms: vec![
+                    "a generic function `fn f<T>(...)`".to_string(),
+                    "a trait with the operation as a method".to_string(),
+                ],
+            };
+        }
+        // Same shape, callees vary in matching slots: dispatch over a set of cases.
+        if self.cfg_identical
+            && self.arity_identical
+            && self.calls_same_shape
+            && !self.calls_identical
+        {
+            return LikelyAbstraction {
+                family: "enum_dispatch".to_string(),
+                rationale: format!(
+                    "{n} bodies with the same skeleton and the same call *shape*, but different \
+                     callees in matching positions — each looks like one case of a dispatch, so a \
+                     trait method per case or an enum matched over its variants would unify them."
+                ),
+                language_mechanisms: vec![
+                    "a trait method with one impl per case".to_string(),
+                    "an enum plus a `match` that dispatches".to_string(),
+                    "a higher-order function taking the varying operation as a parameter"
+                        .to_string(),
+                ],
+            };
+        }
+        // Three-plus with a constant skeleton but varying detail: macro-shaped.
+        if n >= 3 && self.cfg_identical {
+            return LikelyAbstraction {
+                family: "macro_rules".to_string(),
+                rationale: format!(
+                    "{n} bodies sharing one control-flow skeleton with the varying parts confined \
+                     to a few slots — a declarative `macro_rules!` that stamps out the skeleton is \
+                     often the lowest-friction way to remove the repetition."
+                ),
+                language_mechanisms: vec![
+                    "a `macro_rules!` generating the repeated item".to_string(),
+                    "a generic function if the variation is only in types".to_string(),
+                ],
+            };
+        }
+        // Fallback: a helper, but weaker.
+        LikelyAbstraction {
+            family: "helper_function".to_string(),
+            rationale: format!(
+                "{n} structurally similar bodies; the shared part could likely be pulled into a \
+                 helper, though the variation is not confined to a single clean axis."
+            ),
+            language_mechanisms: vec!["a shared helper function for the common part".to_string()],
+        }
+    }
+
+    /// The one-line summary of the cluster.
+    fn summary(&self, members: &[&StructuralSignature], dominant_signal: &str) -> String {
+        let n = members.len();
+        let kind = plural_kind(members);
+        let shell = if self.cfg_identical && self.rep_cfg.match_arms > 0 {
+            format!(
+                "the same {}-arm match/error-handling shell",
+                self.rep_cfg.match_arms
+            )
+        } else if self.cfg_identical && self.rep_cfg.loop_count > 0 {
+            "the same loop-shaped shell".to_string()
+        } else if self.types_identical {
+            "the same signature shape and structure".to_string()
+        } else {
+            "a closely matching structure".to_string()
+        };
+        format!(
+            "{n} {kind} with {shell} (dominant signal: {})",
+            humanize_signal(dominant_signal)
+        )
+    }
+
+    /// The honest reasons *not* to consolidate.
+    fn counter_evidence(
+        &self,
+        members: &[&StructuralSignature],
+        breakdown: &BTreeMap<String, f64>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.min_token_len < 16 {
+            out.push(format!(
+                "the smallest member is only {} normalized tokens — it may be too small to justify \
+                 a shared abstraction",
+                self.min_token_len
+            ));
+        }
+        if self.file_count > 1 {
+            let files: BTreeSet<&str> = members.iter().map(|m| m.file.as_str()).collect();
+            out.push(format!(
+                "members span {} files ({}) — consolidating would introduce a cross-module \
+                 dependency that may not be worth the coupling",
+                self.file_count,
+                files.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !self.types_identical {
+            out.push(
+                "the signature types differ, so only a generic/trait abstraction would fit — a \
+                 plain shared function would not"
+                    .to_string(),
+            );
+        }
+        if self.any_macro {
+            out.push(
+                "one or more bodies contain macro invocations the syntactic extractor cannot see \
+                 into — hidden logic may differ between members"
+                    .to_string(),
+            );
+        }
+        let call_seq = breakdown.get("call_seq").copied().unwrap_or(0.0);
+        let shingle = breakdown.get("shingle_jaccard").copied().unwrap_or(0.0);
+        if call_seq < 0.34 && shingle > 0.6 {
+            out.push(
+                "the structural shells match but the calls the bodies make differ substantially — \
+                 the similarity may be superficial (same shape, unrelated work)"
+                    .to_string(),
+            );
+        }
+        // The always-true syntactic caveat, stated as counter-evidence too.
+        out.push(
+            "syntactic match only: sameness of structure does not imply sameness of behaviour, and \
+             two identically-shaped type slots may be different types"
+                .to_string(),
+        );
+        out
+    }
+}
+
+/// Assemble the per-finding profile block: the capabilities that shaped the
+/// finding and the limitations that bear on it, drawn from the shipped profiles.
+fn finding_profile(profiles: &[LanguageProfile], cmp: &ClusterFeatures) -> FindingProfile {
+    let mut capabilities_used: Vec<String> = Vec::new();
+    let mut limitations: Vec<String> = Vec::new();
+    let keys = [
+        "types_resolved",
+        "control_flow_available",
+        "generics_visible",
+        "call_targets_known",
+        "macro_expansion_visible",
+    ];
+    for p in profiles {
+        for k in keys {
+            let v = p.capability(k);
+            if v != "unknown" {
+                capabilities_used.push(format!("{k}={v}"));
+            }
+        }
+        // Always cite the type-comparison caveat when types matter to the finding.
+        for lim in &p.limitations {
+            let touches_types = lim.contains("type") && !cmp.types_identical;
+            let touches_macro = lim.contains("Macro") && cmp.any_macro;
+            let touches_calls = lim.contains("Call") && !cmp.calls_identical;
+            // The syntactic-only umbrella limitation (first) always applies.
+            let is_umbrella = lim.starts_with("Syntactic only");
+            if is_umbrella || touches_types || touches_macro || touches_calls {
+                limitations.push(lim.clone());
+            }
+        }
+    }
+    capabilities_used.sort();
+    capabilities_used.dedup();
+    limitations.dedup();
+    FindingProfile {
+        capabilities_used,
+        limitations,
+    }
+}
+
+/// The pluralized def kind for a summary, e.g. `"functions"` / `"methods"`.
+fn plural_kind(members: &[&StructuralSignature]) -> String {
+    let kinds: BTreeSet<&str> = members.iter().map(|m| m.kind.as_str()).collect();
+    let base = if kinds.len() == 1 {
+        match *kinds.iter().next().unwrap() {
+            "impl_method" | "trait_method" | "method" => "method",
+            "closure" => "closure",
+            _ => "function",
+        }
+    } else {
+        "callable"
+    };
+    format!("{base}s")
+}
+
+/// A reader-friendly name for a breakdown signal.
+fn humanize_signal(signal: &str) -> &str {
+    match signal {
+        "shingle_jaccard" => "AST-fingerprint overlap",
+        "cfg" => "control-flow skeleton",
+        "type_shape" => "signature shape",
+        "call_seq" => "call sequence",
+        "histogram" => "statement mix",
+        other => other,
+    }
+}
+
+/// The distinct erased type shapes across a cluster, as `"(p1, p2) -> r"` lines.
+fn distinct_type_shapes(members: &[&StructuralSignature]) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for m in members {
+        set.insert(format!(
+            "({}) -> {}",
+            m.type_shape.params.join(", "),
+            m.type_shape.result
+        ));
+    }
+    set.into_iter().collect()
+}
+
+/// The distinct call sequences across a cluster, as `"[a, b, c]"` lines.
+fn distinct_call_seqs(members: &[&StructuralSignature]) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for m in members {
+        set.insert(format!("[{}]", m.call_sequence.join(", ")));
+    }
+    set.into_iter().collect()
+}
+
+/// For a same-shape call divergence, describe which positions vary, e.g.
+/// `pos 1: {validate|check}`.
+fn positional_call_diff(members: &[&StructuralSignature]) -> String {
+    let len = members[0].call_sequence.len();
+    let mut parts: Vec<String> = Vec::new();
+    for pos in 0..len {
+        let variants: BTreeSet<&str> = members
+            .iter()
+            .filter_map(|m| m.call_sequence.get(pos).map(String::as_str))
+            .collect();
+        if variants.len() > 1 {
+            parts.push(format!(
+                "pos {}: {{{}}}",
+                pos,
+                variants.into_iter().collect::<Vec<_>>().join("|")
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "(callees differ)".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests;
