@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod adapter_harness;
+mod api_rust;
 mod go_adapter;
 mod portdiff_config;
 mod portdiff_html;
@@ -50,6 +51,15 @@ enum Cmd {
     /// per-package paths, `--package` picks one. Writes a JSON report and, with
     /// `--html`, a self-contained dashboard.
     PortDiff(PortDiffArgs),
+    /// Emit stable JSON describing a package's PUBLIC interface: exported
+    /// functions/methods with real signatures (params + types, return type,
+    /// async-ness, a knowable error type), exported types/enums/traits/aliases/
+    /// consts with their shapes, visibility, module path, and doc comments,
+    /// grouped by module. Two consumers: porting (the source package's public
+    /// API as the contract a port must match) and binding/agent tooling
+    /// (deciding what a generated binding should expose). Rust is extracted via
+    /// `rustdoc --output-format=json`; TypeScript and Python are later phases.
+    Api(ApiArgs),
 }
 
 #[derive(Parser)]
@@ -199,6 +209,19 @@ struct PortDiffArgs {
     html: Option<PathBuf>,
 }
 
+#[derive(Parser)]
+struct ApiArgs {
+    /// The project to analyze.
+    path: PathBuf,
+    /// Where to write the API JSON. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Override the language auto-detected from the project markers
+    /// (`rust`/`typescript`/`python`/`go`). Phase 1 implements Rust.
+    #[arg(long)]
+    lang: Option<String>,
+}
+
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
 /// sets; `dbsp` is the incremental-capable engine, `naive` the reference BFS.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -245,6 +268,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::PortDiff(args) => match port_diff_cmd(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::Api(args) => match api(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -302,6 +329,53 @@ fn graph(args: GraphArgs) -> Result<ExitCode> {
     let graph = scope_to_closure(graph, &args.from)?;
     let json = serde_json::to_string_pretty(&graph).context("serializing the graph to JSON")?;
     write_json(args.out.as_deref(), &json, "graph")
+}
+
+/// The `hinzu api` flow. Auto-detects the language from the project markers (or
+/// takes `--lang`), dispatches to the per-language extractor, and writes the
+/// public-API JSON to `--out` or stdout. All the file/process effects live in
+/// the extractor (the CLI side); core only normalizes the parsed result. Phase 1
+/// implements Rust via `rustdoc --output-format=json`; the other languages fail
+/// with an honest "not yet implemented" rather than faking a surface.
+fn api(args: ApiArgs) -> Result<ExitCode> {
+    let language = detect_api_language(&args.path, args.lang.as_deref())?;
+    let report = match language.as_str() {
+        "rust" => api_rust::extract(&args.path, &args.path.display().to_string())?,
+        "typescript" | "python" | "go" => {
+            anyhow::bail!("{language} api extraction is not yet implemented (phase 1 is Rust only)")
+        }
+        other => {
+            anyhow::bail!("unknown --lang '{other}'; expected rust, typescript, python, or go")
+        }
+    };
+    let json =
+        serde_json::to_string_pretty(&report).context("serializing the API report to JSON")?;
+    write_json(args.out.as_deref(), &json, "api report")
+}
+
+/// Resolve the language for `hinzu api`: an explicit `--lang` (lowercased), else
+/// the project's marker file — Cargo.toml → rust, tsconfig/package.json →
+/// typescript, pyproject/setup → python, go.mod → go (Rust wins a tie, matching
+/// `route_facts`). Errors when nothing matches so the operator gets a clear
+/// message instead of a silent empty report.
+fn detect_api_language(path: &Path, lang: Option<&str>) -> Result<String> {
+    if let Some(l) = lang {
+        return Ok(l.to_lowercase());
+    }
+    if rust_adapter::is_cargo_project(path) {
+        Ok("rust".to_string())
+    } else if ts_adapter::is_ts_project(path) {
+        Ok("typescript".to_string())
+    } else if py_adapter::is_python_project(path) {
+        Ok("python".to_string())
+    } else if go_adapter::is_go_project(path) {
+        Ok("go".to_string())
+    } else {
+        anyhow::bail!(
+            "{} is not a cargo, TypeScript, Python, or Go project — pass --lang to force one",
+            path.display()
+        )
+    }
 }
 
 /// The `hinzu plan` flow. Builds (or loads) the porting dependency graph,
