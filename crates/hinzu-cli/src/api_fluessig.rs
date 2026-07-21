@@ -49,12 +49,13 @@ pub fn run(
 pub fn summary(stats: &Stats) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "hinzu api-fluessig: {} source items → {} models, {} enums, {} interfaces, {} unions\n",
+        "hinzu api-fluessig: {} source items → {} models, {} enums, {} interfaces, {} unions ({} lifted from aliases)\n",
         stats.items_in,
         stats.models_emitted,
         stats.enums_emitted,
         stats.interfaces_emitted,
         stats.unions_synthesized,
+        stats.unions_lifted,
     ));
     s.push_str(&format!(
         "  ops: {} total, {} cleanly typed, {} degraded (a param/return fell back to Json)\n",

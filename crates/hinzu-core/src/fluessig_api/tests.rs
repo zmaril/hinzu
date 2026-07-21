@@ -14,6 +14,31 @@ fn scalar(s: &str) -> FlType {
     FlType::Scalar(s.to_string())
 }
 
+/// A single-module `@x/demo` report over `items` — the shared scaffold for the
+/// end-to-end `build_fluessig` tests.
+fn demo_report(items: Vec<ApiItem>) -> crate::api::ApiReport {
+    build_api(
+        PackageInfo {
+            name: "@x/demo".to_string(),
+            language: "typescript".to_string(),
+            root: ".".to_string(),
+            version: None,
+        },
+        Fidelity {
+            source: "tsc".to_string(),
+            format_version: None,
+            complete: false,
+            notes: vec![],
+        },
+        vec![Module {
+            path: "m".to_string(),
+            file: None,
+            doc: None,
+            items,
+        }],
+    )
+}
+
 #[test]
 fn scalars_and_ambiguities() {
     let mut c = conv();
@@ -327,26 +352,7 @@ fn build_fluessig_end_to_end() {
     };
     let dropped_const = ApiItem::new("const", "m#VERSION", "VERSION", "m");
 
-    let report = build_api(
-        PackageInfo {
-            name: "@x/demo".to_string(),
-            language: "typescript".to_string(),
-            root: ".".to_string(),
-            version: None,
-        },
-        Fidelity {
-            source: "tsc".to_string(),
-            format_version: None,
-            complete: false,
-            notes: vec![],
-        },
-        vec![Module {
-            path: "m".to_string(),
-            file: None,
-            doc: None,
-            items: vec![iface, alias, func, class, method, dropped_const],
-        }],
-    );
+    let report = demo_report(vec![iface, alias, func, class, method, dropped_const]);
 
     let out = build_fluessig(&report);
 
@@ -397,6 +403,263 @@ fn build_fluessig_end_to_end() {
     assert!(json.contains("\"enum\":\"InstanceStatus\""));
     assert!(json.contains("\"model\":\"Summary\""));
     assert!(json.contains("\"async\":true"));
+}
+
+#[test]
+fn union_of_named_types_alias_lifts_to_named_union() {
+    // A top-level `type U = A | B` alias lifts into a union named for the alias
+    // (not the `AOrBUnion` synthesized name), with each member resolving.
+    let mut c = conv();
+    c.known_models.insert("RpcCommand".to_string());
+    c.known_models.insert("RpcExtensionUIResponse".to_string());
+    let members =
+        expand_alias_union_members(Some("RpcCommand | RpcExtensionUIResponse"), &c.indexable)
+            .expect("a union of named types is liftable");
+    assert_eq!(members, vec!["RpcCommand", "RpcExtensionUIResponse"]);
+    assert!(c.lift_alias_union("RpcClientMessage", &members));
+    let u = &c.unions["RpcClientMessage"];
+    assert_eq!(u.name, "RpcClientMessage");
+    assert_eq!(u.variants.len(), 2);
+    assert_eq!(u.variants[0].tag, "rpcCommand");
+    assert_eq!(
+        u.variants[0].ty,
+        FlType::Model {
+            model: "RpcCommand".to_string()
+        }
+    );
+    // Lifting the same name twice is a no-op (dedupe).
+    assert!(!c.lift_alias_union("RpcClientMessage", &members));
+}
+
+#[test]
+fn indexed_access_alias_expands_to_value_type_union() {
+    // `X[keyof X]` resolves to a union over the value types of X's members.
+    let mut indexable = BTreeMap::new();
+    indexable.insert(
+        "RequestMap".to_string(),
+        vec!["SpawnRequest".to_string(), "ListRequest".to_string()],
+    );
+    let members = expand_alias_union_members(Some("RequestMap[keyof RequestMap]"), &indexable)
+        .expect("an indexed access over a known model is liftable");
+    assert_eq!(members, vec!["SpawnRequest", "ListRequest"]);
+
+    let mut c = conv();
+    c.known_models.insert("SpawnRequest".to_string());
+    c.known_models.insert("ListRequest".to_string());
+    c.lift_alias_union("OrchestratorRequest", &members);
+    let u = &c.unions["OrchestratorRequest"];
+    assert_eq!(u.variants.len(), 2);
+    assert_eq!(u.variants[0].tag, "spawnRequest");
+    assert_eq!(
+        u.variants[1].ty,
+        FlType::Model {
+            model: "ListRequest".to_string()
+        }
+    );
+
+    // An indexed access whose base is not a known interface/record degrades
+    // gracefully: not liftable, so the alias stays dropped.
+    assert!(expand_alias_union_members(Some("Unknown[keyof Unknown]"), &BTreeMap::new()).is_none());
+    // `X[K]` with a specific (non-`keyof X`) key is not this shape.
+    assert!(indexed_access_base("RequestMap[\"spawn\"]").is_none());
+    assert_eq!(
+        indexed_access_base("RequestMap[keyof RequestMap]"),
+        Some("RequestMap")
+    );
+}
+
+#[test]
+fn indexed_access_plus_extra_member_shape() {
+    // The `X[keyof X] | Y` shape: the expansion plus the extra union member.
+    let mut indexable = BTreeMap::new();
+    indexable.insert(
+        "ResponseMap".to_string(),
+        vec!["SpawnResponse".to_string(), "ListResponse".to_string()],
+    );
+    let members = expand_alias_union_members(
+        Some("ResponseMap[keyof ResponseMap] | ErrorResponse"),
+        &indexable,
+    )
+    .expect("indexed-access + extra member is liftable");
+    assert_eq!(
+        members,
+        vec!["SpawnResponse", "ListResponse", "ErrorResponse"]
+    );
+}
+
+#[test]
+fn ref_to_lifted_alias_resolves_to_union() {
+    // A field/param/return referencing a lifted alias by name resolves to the
+    // union rather than degrading to `Json`.
+    let mut c = conv();
+    c.known_unions.insert("OrchestratorRequest".to_string());
+    let p = c.parse_type("OrchestratorRequest");
+    assert!(!p.degraded);
+    assert_eq!(
+        p.ty,
+        FlType::Union {
+            union: "OrchestratorRequest".to_string()
+        }
+    );
+    // …and through a list wrapper.
+    assert_eq!(
+        c.parse_type("OrchestratorRequest[]").ty,
+        FlType::List {
+            list: Box::new(FlType::Union {
+                union: "OrchestratorRequest".to_string()
+            })
+        }
+    );
+}
+
+#[test]
+fn conditional_or_bare_alias_is_not_lifted() {
+    let indexable = BTreeMap::new();
+    // A conditional/generic (`ResponseFor`) target is irreducible → stays dropped.
+    assert!(expand_alias_union_members(
+        Some("T extends { type: infer K } ? ResponseMap[K] | ErrorResponse : ErrorResponse"),
+        &indexable,
+    )
+    .is_none());
+    // A bare single alias (`type A = B`) is a different gap → not lifted.
+    assert!(expand_alias_union_members(Some("SomeOtherType"), &indexable).is_none());
+    // A string-literal union is left for the catalog-enum path, not stolen here.
+    assert!(expand_alias_union_members(Some("\"a\" | \"b\""), &indexable).is_none());
+}
+
+#[test]
+fn alias_with_unresolved_sibling_member_lifts_with_json() {
+    // A mixed union whose in-package members resolve and whose sibling-package
+    // members degrade to `Json` (counted) still lifts — the alias is no longer
+    // dropped, and each member keeps a readable tag.
+    let mut c = conv();
+    c.known_models.insert("RpcReadyResponse".to_string());
+    c.known_models.insert("ErrorResponse".to_string());
+    let members = vec![
+        "RpcReadyResponse".to_string(),  // in-package
+        "RpcResponse".to_string(),       // sibling-package → Json
+        "AgentSessionEvent".to_string(), // sibling-package → Json
+        "ErrorResponse".to_string(),     // in-package
+    ];
+    c.lift_alias_union("RpcServerMessage", &members);
+    let u = &c.unions["RpcServerMessage"];
+    assert_eq!(u.variants.len(), 4);
+    assert_eq!(
+        u.variants[0].ty,
+        FlType::Model {
+            model: "RpcReadyResponse".to_string()
+        }
+    );
+    assert_eq!(u.variants[1].tag, "rpcResponse");
+    assert_eq!(u.variants[1].ty, FlType::json());
+    assert_eq!(u.variants[2].ty, FlType::json());
+    assert_eq!(
+        u.variants[3].ty,
+        FlType::Model {
+            model: "ErrorResponse".to_string()
+        }
+    );
+    // Both sibling members counted as honest degradations.
+    assert_eq!(c.reasons.get("unresolved type reference"), Some(&2));
+}
+
+/// End-to-end: an `X[keyof X]` alias lifts to a named union, a ref to it
+/// resolves, and an irreducible conditional alias is still dropped.
+#[test]
+fn build_fluessig_lifts_indexed_access_alias_end_to_end() {
+    let model = |name: &str| ApiItem::new("interface", &format!("m#{name}"), name, "m");
+    let field = |n: &str, t: &str| Field {
+        name: n.to_string(),
+        ty: t.to_string(),
+        visibility: "public".to_string(),
+        doc: None,
+        optional: false,
+    };
+    let request_map = {
+        let mut it = model("RequestMap");
+        it.fields = vec![field("spawn", "SpawnRequest"), field("list", "ListRequest")];
+        it
+    };
+    let alias = {
+        let mut it = ApiItem::new(
+            "typeAlias",
+            "m#OrchestratorRequest",
+            "OrchestratorRequest",
+            "m",
+        );
+        it.alias_target = Some("RequestMap[keyof RequestMap]".to_string());
+        it
+    };
+    let conditional = {
+        let mut it = ApiItem::new("typeAlias", "m#ResponseFor", "ResponseFor", "m");
+        it.alias_target =
+            Some("T extends { type: infer K } ? ResponseMap[K] : ErrorResponse".to_string());
+        it
+    };
+    let func = {
+        let mut it = ApiItem::new("function", "m#parseRequestLine", "parseRequestLine", "m");
+        it.signature = Some(Signature {
+            params: vec![],
+            return_type: Some("OrchestratorRequest".to_string()),
+            is_async: false,
+            receiver: None,
+            error_type: None,
+            generics: vec![],
+        });
+        it
+    };
+
+    let report = demo_report(vec![
+        request_map,
+        model("SpawnRequest"),
+        model("ListRequest"),
+        alias,
+        conditional,
+        func,
+    ]);
+
+    let out = build_fluessig(&report);
+
+    // The indexed-access alias lifted into a named union over the value types.
+    let u = out
+        .api
+        .unions
+        .iter()
+        .find(|u| u.name == "OrchestratorRequest")
+        .expect("OrchestratorRequest lifted to a union");
+    assert_eq!(u.variants.len(), 2);
+    assert_eq!(
+        u.variants[0].ty,
+        FlType::Model {
+            model: "SpawnRequest".to_string()
+        }
+    );
+    assert_eq!(out.stats.unions_lifted, 1);
+
+    // The op's return type resolves to the lifted union (not Json).
+    let op = out
+        .api
+        .interfaces
+        .iter()
+        .flat_map(|i| &i.ops)
+        .find(|o| o.name == "parseRequestLine")
+        .unwrap();
+    assert_eq!(
+        op.returns,
+        FlType::Union {
+            union: "OrchestratorRequest".to_string()
+        }
+    );
+    assert_eq!(out.stats.ops_clean, 1);
+    assert_eq!(out.stats.ops_degraded, 0);
+
+    // The conditional/generic alias stays dropped (it is irreducible here).
+    assert_eq!(
+        out.stats
+            .dropped
+            .get("typeAlias (non-string-union) dropped"),
+        Some(&1)
+    );
 }
 
 #[test]
