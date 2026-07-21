@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod adapter_harness;
+mod api_diff;
 mod api_py;
 mod api_rust;
 mod api_ts;
@@ -94,7 +95,7 @@ enum Cmd {
     /// so convention renames (`streamText` ↔ `stream_text`) don't false-miss.
     /// Complements `hinzu port-diff` (which bands file/graph progress): this
     /// grades public-surface conformance. See `notes/api-diff.md`.
-    ApiDiff(ApiDiffArgs),
+    ApiDiff(api_diff::ApiDiffArgs),
 }
 
 #[derive(Parser)]
@@ -283,32 +284,6 @@ struct ApiArgs {
     lang: Option<String>,
 }
 
-#[derive(Parser)]
-struct ApiDiffArgs {
-    /// The SOURCE package's `hinzu api` report JSON — the public-surface contract
-    /// the target must match. Produce it with `hinzu api <src-pkg> --out src.json`.
-    #[arg(long)]
-    source: PathBuf,
-    /// The TARGET package's `hinzu api` report JSON — the port whose surface is
-    /// graded. Produce it with `hinzu api <tgt-pkg> --out tgt.json`.
-    #[arg(long)]
-    target: PathBuf,
-    /// A port-diff config TOML (`--config`) + `--package <name>`: pull the same
-    /// naming rules (camel↔snake fns, kebab↔snake files, PascalCase/SCREAMING
-    /// kept) and package→crate module mapping port-diff uses, so cross-language
-    /// comparisons don't false-miss on convention renames. Optional — without it
-    /// the built-in TS→Rust naming ruleset is used.
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Which package in `--config` to pull the naming rules + crate mapping from.
-    /// Required when `--config` is given.
-    #[arg(long)]
-    package: Option<String>,
-    /// Where to write the conformance report JSON. Defaults to stdout.
-    #[arg(long)]
-    out: Option<PathBuf>,
-}
-
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
 /// sets; `dbsp` is the incremental-capable engine, `naive` the reference BFS.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -370,7 +345,7 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
-        Cmd::ApiDiff(args) => match api_diff(args) {
+        Cmd::ApiDiff(args) => match api_diff::run(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -453,56 +428,6 @@ fn api(args: ApiArgs) -> Result<ExitCode> {
     let json =
         serde_json::to_string_pretty(&report).context("serializing the API report to JSON")?;
     write_json(args.out.as_deref(), &json, "api report")
-}
-
-/// The `hinzu api-diff` flow. Reads the two `hinzu api` reports off disk, builds
-/// the [`NamingRules`](hinzu_core::portdiff::NamingRules) (from `--config` +
-/// `--package`, else the built-in TS→Rust ruleset), calls the pure
-/// [`hinzu_core::apidiff::build_api_diff`], and writes the conformance JSON to
-/// `--out` or stdout. All the file I/O is here in the CLI; core only grades the
-/// two in-memory reports.
-fn api_diff(args: ApiDiffArgs) -> Result<ExitCode> {
-    let source = load_api_report(&args.source)?;
-    let target = load_api_report(&args.target)?;
-    let rules = api_diff_rules(args.config.as_deref(), args.package.as_deref())?;
-    let report = hinzu_core::apidiff::build_api_diff(&source, &target, &rules);
-    let json =
-        serde_json::to_string_pretty(&report).context("serializing the api-diff report to JSON")?;
-    write_json(args.out.as_deref(), &json, "api-diff report")
-}
-
-/// Read + parse a [`hinzu_core::api::ApiReport`] JSON produced by `hinzu api`.
-fn load_api_report(path: &Path) -> Result<hinzu_core::api::ApiReport> {
-    let json = std::fs::read_to_string(path)
-        .with_context(|| format!("reading api report from {}", path.display()))?;
-    serde_json::from_str(&json)
-        .with_context(|| format!("parsing api report from {}", path.display()))
-}
-
-/// Build the naming ruleset for `hinzu api-diff`: from the port-diff config's
-/// selected package (so it reuses the exact naming rules + crate mapping
-/// port-diff uses), or — when no `--config` is given — the built-in TS→Rust
-/// prototype ruleset. `--config` without `--package` is an error, since the rules
-/// (and the crate prefix) are per package.
-fn api_diff_rules(
-    config: Option<&Path>,
-    package: Option<&str>,
-) -> Result<hinzu_core::portdiff::NamingRules> {
-    match config {
-        Some(cfg_path) => {
-            let package = package.ok_or_else(|| {
-                anyhow::anyhow!("--config needs --package <name> to select the naming rules")
-            })?;
-            let cfg = portdiff_config::MultiPackageConfig::load(cfg_path)?;
-            Ok(cfg.resolve(package)?.config.naming)
-        }
-        None => {
-            if package.is_some() {
-                anyhow::bail!("--package needs --config <toml> to read the package's naming rules");
-            }
-            Ok(hinzu_core::portdiff::PortDiffConfig::default_ts_rust().naming)
-        }
-    }
 }
 
 /// Resolve the language for `hinzu api`: an explicit `--lang` (lowercased), else
