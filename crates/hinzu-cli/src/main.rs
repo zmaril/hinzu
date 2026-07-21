@@ -283,8 +283,15 @@ struct ApiArgs {
 
 #[derive(Parser)]
 struct ApiFluessigArgs {
-    /// The hinzu API report JSON (from `hinzu api --out`).
+    /// The PRIMARY hinzu API report JSON (from `hinzu api --out`) — the surface
+    /// whose ops/models are emitted.
     report: PathBuf,
+    /// A sibling-package report to resolve cross-package type imports against
+    /// (repeatable). Their referenced types are pulled into the output as real
+    /// models/unions/enums; their op surface is not emitted. Omit for a
+    /// single-report pass.
+    #[arg(long = "context")]
+    context: Vec<PathBuf>,
     /// Where to write the fluessig `api.json` (op layer + DTO models + unions).
     #[arg(long)]
     out_api: PathBuf,
@@ -371,6 +378,7 @@ fn main() -> ExitCode {
 fn api_fluessig_cmd(args: ApiFluessigArgs) -> Result<ExitCode> {
     let stats = api_fluessig::run(
         &args.report,
+        &args.context,
         &args.out_api,
         &args.out_catalog,
         args.out_stats.as_deref(),
