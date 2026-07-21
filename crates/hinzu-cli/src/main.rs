@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod adapter_harness;
+mod api_diff;
 mod api_py;
 mod api_rust;
 mod api_ts;
@@ -71,6 +72,17 @@ enum Cmd {
     /// takes a pre-extracted body-fact JSON instead (no toolchain needed). Exits
     /// non-zero when a hazard is found, so it is usable as a CI gate.
     Ranges(RangesArgs),
+    /// Grade a TARGET package's public surface against a SOURCE package's,
+    /// item by item — typically a port against the contract it must match. Takes
+    /// two `hinzu api` reports (`--source` / `--target`) and emits a stable JSON
+    /// conformance grade: each source item is matched (name + kind + shape),
+    /// signatureMismatch (matched but the shape differs), or missing; target-only
+    /// items are surfaced as extra. Advisory and evidence-carrying — names are
+    /// normalized with the port config's naming rules (`--config` / `--package`)
+    /// so convention renames (`streamText` ↔ `stream_text`) don't false-miss.
+    /// Complements `hinzu port-diff` (which bands file/graph progress): this
+    /// grades public-surface conformance. See `notes/api-diff.md`.
+    ApiDiff(api_diff::ApiDiffArgs),
 }
 
 #[derive(Parser)]
@@ -327,6 +339,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::Ranges(args) => match ranges(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::ApiDiff(args) => match api_diff::run(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -1243,7 +1259,7 @@ fn build_graph_from_source(
 
 /// Write pretty JSON to `out` (with a trailing newline) or stdout. `what` names
 /// the document in any I/O error.
-fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
+pub(crate) fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
     match out {
         Some(out) => {
             std::fs::write(out, format!("{json}\n"))

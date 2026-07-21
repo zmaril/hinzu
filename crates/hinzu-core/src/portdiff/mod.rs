@@ -155,7 +155,11 @@ fn is_pascal(s: &str) -> bool {
 
 /// Normalize a leaf identifier for cross-language comparison: keep SCREAMING
 /// consts and PascalCase types verbatim (when configured), else camel→snake.
-fn norm_leaf(leaf: &str, rules: &NamingRules) -> String {
+///
+/// `pub(crate)` so [`crate::apidiff`] reuses the exact same leaf normalization
+/// the port-diff matcher does — a convention rename (`streamText` ↔ `stream_text`)
+/// must not read as a missing item there any more than an unmatched symbol here.
+pub(crate) fn norm_leaf(leaf: &str, rules: &NamingRules) -> String {
     if leaf.is_empty() {
         return leaf.to_string();
     }
@@ -169,8 +173,9 @@ fn norm_leaf(leaf: &str, rules: &NamingRules) -> String {
 }
 
 /// A source file path → its normalized module path (source-relative, snake
-/// segments, extension + compound suffixes stripped).
-fn source_file_to_module(file: &str, rules: &NamingRules) -> String {
+/// segments, extension + compound suffixes stripped). `pub(crate)` so
+/// [`crate::apidiff`] anchors a source item on the same module spelling.
+pub(crate) fn source_file_to_module(file: &str, rules: &NamingRules) -> String {
     let mut f = file;
     let src_pref = format!("{}/", rules.source_src_prefix);
     if let Some(rest) = f.strip_prefix(&src_pref) {
@@ -197,8 +202,8 @@ fn source_file_to_module(file: &str, rules: &NamingRules) -> String {
 
 /// A target file (workspace-relative) → its normalized module path in the
 /// source-relative form: strip the crate `src` prefix, the `.rs` extension, and a
-/// trailing `/mod`.
-fn target_file_to_module(file: &str, rules: &NamingRules) -> String {
+/// trailing `/mod`. `pub(crate)` so [`crate::apidiff`] anchors a target item too.
+pub(crate) fn target_file_to_module(file: &str, rules: &NamingRules) -> String {
     let mut f = file;
     // Try each configured target crate's src prefix (a package may map to several
     // crates); the first that matches wins. Fall back to the generic
