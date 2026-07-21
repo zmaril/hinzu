@@ -364,6 +364,36 @@ pub fn path_to_uri(path: &std::path::Path) -> String {
     format!("file://{}", percent_encode(&p))
 }
 
+/// Drive the LSP `initialize`/`initialized` handshake for a workspace `root`,
+/// with the server's `initializationOptions` and the client's `textDocument`
+/// capabilities. The scaffolding (processId, rootUri, workDoneProgress,
+/// workspaceFolders) is identical across this crate's drivers — the fact
+/// extractor and the API extractor — so it lives here; each caller passes only
+/// the capabilities it needs.
+pub fn initialize(
+    lsp: &mut LspClient,
+    root: &std::path::Path,
+    init_options: &Value,
+    text_document: Value,
+) -> Result<()> {
+    let root_uri = path_to_uri(root);
+    let params = json!({
+        "processId": std::process::id(),
+        "rootUri": root_uri,
+        "initializationOptions": init_options,
+        "capabilities": {
+            "textDocument": text_document,
+            "window": {"workDoneProgress": true},
+        },
+        "workspaceFolders": [{"uri": root_uri, "name": root.file_name()
+            .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into())}],
+    });
+    lsp.request("initialize", params, Duration::from_secs(30))
+        .context("LSP initialize")?;
+    lsp.notify("initialized", json!({}))?;
+    Ok(())
+}
+
 /// Minimal percent-decoding (`%XX`), enough for filesystem URIs.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
