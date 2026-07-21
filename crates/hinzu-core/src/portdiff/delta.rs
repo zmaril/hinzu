@@ -440,6 +440,9 @@ mod tests {
             mapped_target: None,
             map_method: None,
             map_votes: None,
+            dominant_target_file: None,
+            dominant_target_symbols: 0,
+            target_file_contributions: Vec::new(),
             total_symbols: total,
             matched_symbols: matched,
             tier_breakdown: FileTierBreakdown::default(),
@@ -469,6 +472,7 @@ mod tests {
             ready_frontier_total: 0,
             naive_vs_graph: NaiveVsGraph::default(),
             conformance_crosscheck: ConformanceCrosscheck::default(),
+            merges: crate::portdiff::MergeReport::default(),
             fidelity: Fidelity {
                 structural_not_correctness: true,
                 ..Default::default()

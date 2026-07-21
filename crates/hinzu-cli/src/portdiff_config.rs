@@ -183,6 +183,7 @@ impl MultiPackageConfig {
                 package: pkg.conformance_package.clone(),
                 src_prefix_strip: format!("packages/{}/", pkg.conformance_package),
             }),
+            package: Some(name.to_string()),
         };
 
         Ok(ResolvedPackage {
