@@ -162,18 +162,6 @@ fn similarity_breakdown_key(breakdown: &BTreeMap<String, f64>) -> String {
         .unwrap_or_default()
 }
 
-/// A [`Member`] view of a signature.
-fn to_member(s: &StructuralSignature) -> Member {
-    Member {
-        symbol_id: s.symbol_id.clone(),
-        display: s.display.clone(),
-        language: s.language.clone(),
-        file: s.file.clone(),
-        line_start: s.line_start,
-        line_end: s.line_end,
-    }
-}
-
 /// The cross-member feature comparison a cluster's explanation is built from:
 /// which structural features are identical across every member and which vary.
 struct ClusterFeatures {

@@ -15,9 +15,9 @@
 //! sequence; and the signature's parameter/return types drive the arity and the
 //! erased type shape.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hinzu_core::similarity::{Arity, Cfg, SignatureDoc, StructuralSignature, TypeShape, SHINGLE_K};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -28,28 +28,8 @@ use syn::visit::{self, Visit};
 /// failing the whole run — a project may contain a generated or edition-specific
 /// file `syn` cannot read, and one bad file should not sink the analysis.
 pub fn extract(project: &Path) -> Result<SignatureDoc> {
-    let files = rust_files(project)?;
     let mut signatures = Vec::new();
-    for file in &files {
-        let rel = file
-            .strip_prefix(project)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .to_string();
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("warning: skipping {} (unreadable: {e})", file.display());
-                continue;
-            }
-        };
-        let parsed = match syn::parse_file(&src) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("warning: skipping {} (parse error: {e})", rel);
-                continue;
-            }
-        };
+    for (rel, parsed) in crate::rust_source::parsed_rust_files(project)? {
         walk_items(&parsed.items, &[], &rel, &mut signatures);
     }
     Ok(SignatureDoc {
@@ -57,31 +37,6 @@ pub fn extract(project: &Path) -> Result<SignatureDoc> {
         extractor: "syn".to_string(),
         signatures,
     })
-}
-
-/// Every `.rs` file under `root`, skipping any `target/` directory and hidden
-/// directories. A plain recursive walk — no external crate needed.
-fn rust_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("reading directory {}", dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
-                if name == "target" || name.starts_with('.') {
-                    continue;
-                }
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 /// Recursively walk items, tracking the item path (module / impl-type / trait

@@ -1,0 +1,39 @@
+# Sample `hinzu similar --libraries` config: the libraries this user likes, so
+# the curated-library tier can say "adopt X" where local code has X's shape.
+
+[[libraries.rust]]
+crate  = "thiserror"
+kinds  = ["derive"]
+source = "curated"
+trust  = 0.8
+
+[[libraries.rust]]
+crate  = "derive_more"
+kinds  = ["derive"]
+source = "curated"
+trust  = 0.7
+
+[[libraries.rust]]
+crate  = "strum"
+kinds  = ["derive"]
+source = "curated"
+trust  = 0.6
+
+[[libraries.rust]]
+crate  = "itertools"
+version = "0.13"
+kinds  = ["function"]
+source = "curated"
+trust  = 0.9
+
+# The rustdoc (Tier-A, signature-shape) path — reads a pre-generated rustdoc JSON.
+# Generate with: cargo +nightly-2026-07-18 rustdoc -p itertools -- \
+#   -Zunstable-options --output-format json   (→ target/doc/itertools.json)
+[[libraries.rust]]
+crate        = "itertools"
+version      = "0.13"
+kinds        = ["function"]
+source       = "rustdoc"
+trust        = 0.9
+rustdoc_json = "target/doc/itertools.json"
+items        = ["process_results", "fold_ok"]

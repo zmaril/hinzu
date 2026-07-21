@@ -243,6 +243,90 @@ pub fn ts_tsc_profile() -> LanguageProfile {
     }
 }
 
+/// The `rustdoc` **source** profile for the curated-library tier: what reading a
+/// crate's public API via `cargo rustdoc --output-format json` can and cannot
+/// see. It sees the exposed generic signatures, the generic params, and the
+/// where-bounds — enough to reduce a combinator to a virtual `type_shape`. It
+/// does **not** see macro expansion, private impls, or any semantics, so a match
+/// from it is a *signature-shape* match, never a behaviour match. Shipped as data
+/// so every Tier-A (function/combinator) library finding can cite these edges.
+pub fn rustdoc_source_profile() -> LanguageProfile {
+    LanguageProfile {
+        language: "rust".to_string(),
+        extractor: "rustdoc".to_string(),
+        capabilities: caps(&[
+            ("types_resolved", "partial"),
+            ("call_targets_known", "no"),
+            ("macro_expansion_visible", "no"),
+            ("control_flow_available", "no"),
+            ("generics_visible", "yes"),
+            ("dynamic_dispatch_understood", "no"),
+            ("suggestion_scope", "adopt_library"),
+        ]),
+        abstraction_families: vec!["adopt_library".to_string()],
+        limitations: vec![
+            // Umbrella caveat FIRST.
+            "Signature-shape only: rustdoc exposes a library item's public signature and bounds, \
+             not its body or semantics, so a match means the local code has the SAME SHAPE as the \
+             library item — never that it does the same thing. Adopting the item is a suggestion to \
+             investigate, not a verified equivalence."
+                .to_string(),
+            "No body and no call graph: the match scores the erased type-shape and arity of the \
+             exposed signature; it cannot compare what the library item does internally."
+                .to_string(),
+            "Adopting a library item adds a dependency (and its transitive tree); a one-off local \
+             implementation may be cheaper than the coupling."
+                .to_string(),
+            "Version skew: the doc'd signature is whatever version was documented; a different \
+             pinned version may expose a different shape."
+                .to_string(),
+        ],
+    }
+}
+
+/// The `curated-pattern` **source** profile for the curated-library tier: what a
+/// hand-authored known-pattern catalog can and cannot match. It only recognizes
+/// the boilerplate shapes explicitly encoded in the shipped catalog (the impls a
+/// derive eliminates, the loop a combinator replaces), matched syntactically over
+/// local `impl`/`enum`/function structure. It is honest that it may miss variants
+/// a real derive handles and may be skewed against the crate's actual version.
+pub fn curated_pattern_profile() -> LanguageProfile {
+    LanguageProfile {
+        language: "rust".to_string(),
+        extractor: "curated-pattern".to_string(),
+        capabilities: caps(&[
+            ("types_resolved", "syntactic"),
+            ("call_targets_known", "syntactic"),
+            ("macro_expansion_visible", "no"),
+            ("control_flow_available", "partial"),
+            ("generics_visible", "partial"),
+            ("dynamic_dispatch_understood", "no"),
+            ("suggestion_scope", "adopt_library"),
+        ]),
+        abstraction_families: vec!["adopt_library".to_string()],
+        limitations: vec![
+            // Umbrella caveat FIRST.
+            "Curated and structural: this match recognizes a hand-authored boilerplate shape the \
+             library's derive/combinator would replace — it is a shape match, not a behaviour \
+             match, so the local code may do more than the derive expresses."
+                .to_string(),
+            "Curated-pattern incompleteness: the catalog encodes a SUBSET of what each derive does; \
+             a real derive may handle variants, attributes, or edge cases the pattern does not, so \
+             the finding may over- or under-claim what adopting it removes."
+                .to_string(),
+            "Version skew: the pattern is pinned to no exact crate version; the crate's real \
+             derive/API may differ from what is transcribed here."
+                .to_string(),
+            "Adopting a library adds a dependency (and its transitive tree); a one-off local \
+             implementation may be cheaper than the coupling."
+                .to_string(),
+            "Syntactic extraction: the pattern reads trait impls by their written path, so a \
+             re-exported or aliased trait can be missed (a false negative), never faked."
+                .to_string(),
+        ],
+    }
+}
+
 /// The profile for a language spelling, or `None` when no extractor profile is
 /// shipped for it yet (the honest capability edge — an unshipped language is
 /// reported as absent, never faked). This is the language-keyed default, which
