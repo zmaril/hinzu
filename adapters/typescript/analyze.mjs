@@ -946,6 +946,70 @@ function resolveAlias(sym) {
   return sym;
 }
 
+// A declaration explicitly marked `export` (`export interface X`, `export type
+// Y`). Type-reference reachability only promotes in-package types that their own
+// module already makes public, so it never surfaces truly-private helper types.
+function hasExportModifier(decl) {
+  return !!decl && ts.canHaveModifiers(decl) && (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Export) !== 0;
+}
+
+// The rightmost symbol named by a type-position node: an `EntityName`
+// (`Foo`/`ns.Foo` in a `TypeReferenceNode`) or the expression of an
+// `ExpressionWithTypeArguments` (a heritage clause `extends Foo`). Alias-resolved
+// so a locally-imported name reaches its real declaration.
+function typeRefTargetSymbol(node) {
+  let n = node;
+  if (ts.isQualifiedName(n)) n = n.right;
+  else if (ts.isPropertyAccessExpression(n)) n = n.name;
+  const sym = n && checker.getSymbolAtLocation(n);
+  return sym ? resolveAlias(sym) : null;
+}
+
+// The in-package, module-exported *type* symbols referenced in the type positions
+// of one declaration (interface members, alias target, class heritage/members,
+// function params + return). Value-space is skipped: the walk never descends into
+// statement bodies, so only real type references are collected. This is what makes
+// a type like `BashResult` — reachable only because a public `RpcResponse`/
+// `BashToolDetails` names it, never named-re-exported from an entry point — count
+// as public surface, so a consumer can resolve the reference instead of seeing a
+// bare string. Returns resolved symbols; the caller lowers them like any export.
+function collectInPackageTypeRefs(decl) {
+  const found = [];
+  const visit = (n) => {
+    if (!n) return;
+    // Never walk into executable bodies: a type-position closure must not pick up
+    // value identifiers that merely share a name with a type.
+    if (ts.isBlock(n)) return;
+    if (ts.isTypeReferenceNode(n)) {
+      const sym = typeRefTargetSymbol(n.typeName);
+      if (sym) found.push(sym);
+      if (n.typeArguments) n.typeArguments.forEach(visit);
+      return;
+    }
+    if (ts.isExpressionWithTypeArguments(n)) {
+      const sym = typeRefTargetSymbol(n.expression);
+      if (sym) found.push(sym);
+      if (n.typeArguments) n.typeArguments.forEach(visit);
+      return;
+    }
+    ts.forEachChild(n, visit);
+  };
+  ts.forEachChild(decl, visit);
+
+  const out = [];
+  const TYPEISH = ts.SymbolFlags.Interface | ts.SymbolFlags.TypeAlias | ts.SymbolFlags.Enum | ts.SymbolFlags.Class;
+  for (const sym of found) {
+    if (!(sym.flags & TYPEISH)) continue;
+    const d = sym.getDeclarations && sym.getDeclarations()?.[0];
+    if (!d) continue;
+    const rel = srcRel(ROOT, d.getSourceFile().fileName);
+    if (rel === null || rel.endsWith(".d.ts")) continue; // external / declaration-only
+    if (!hasExportModifier(d)) continue; // its own module does not make it public
+    out.push(sym);
+  }
+  return out;
+}
+
 // The `@throws` type/description on a declaration, rendered — TypeScript models
 // no checked exceptions, so this is the only honest error-type source.
 function throwsOf(decl) {
@@ -1058,8 +1122,11 @@ function isPublicMember(m) {
 }
 
 // Lower one exported symbol into one or more ApiItems (a class yields its own
-// item plus a `method` item per public method). Pushes onto `out`.
-function lowerExport(exportName, sym, out, seen) {
+// item plus a `method` item per public method). Pushes onto `out`. When a `queue`
+// is supplied, in-package exported types referenced from this declaration's type
+// positions are pushed onto it so the public surface closes over the types a
+// consumer needs to resolve — see `collectInPackageTypeRefs`.
+function lowerExport(exportName, sym, out, seen, queue) {
   const s = resolveAlias(sym);
   // getDeclarations() returns undefined for a declaration-less symbol (e.g. an
   // ambient/synthesized export); guard the index so such symbols are skipped by
@@ -1128,6 +1195,10 @@ function lowerExport(exportName, sym, out, seen) {
     }
   }
   out.push(item);
+  // Close over type references: enqueue in-package exported types this item names
+  // so they become first-class public items too (transitive; dedup is by id in the
+  // early-return above, so re-enqueuing an already-lowered type is harmless).
+  if (queue) for (const ref of collectInPackageTypeRefs(decl)) queue.push([ref.getName(), ref]);
   return id;
 }
 
@@ -1176,6 +1247,10 @@ function emitApiReport(root, program, checker, entryFiles) {
   const seen = new Set();
   const items = [];
   let entryCount = 0;
+  // Worklist: seed with the entry points' named exports, then drain. Lowering an
+  // item enqueues the in-package exported types it references, so the surface
+  // closes over every type a consumer must resolve (dedup by id keeps it finite).
+  const queue = [];
   for (const entry of entryFiles) {
     const sf = program.getSourceFile(entry);
     if (!sf) {
@@ -1185,7 +1260,11 @@ function emitApiReport(root, program, checker, entryFiles) {
     const msym = checker.getSymbolAtLocation(sf);
     if (!msym) continue;
     entryCount++;
-    for (const ex of checker.getExportsOfModule(msym)) lowerExport(ex.getName(), ex, items, seen);
+    for (const ex of checker.getExportsOfModule(msym)) queue.push([ex.getName(), ex]);
+  }
+  while (queue.length) {
+    const [name, sym] = queue.shift();
+    lowerExport(name, sym, items, seen, queue);
   }
 
   // Group by module (declaring file / external package).
