@@ -69,6 +69,12 @@ pub fn summary(stats: &Stats) -> String {
         stats.unions_synthesized,
         stats.unions_lifted,
     ));
+    if stats.consts_emitted > 0 {
+        s.push_str(&format!(
+            "  consts: {} exported constant(s) emitted into api.json consts[] (was dropped)\n",
+            stats.consts_emitted,
+        ));
+    }
     if stats.context_reports > 0 {
         s.push_str(&format!(
             "  cross-package: {} context report(s), {} sibling type(s) pulled in (transitively referenced)\n",
