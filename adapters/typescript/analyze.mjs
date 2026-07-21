@@ -27,6 +27,16 @@
 import ts from "typescript";
 import path from "node:path";
 import fs from "node:fs";
+import {
+  parseArgs,
+  programFromTsconfig,
+  makeOwnedRel,
+  forEachOwnedSourceFile,
+  isFunctionLike,
+  nameForNode,
+  qualifierChain,
+  lineOf,
+} from "./common.mjs";
 
 // --- shared, flat effect vocabulary (a subset of hinzu's categories) ---------
 // The same names Rust uses. A category that does not apply to TypeScript simply
@@ -79,19 +89,13 @@ const EFFECTFUL_NPM = {
 };
 
 // --- argument parsing --------------------------------------------------------
-const argv = process.argv.slice(2);
-let projectArg = null;
-let tsconfigArg = null;
-let apiMode = false;
-for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === "--tsconfig") tsconfigArg = argv[++i];
-  else if (argv[i] === "--api") apiMode = true;
-  else if (!projectArg) projectArg = argv[i];
-}
-if (!projectArg) {
-  console.error("usage: node analyze.mjs <project-dir> [--tsconfig <path>]");
-  process.exit(2);
-}
+const { projectArg, tsconfigArg } = parseArgs(
+  process.argv.slice(2),
+  "usage: node analyze.mjs <project-dir> [--tsconfig <path>] [--api]",
+);
+// `parseArgs` covers the shape both extractors share; `--api` is analyze-only,
+// so detect it here rather than widening the shared parser.
+const apiMode = process.argv.slice(2).includes("--api");
 const ROOT = path.resolve(projectArg);
 const tsconfigPath = tsconfigArg
   ? path.resolve(tsconfigArg)
@@ -102,24 +106,13 @@ if (!tsconfigPath || !fs.existsSync(tsconfigPath)) {
 }
 
 // --- build the Program from the project's own tsconfig -----------------------
-const cfgFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
-const parsed = ts.parseJsonConfigFileContent(
-  cfgFile.config,
-  ts.sys,
-  path.dirname(tsconfigPath),
-  { noEmit: true },
-);
-if (parsed.errors.length) {
-  for (const e of parsed.errors) {
-    console.error("tsconfig:", ts.flattenDiagnosticMessageText(e.messageText, "\n"));
-  }
-}
 // In API mode the program is rooted at the package's entry points (so it pulls
 // in just the public surface's reachable files, not the whole monorepo); in
-// fact mode it is rooted at the tsconfig's own file set, exactly as before.
+// fact mode it is rooted at the tsconfig's own file set, exactly as before. The
+// shared `programFromTsconfig` builds the Program the same way both extractors
+// need; `apiEntryFiles` overrides its root file set only in API mode.
 const apiEntryFiles = apiMode ? resolveEntryFiles(ROOT) : null;
-const rootNames = apiEntryFiles ?? parsed.fileNames;
-const program = ts.createProgram({ rootNames, options: parsed.options });
+const { program, parsed, rootNames } = programFromTsconfig(tsconfigPath, apiEntryFiles);
 const checker = program.getTypeChecker();
 console.error(
   `hinzu-ts: TypeScript ${ts.version} | root files ${rootNames.length} | ` +
@@ -136,16 +129,9 @@ if (apiMode) {
 // --- which files we own (attribute definitions to) ---------------------------
 // Everything under the project root that is real source: not a dependency, not a
 // declaration file, not build output. Tests are kept as definitions; a policy's
-// `ignore` globs, not the adapter, decide whether to skip them.
-const IGNORED_DIRS = /(^|\/)(node_modules|dist|build|out|coverage|\.git)(\/|$)/;
-function ownedRel(fileName) {
-  const rel = path.relative(ROOT, fileName);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  const unix = rel.split(path.sep).join("/");
-  if (IGNORED_DIRS.test("/" + unix)) return null;
-  if (unix.endsWith(".d.ts")) return null;
-  return unix;
-}
+// `ignore` globs, not the adapter, decide whether to skip them. The filter is
+// shared with structural.mjs — see common.mjs.
+const ownedRel = makeOwnedRel(ROOT);
 
 // --- symbol ids --------------------------------------------------------------
 // A local callable's id is its file (no extension) plus its qualified name, made
@@ -167,17 +153,8 @@ const defIdByNode = new Map(); // ts.Node -> id
 const defs = new Map(); // id -> definition record
 let anon = 0;
 
-function isFunctionLike(n) {
-  return (
-    ts.isFunctionDeclaration(n) ||
-    ts.isMethodDeclaration(n) ||
-    ts.isArrowFunction(n) ||
-    ts.isFunctionExpression(n) ||
-    ts.isConstructorDeclaration(n) ||
-    ts.isGetAccessorDeclaration(n) ||
-    ts.isSetAccessorDeclaration(n)
-  );
-}
+// `isFunctionLike`, `nameForNode`, `qualifierChain`, and `lineOf` are shared with
+// structural.mjs — see common.mjs.
 
 // A type declaration we register as a definition so signature-type edges have a
 // local port target: classes, interfaces, type aliases, and enums. Registering
@@ -203,48 +180,7 @@ function typeNameForNode(n) {
   return "(anonymous type)";
 }
 
-function nameForNode(n) {
-  if (
-    (ts.isFunctionDeclaration(n) ||
-      ts.isMethodDeclaration(n) ||
-      ts.isGetAccessorDeclaration(n) ||
-      ts.isSetAccessorDeclaration(n)) &&
-    n.name
-  ) {
-    return n.name.getText();
-  }
-  if (ts.isConstructorDeclaration(n)) return "constructor";
-  const p = n.parent;
-  if (p && ts.isVariableDeclaration(p) && p.name) return p.name.getText();
-  if (p && ts.isPropertyAssignment(p) && p.name) return p.name.getText();
-  if (p && ts.isPropertyDeclaration(p) && p.name) return p.name.getText();
-  if (p && ts.isExportAssignment(p)) return "(default)";
-  if (p && (ts.isCallExpression(p) || ts.isNewExpression(p))) return "(callback)";
-  return "(anonymous)";
-}
-
-function qualifierChain(n) {
-  const parts = [];
-  let cur = n.parent;
-  while (cur) {
-    if (ts.isClassDeclaration(cur) || ts.isClassExpression(cur)) {
-      parts.unshift(cur.name ? cur.name.getText() : "(class)");
-    } else if (ts.isModuleDeclaration(cur) && cur.name) {
-      parts.unshift(cur.name.getText());
-    }
-    cur = cur.parent;
-  }
-  return parts;
-}
-
-function lineOf(sf, pos) {
-  return sf.getLineAndCharacterOfPosition(pos).line + 1;
-}
-
-for (const sf of program.getSourceFiles()) {
-  const rel = ownedRel(sf.fileName);
-  if (!rel) continue;
-  const relNoExt = rel.replace(/\.[cm]?tsx?$/, "");
+forEachOwnedSourceFile(program, ownedRel, (sf, rel, relNoExt) => {
   const walk = (n) => {
     const fnLike = isFunctionLike(n);
     if (fnLike || isTypeDeclLike(n)) {
@@ -266,7 +202,7 @@ for (const sf of program.getSourceFiles()) {
     ts.forEachChild(n, walk);
   };
   ts.forEachChild(sf, walk);
-}
+});
 console.error(`hinzu-ts: definitions ${defs.size}`);
 
 // --- edges + effect roots ----------------------------------------------------
