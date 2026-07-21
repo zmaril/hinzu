@@ -24,6 +24,7 @@ pub mod policy;
 pub mod portdiff;
 pub mod roots;
 pub mod rules;
+pub mod similarity;
 pub mod store;
 
 /// Shared builders for the unit tests across the engine's modules, kept in one

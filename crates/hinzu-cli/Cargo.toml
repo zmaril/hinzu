@@ -19,6 +19,11 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# The structural (syn-based) Rust extractor behind `hinzu similar`. syn 2 is
+# already resolved transitively in Cargo.lock; span-locations gives real line
+# numbers on stable.
+syn = { version = "2", features = ["full", "visit", "extra-traits", "printing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [dev-dependencies]
 tempfile = "3"

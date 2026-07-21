@@ -11,6 +11,8 @@ mod portdiff_config;
 mod portdiff_html;
 mod py_adapter;
 mod rust_adapter;
+mod similar_cmd;
+mod structural_rust;
 mod ts_adapter;
 
 use std::path::{Path, PathBuf};
@@ -93,6 +95,16 @@ enum Cmd {
     /// degrading honestly (an unmodelable type falls back to `Json`) and writing
     /// a coverage-stats sidecar so the lossy edges are visible, not silent.
     ApiFluessig(ApiFluessigArgs),
+    /// Find places where several implementations are structurally similar enough
+    /// that a shared abstraction is worth investigating. ADVISORY and
+    /// evidence-based: it locates clusters, explains what they share and what
+    /// differs (the abstraction axes), names a likely abstraction family with a
+    /// confidence, cites the per-language capability/limitations, and lists
+    /// reasons NOT to consolidate. It never refactors and never claims an
+    /// abstraction is definitely correct. Extracts Rust signatures with syn
+    /// (syntactic — types/macros/call-targets are read, not resolved), or reads a
+    /// pre-extracted `--structural` signatures JSON.
+    Similar(similar_cmd::SimilarArgs),
 }
 
 #[derive(Parser)]
@@ -367,6 +379,10 @@ fn main() -> ExitCode {
             Err(e) => report_error(e),
         },
         Cmd::ApiFluessig(args) => match api_fluessig_cmd(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::Similar(args) => match similar_cmd::run(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },

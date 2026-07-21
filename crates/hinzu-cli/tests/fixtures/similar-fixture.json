@@ -1,0 +1,57 @@
+{
+  "language": "rust",
+  "extractor": "syn",
+  "signatures": [
+    {
+      "symbol_id": "src/parse.rs::parse_u8",
+      "display": "parse_u8",
+      "language": "rust",
+      "kind": "function",
+      "file": "src/parse.rs",
+      "line_start": 10,
+      "line_end": 24,
+      "arity": { "params": 1, "results": 1, "generics": 0 },
+      "cfg": { "branch_count": 1, "match_arms": 2, "loop_count": 0, "try_count": 1, "return_points": 1, "max_nesting": 2 },
+      "stmt_histogram": { "call": 3, "if": 1, "match": 1, "let": 2, "try": 1 },
+      "call_sequence": ["validate", "map_err", "into"],
+      "type_shape": { "params": ["&_"], "result": "Result<_,_>" },
+      "shingles": [10, 11, 12, 13, 14, 15, 16],
+      "token_len": 28,
+      "features": {}
+    },
+    {
+      "symbol_id": "src/parse.rs::parse_u16",
+      "display": "parse_u16",
+      "language": "rust",
+      "kind": "function",
+      "file": "src/parse.rs",
+      "line_start": 30,
+      "line_end": 44,
+      "arity": { "params": 1, "results": 1, "generics": 0 },
+      "cfg": { "branch_count": 1, "match_arms": 2, "loop_count": 0, "try_count": 1, "return_points": 1, "max_nesting": 2 },
+      "stmt_histogram": { "call": 3, "if": 1, "match": 1, "let": 2, "try": 1 },
+      "call_sequence": ["validate", "map_err", "into"],
+      "type_shape": { "params": ["&_"], "result": "Option<_>" },
+      "shingles": [10, 11, 12, 13, 14, 15, 16],
+      "token_len": 28,
+      "features": {}
+    },
+    {
+      "symbol_id": "src/agg.rs::sum_list",
+      "display": "sum_list",
+      "language": "rust",
+      "kind": "function",
+      "file": "src/agg.rs",
+      "line_start": 5,
+      "line_end": 15,
+      "arity": { "params": 1, "results": 1, "generics": 0 },
+      "cfg": { "branch_count": 0, "match_arms": 0, "loop_count": 1, "try_count": 0, "return_points": 0, "max_nesting": 1 },
+      "stmt_histogram": { "loop": 1, "call": 1, "let": 2, "assign": 1 },
+      "call_sequence": ["push"],
+      "type_shape": { "params": ["Vec<_>"], "result": "_" },
+      "shingles": [50, 51, 52, 53, 54],
+      "token_len": 22,
+      "features": {}
+    }
+  ]
+}
