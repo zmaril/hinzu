@@ -1061,7 +1061,10 @@ function isPublicMember(m) {
 // item plus a `method` item per public method). Pushes onto `out`.
 function lowerExport(exportName, sym, out, seen) {
   const s = resolveAlias(sym);
-  const decl = (s.getDeclarations && s.getDeclarations()[0]) || null;
+  // getDeclarations() returns undefined for a declaration-less symbol (e.g. an
+  // ambient/synthesized export); guard the index so such symbols are skipped by
+  // the `if (!decl)` below rather than throwing.
+  const decl = (s.getDeclarations && s.getDeclarations()?.[0]) || null;
   if (!decl) return null;
   const declFile = decl.getSourceFile().fileName;
   const rel = srcRel(ROOT, declFile);
@@ -1156,7 +1159,7 @@ function countInternalOnly(root, program, publicIds) {
     if (!msym) continue;
     for (const ex of checker.getExportsOfModule(msym)) {
       const s = resolveAlias(ex);
-      const d = s.getDeclarations && s.getDeclarations()[0];
+      const d = s.getDeclarations && s.getDeclarations()?.[0];
       if (!d) continue;
       const dr = srcRel(root, d.getSourceFile().fileName);
       if (!dr || dr.endsWith(".d.ts")) continue;
