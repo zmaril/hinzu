@@ -58,7 +58,7 @@ pub(super) fn explain_cluster(
         basis_parts.push(format!("capped at {cap:.2} (syntactic extractor)"));
     }
 
-    let counter_evidence = cmp.counter_evidence(&members, &breakdown);
+    let counter_evidence = cmp.counter_evidence(&members, &breakdown, types_resolved);
     // Each counter-evidence class docks confidence a little, fail-closed.
     if cmp.min_token_len < cmp.max_token_len.min(24) {
         confidence *= 0.9;
@@ -392,6 +392,7 @@ impl ClusterFeatures {
         &self,
         members: &[&StructuralSignature],
         breakdown: &BTreeMap<String, f64>,
+        types_resolved: bool,
     ) -> Vec<String> {
         let mut out = Vec::new();
         if self.min_token_len < 16 {
@@ -433,12 +434,25 @@ impl ClusterFeatures {
                     .to_string(),
             );
         }
-        // The always-true syntactic caveat, stated as counter-evidence too.
-        out.push(
-            "syntactic match only: sameness of structure does not imply sameness of behaviour, and \
-             two identically-shaped type slots may be different types"
-                .to_string(),
-        );
+        // The always-true structural caveat, stated as counter-evidence too. Its
+        // wording tracks the profile: a syntactic extractor cannot even confirm
+        // the types match, while a resolved one can — but structural sameness
+        // still never implies behavioural sameness, and two identically-shaped
+        // (leaf-erased) type slots may be genuinely different types either way.
+        if types_resolved {
+            out.push(
+                "structural match only: resolved types were compared, but sameness of structure \
+                 does not imply sameness of behaviour, and two identically-shaped type slots may \
+                 be genuinely different types"
+                    .to_string(),
+            );
+        } else {
+            out.push(
+                "syntactic match only: sameness of structure does not imply sameness of \
+                 behaviour, and two identically-shaped type slots may be different types"
+                    .to_string(),
+            );
+        }
         out
     }
 }

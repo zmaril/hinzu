@@ -116,6 +116,70 @@ pub fn rust_syn_profile() -> LanguageProfile {
     }
 }
 
+/// The Rust/`stablemir` profile: a structural extractor built on the compiler's
+/// own **monomorphized MIR**, via the StableMIR (`rustc_public`) driver.
+///
+/// It is honestly *richer* than the Rust/syn profile, and says exactly where. MIR
+/// is post-type-resolution and post-monomorphization, so: types are the
+/// compiler's resolved types (`types_resolved` is `yes`, not `syntactic` — a type
+/// alias collapses to its underlying constructor, and a concrete function's slots
+/// are the real types); call targets are resolved callees (`call_targets_known`
+/// is `yes`); macro-generated logic is already expanded into the body
+/// (`macro_expansion_visible` is `yes` — the syn opacity caveat is lifted). The
+/// costs are stated as limitations, not hidden: source-level structured nesting is
+/// lowered to flat basic blocks (so `control_flow_available` is `partial` and
+/// `max_nesting` is 0), and indirect dispatch through fn-pointers / trait objects
+/// is still unresolved (`dynamic_dispatch_understood` is `partial`). Its
+/// abstraction families are the same as the Rust/syn profile, so a finding from
+/// either Rust extractor names the same Rust mechanisms.
+pub fn rust_stablemir_profile() -> LanguageProfile {
+    let syn = rust_syn_profile();
+    LanguageProfile {
+        language: "rust".to_string(),
+        extractor: "stablemir".to_string(),
+        capabilities: caps(&[
+            ("types_resolved", "yes"),
+            ("call_targets_known", "yes"),
+            ("macro_expansion_visible", "yes"),
+            ("control_flow_available", "partial"),
+            ("generics_visible", "yes"),
+            ("dynamic_dispatch_understood", "partial"),
+            ("suggestion_scope", "language_specific"),
+        ]),
+        // Same families as the syn Rust profile: the resolved path changes what is
+        // seen, not which Rust mechanisms a finding may suggest.
+        abstraction_families: syn.abstraction_families,
+        limitations: vec![
+            // The umbrella caveat FIRST (finding_profile treats limitation[0] as
+            // the always-applies umbrella). Unlike syn's, it states the resolution
+            // win: types and macro bodies ARE resolved/visible; structural
+            // sameness still does not imply behavioural sameness.
+            "Resolved but structural: types are the compiler's resolved types and macro bodies are \
+             expanded (the syntactic caveats are lifted), but structural sameness still does not \
+             imply behavioural sameness — two identically-shaped type slots may be genuinely \
+             different types."
+                .to_string(),
+            "MIR is post-monomorphization and post-expansion: type aliases collapse to their \
+             underlying constructor and macro-generated logic is visible in the body — the syn \
+             extractor's alias and macro-opacity caveats do NOT apply here."
+                .to_string(),
+            "Source-level control flow is lowered to flat basic blocks: structured nesting is not \
+             recoverable (`max_nesting` reads 0), and `if` vs `match` and loops are read \
+             best-effort from `SwitchInt` fan-out and CFG back-edges rather than from source \
+             syntax."
+                .to_string(),
+            "Dynamic dispatch through trait objects and function pointers is still unresolved: an \
+             indirect call has no resolved callee, so it does not appear in the call sequence \
+             (surfaced, not faked)."
+                .to_string(),
+            "A generic function that is never monomorphized at the item level is signed from its \
+             polymorphic body, so its type parameters appear as `_` (unresolved, like syn); the \
+             resolution win lands on concrete functions and on aliases in any signature."
+                .to_string(),
+        ],
+    }
+}
+
 /// The TypeScript/`tsc-checker` profile: a structural extractor built on the
 /// TypeScript compiler API, driving the **type checker**.
 ///
@@ -181,11 +245,30 @@ pub fn ts_tsc_profile() -> LanguageProfile {
 
 /// The profile for a language spelling, or `None` when no extractor profile is
 /// shipped for it yet (the honest capability edge — an unshipped language is
-/// reported as absent, never faked). Ships Rust/syn and TypeScript/tsc-checker.
+/// reported as absent, never faked). This is the language-keyed default, which
+/// resolves Rust to its *syntactic* (`syn`) profile; a caller that knows the
+/// producing extractor should use [`profile_for`] so a resolved run reports the
+/// resolved capabilities. Ships Rust/syn and TypeScript/tsc-checker.
 pub fn profile_for_language(language: &str) -> Option<LanguageProfile> {
     match language {
         "rust" => Some(rust_syn_profile()),
         "typescript" => Some(ts_tsc_profile()),
+        _ => None,
+    }
+}
+
+/// The profile for a `(language, extractor)` pairing, or `None` when no profile is
+/// shipped. This is the extractor-aware lookup: a Rust run reports the `stablemir`
+/// (resolved-type) profile when that extractor produced it, and the `syn`
+/// (syntactic) profile otherwise — the difference that lifts or keeps the
+/// confidence cap. An unrecognized Rust extractor falls back to the syn profile
+/// (the conservative default). A non-Rust language ignores the extractor and uses
+/// its single shipped profile.
+pub fn profile_for(language: &str, extractor: &str) -> Option<LanguageProfile> {
+    match (language, extractor) {
+        ("rust", "stablemir") => Some(rust_stablemir_profile()),
+        ("rust", _) => Some(rust_syn_profile()),
+        ("typescript", _) => Some(ts_tsc_profile()),
         _ => None,
     }
 }

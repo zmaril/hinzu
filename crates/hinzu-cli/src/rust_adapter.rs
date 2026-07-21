@@ -19,7 +19,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use hinzu_core::absint::body::BodyFacts;
-use hinzu_core::facts::FactSet;
+use hinzu_core::{facts::FactSet, similarity::SignatureDoc};
 
 /// The nightly the driver is pinned to (its `rust-toolchain.toml`). The target
 /// crate must compile with the same rustc the driver linked against, so the
@@ -64,9 +64,67 @@ pub fn extract_bodies(project: &Path) -> Result<BodyFacts> {
     Ok(bodies)
 }
 
+/// Extract **structural signatures** from a cargo project by running the same
+/// StableMIR driver over it — the resolved-type Rust path behind
+/// `hinzu similar --rust-extractor stablemir`. The driver emits a sibling
+/// `sigs-<crate>-<pid>.json` (in `hinzu_core::similarity::SignatureDoc` shape)
+/// alongside the effect `facts-*.json`; this runs the build and merges those
+/// per-crate signature documents into one `SignatureDoc` stamped `rust` /
+/// `stablemir`. Fails honestly when the nightly toolchain or driver is
+/// unavailable rather than faking a resolved analysis.
+pub fn extract_signatures(project: &Path) -> Result<SignatureDoc> {
+    let facts_dir = run_driver(project, false)?;
+    let signatures = merge_sigs_dir(&facts_dir)?;
+
+    if signatures.is_empty() {
+        bail!(
+            "the driver produced no signatures for {} — is it a buildable cargo project?",
+            project.display()
+        );
+    }
+    Ok(SignatureDoc {
+        language: "rust".to_string(),
+        extractor: "stablemir".to_string(),
+        signatures,
+    })
+}
+
+/// Whether the StableMIR driver is available WITHOUT triggering a toolchain
+/// download or a build. `auto` uses this to decide between the resolved path and
+/// the syn fallback: an explicit `HINZU_RUSTC_DRIVER` binary, or the pinned
+/// nightly already installed (so `cargo build` for the driver will not have to
+/// download it). A stable-only environment (CI) has neither, so `auto` degrades
+/// to syn without ever reaching for the network — keeping the toolchain-free path
+/// truly toolchain-free.
+pub fn driver_available() -> bool {
+    if let Ok(path) = std::env::var("HINZU_RUSTC_DRIVER") {
+        if PathBuf::from(path).is_file() {
+            return true;
+        }
+    }
+    pinned_nightly_installed()
+}
+
+/// Whether the driver's pinned nightly toolchain is already installed, read from
+/// `rustup toolchain list` without installing anything.
+fn pinned_nightly_installed() -> bool {
+    let Ok(out) = Command::new("rustup").args(["toolchain", "list"]).output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.contains(DRIVER_NIGHTLY))
+}
+
 /// Locate the driver + its sysroot, create a fresh facts dir, and run the
 /// extraction build over `project`; returns the facts dir the driver wrote into.
-/// Shared by the effect-fact and body-fact extraction paths.
+/// One build produces every sibling output — the effect `facts-*.json`, the
+/// structural `sigs-*.json`, and (with `emit_bodies`) the range-analysis
+/// `bodies-*.json` — so each entry point differs only in which files it merges.
+/// Shared by the effect-fact, body-fact, and signature extraction paths.
 fn run_driver(project: &Path, emit_bodies: bool) -> Result<PathBuf> {
     let driver = driver_binary().context(
         "the StableMIR driver is unavailable — build crates/hinzu-rustc-driver with its pinned \
@@ -92,6 +150,28 @@ fn merge_bodies_dir(dir: &Path) -> Result<BodyFacts> {
         for function in facts.functions {
             if seen.insert(function.id.clone()) {
                 merged.functions.push(function);
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Merge every `sigs-*.json` in `dir` (one per wrapped crate, each a
+/// `SignatureDoc`) into one flat, deterministically ordered signature list. A
+/// signature id can recur across the lib/bin compilation units the wrapper runs
+/// over; the first occurrence wins so a shared symbol is not double-counted.
+fn merge_sigs_dir(dir: &Path) -> Result<Vec<hinzu_core::similarity::StructuralSignature>> {
+    let mut merged = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    for file in &output_files(dir, "sigs-")? {
+        let json =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let doc: SignatureDoc = serde_json::from_str(&json)
+            .with_context(|| format!("parsing driver signatures from {}", file.display()))?;
+        for sig in doc.signatures {
+            if seen.insert(sig.symbol_id.clone()) {
+                merged.push(sig);
             }
         }
     }
