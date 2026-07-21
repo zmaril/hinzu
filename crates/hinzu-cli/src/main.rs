@@ -1166,6 +1166,7 @@ fn band_label(band: hinzu_core::portdiff::Band) -> &'static str {
     match band {
         Band::Done => "DONE",
         Band::Ported => "PORTED",
+        Band::Relocated => "RELOCATED",
         Band::Started => "STARTED",
         Band::NotStarted => "NOT-STARTED",
     }

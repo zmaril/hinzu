@@ -28,9 +28,30 @@ fn band_color(band: Band) -> &'static str {
     match band {
         Band::Done => "#3fb950",
         Band::Ported => "#58a6ff",
+        Band::Relocated => "#a371f7",
         Band::Started => "#d29922",
         Band::NotStarted => "#6e7681",
     }
+}
+
+/// The five band header colors in report order: DONE, PORTED, RELOCATED,
+/// STARTED, NOT-STARTED. Shared by every band-column table header so the color
+/// legend is spelled once and inline-captured by the header templates.
+#[allow(clippy::type_complexity)]
+fn band_header_colors() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    (
+        band_color(Band::Done),
+        band_color(Band::Ported),
+        band_color(Band::Relocated),
+        band_color(Band::Started),
+        band_color(Band::NotStarted),
+    )
 }
 
 /// The band's display label (matches the JSON `serde` rename).
@@ -38,6 +59,7 @@ fn band_name(band: Band) -> &'static str {
     match band {
         Band::Done => "DONE",
         Band::Ported => "PORTED",
+        Band::Relocated => "RELOCATED",
         Band::Started => "STARTED",
         Band::NotStarted => "NOT-STARTED",
     }
@@ -76,6 +98,7 @@ fn band_bar(bands: &BandCounts, total: usize) -> String {
     let segs = [
         (Band::Done, bands.done),
         (Band::Ported, bands.ported),
+        (Band::Relocated, bands.relocated),
         (Band::Started, bands.started),
         (Band::NotStarted, bands.not_started),
     ];
@@ -216,7 +239,7 @@ fn multi_hero(report: &MultiPackageReport) -> String {
 /// The overall completion bar panel.
 fn multi_overall_bar(t: &RollupTotals) -> String {
     bar_legend_panel(
-        r#"Overall port completion <span class="q">DONE test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span>"#,
+        r#"Overall port completion <span class="q">DONE test-verified · PORTED ≥ threshold symbols · RELOCATED moved to secondary crate · STARTED some match · NOT-STARTED none</span>"#,
         &t.bands,
         t.source_files_total,
         true,
@@ -271,20 +294,17 @@ fn multi_summary_table(report: &MultiPackageReport) -> String {
         t.conformance_native,
         "—",
     );
+    let (dc, pc, rc, sc, nc) = band_header_colors();
     format!(
         r#"<div class="panel">
   <h2>Summary table</h2>
   <table>
-    <thead><tr><th>package</th><th class="num">files</th><th class="num" style="color:{dc}">DONE</th><th class="num" style="color:{pc}">PORTED</th><th class="num" style="color:{sc}">STARTED</th><th class="num" style="color:{nc}">NOT-STARTED</th><th class="num">symbols matched</th><th class="num">conf. native</th><th class="num">waves</th></tr></thead>
+    <thead><tr><th>package</th><th class="num">files</th><th class="num" style="color:{dc}">DONE</th><th class="num" style="color:{pc}">PORTED</th><th class="num" style="color:{rc}">RELOCATED</th><th class="num" style="color:{sc}">STARTED</th><th class="num" style="color:{nc}">NOT-STARTED</th><th class="num">symbols matched</th><th class="num">conf. native</th><th class="num">waves</th></tr></thead>
     <tbody>{rows}{total_row}</tbody>
   </table>
-  <div class="callout">DONE band == conformance native modules per package — the structural matcher and the test manifest agree on the test-verified floor. STARTED / PORTED are structural (graph-derived) and under-count by design.</div>
+  <div class="callout">DONE band == conformance native modules per package — the structural matcher and the test manifest agree on the test-verified floor. STARTED / PORTED / RELOCATED are structural (graph-derived) and under-count by design; RELOCATED marks a port that moved to a secondary target crate.</div>
 </div>
 "#,
-        dc = band_color(Band::Done),
-        pc = band_color(Band::Ported),
-        sc = band_color(Band::Started),
-        nc = band_color(Band::NotStarted),
     )
 }
 
@@ -308,6 +328,7 @@ fn summary_row(
     <td class="num">{files}</td>
     <td class="num" style="color:{dc}">{d}</td>
     <td class="num" style="color:{pc}">{p}</td>
+    <td class="num" style="color:{rc}">{r}</td>
     <td class="num" style="color:{sc}">{s}</td>
     <td class="num dim">{ns}</td>
     <td class="num {cls}">{sm}/{st} ({smp})</td>
@@ -318,6 +339,8 @@ fn summary_row(
         d = bands.done,
         pc = band_color(Band::Ported),
         p = bands.ported,
+        rc = band_color(Band::Relocated),
+        r = bands.relocated,
         sc = band_color(Band::Started),
         s = bands.started,
         ns = bands.not_started,
@@ -344,11 +367,12 @@ fn multi_pkg_section(pkg: &PackageRollup) -> String {
     )
 }
 
-/// The four-band legend row.
+/// The five-band legend row.
 fn band_legend(b: &BandCounts) -> String {
     [
         (Band::Done, b.done),
         (Band::Ported, b.ported),
+        (Band::Relocated, b.relocated),
         (Band::Started, b.started),
         (Band::NotStarted, b.not_started),
     ]
@@ -449,7 +473,7 @@ fn cards(report: &PortDiffReport) -> String {
 /// The file-band bar + legend panel.
 fn bands_panel(b: &BandCounts, total: usize) -> String {
     bar_legend_panel(
-        r#"File bands <span class="q">DONE = test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span>"#,
+        r#"File bands <span class="q">DONE = test-verified · PORTED ≥ threshold symbols · RELOCATED moved to secondary crate · STARTED some match · NOT-STARTED none</span>"#,
         b,
         total,
         false,
@@ -557,7 +581,7 @@ fn waves_panel(report: &PortDiffReport) -> String {
     <td class="mono">wave {wave}</td>
     <td class="num">{files}</td>
     <td style="min-width:180px">{bar}</td>
-    <td class="num">{d}</td><td class="num">{p}</td>
+    <td class="num">{d}</td><td class="num">{p}</td><td class="num">{r}</td>
     <td class="num">{s}</td><td class="num">{n}</td>
     <td class="num">{sym}</td>
   </tr>"#,
@@ -566,24 +590,22 @@ fn waves_panel(report: &PortDiffReport) -> String {
             bar = band_bar(&w.bands, w.files),
             d = w.bands.done,
             p = w.bands.ported,
+            r = w.bands.relocated,
             s = w.bands.started,
             n = w.bands.not_started,
             sym = pct(w.symbols_pct),
         ));
     }
+    let (dc, pc, rc, sc, nc) = band_header_colors();
     format!(
         r#"<div class="panel">
   <h2>Waves <span class="q">from the source port plan — band mix + symbol coverage per wave</span></h2>
   <table>
-    <thead><tr><th>wave</th><th class="num">files</th><th>band mix</th><th class="num" style="color:{dc}">D</th><th class="num" style="color:{pc}">P</th><th class="num" style="color:{sc}">S</th><th class="num" style="color:{nc}">N</th><th class="num">sym%</th></tr></thead>
+    <thead><tr><th>wave</th><th class="num">files</th><th>band mix</th><th class="num" style="color:{dc}">D</th><th class="num" style="color:{pc}">P</th><th class="num" style="color:{rc}">R</th><th class="num" style="color:{sc}">S</th><th class="num" style="color:{nc}">N</th><th class="num">sym%</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
 </div>
 "#,
-        dc = band_color(Band::Done),
-        pc = band_color(Band::Ported),
-        sc = band_color(Band::Started),
-        nc = band_color(Band::NotStarted),
     )
 }
 

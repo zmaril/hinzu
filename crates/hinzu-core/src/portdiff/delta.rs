@@ -32,14 +32,17 @@ use super::report::{
 };
 
 /// The forward-ordering rank of a band: `NOT-STARTED` (0) `< STARTED` (1) `<
-/// PORTED` (2) `< DONE` (3). A higher rank is "more ported"; a file whose rank
-/// rises has advanced, one whose rank falls has regressed.
+/// RELOCATED` (2) `< PORTED` (3) `< DONE` (4). A higher rank is "more ported"; a
+/// file whose rank rises has advanced, one whose rank falls has regressed.
+/// RELOCATED sits just under PORTED — it is a matched file that moved to a
+/// secondary target crate, so it ranks above STARTED but below an in-place port.
 pub fn band_rank(band: Band) -> u8 {
     match band {
         Band::NotStarted => 0,
         Band::Started => 1,
-        Band::Ported => 2,
-        Band::Done => 3,
+        Band::Relocated => 2,
+        Band::Ported => 3,
+        Band::Done => 4,
     }
 }
 
@@ -97,6 +100,7 @@ pub struct BandTransition {
 pub struct BandNetMovement {
     pub done: i64,
     pub ported: i64,
+    pub relocated: i64,
     pub started: i64,
     pub not_started: i64,
 }
@@ -353,6 +357,7 @@ fn totals_from(files: &[FileDelta], symbols_before: usize, symbols_after: usize)
     let bump = |net: &mut BandNetMovement, band: Band, by: i64| match band {
         Band::Done => net.done += by,
         Band::Ported => net.ported += by,
+        Band::Relocated => net.relocated += by,
         Band::Started => net.started += by,
         Band::NotStarted => net.not_started += by,
     };
