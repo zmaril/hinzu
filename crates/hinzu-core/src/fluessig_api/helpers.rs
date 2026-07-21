@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{FlEnumVariant, FlField, FlType, FlUnionVariant};
+use super::{FlEnumVariant, FlField, FlForeign, FlType, FlUnionVariant};
 
 // ─────────────────────────── string helpers ─────────────────────────────────
 
@@ -204,6 +204,7 @@ pub(super) fn fltype_key(t: &FlType) -> String {
         FlType::List { list } => format!("l[{}]", fltype_key(list)),
         FlType::Nullable { nullable } => format!("n[{}]", fltype_key(nullable)),
         FlType::Union { union } => format!("u:{union}"),
+        FlType::Foreign { foreign } => format!("f:{}", foreign.name),
     }
 }
 
@@ -294,6 +295,85 @@ pub(super) fn is_ident(s: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// The declared generic-parameter NAMES from an item/signature's rendered
+/// generics (`["T", "TSchema extends ZodType", "K = string"]` → `{T, TSchema,
+/// K}`). Each entry's leading identifier is taken, before any ` extends `, `:`,
+/// or ` = ` constraint/default. Non-identifier entries (a Rust lifetime `'a`) are
+/// skipped.
+pub(super) fn generic_names(generics: &[String]) -> BTreeSet<String> {
+    generics
+        .iter()
+        .filter_map(|g| {
+            let head = g.split([' ', ':', '=']).next().unwrap_or("").trim();
+            if is_ident(head) {
+                Some(head.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether a bare name is a **generic type parameter** by its universal spelling:
+/// a single uppercase ASCII letter (`T`, `U`, `K`, `R`). Multi-letter declared
+/// generics (`TSchema`) are recognized from the owning item's generic list
+/// instead (see `Converter::current_generics`), so they need no naming heuristic.
+pub(super) fn is_generic_param(s: &str) -> bool {
+    s.len() == 1 && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// A dotted, module-qualified name (`net.Server`, `NodeJS.ProcessEnv`) → a
+/// [`FlForeign`] opaque-handle payload. `rust_path` maps `a.B` → `a::B`. `None`
+/// unless every dot-separated segment is a plain identifier and there are at
+/// least two of them (so a lone `Foo` or a malformed expression is not opaqued
+/// here — bare builtins go through [`builtin_foreign`]).
+pub(super) fn dotted_foreign(s: &str) -> Option<FlForeign> {
+    if !s.contains('.') {
+        return None;
+    }
+    let segs: Vec<&str> = s.split('.').collect();
+    if segs.len() < 2 || !segs.iter().all(|seg| is_ident(seg)) {
+        return None;
+    }
+    Some(FlForeign {
+        name: s.to_string(),
+        rust_path: segs.join("::"),
+    })
+}
+
+/// A curated allowlist of bare node/DOM/JS builtin type names that render WITHOUT
+/// a module qualifier (`Server`, `ChildProcess`, `AbortSignal`) yet are truly
+/// external — fluessig has no model for them. Maps each to its canonical source
+/// name (a dotted node-module path where one applies) and a best-effort Rust path
+/// for the generated opaque handle. Returns `None` for anything not known to be a
+/// host builtin, so an unknown PascalCase name is presumed **pi-internal** (kept
+/// as honest `Json`) rather than opaqued — the conservative default.
+pub(super) fn builtin_foreign(s: &str) -> Option<FlForeign> {
+    let (name, rust_path) = match s {
+        // node:net — the socket/IPC server & connection. (Orchestrator's
+        // `startIpcServer` returns `Server` imported from `node:net`.)
+        "Server" => ("net.Server", "net::Server"),
+        "Socket" => ("net.Socket", "net::Socket"),
+        // node:child_process
+        "ChildProcess" => ("child_process.ChildProcess", "std::process::Child"),
+        // node:stream
+        "Readable" => ("stream.Readable", "stream::Readable"),
+        "Writable" => ("stream.Writable", "stream::Writable"),
+        "Duplex" => ("stream.Duplex", "stream::Duplex"),
+        // node:fs streams
+        "ReadStream" => ("fs.ReadStream", "fs::ReadStream"),
+        "WriteStream" => ("fs.WriteStream", "fs::WriteStream"),
+        // Web/host globals — rendered bare upstream too (no module qualifier).
+        "AbortSignal" => ("AbortSignal", "AbortSignal"),
+        "AbortController" => ("AbortController", "AbortController"),
+        _ => return None,
+    };
+    Some(FlForeign {
+        name: name.to_string(),
+        rust_path: rust_path.to_string(),
+    })
 }
 
 /// If a type came back `Nullable<T>`, peel it and report that it was nullable
