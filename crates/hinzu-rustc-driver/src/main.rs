@@ -41,6 +41,8 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_public;
 
+mod bodies;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::ControlFlow;
@@ -499,6 +501,10 @@ fn analyze() -> ControlFlow<()> {
     let mut facts = Facts::default();
     let mut seen_root: HashSet<String> = HashSet::new();
     let mut def_ids: HashMap<String, ()> = HashMap::new();
+    // Body-fact extraction (the range-analysis input) is opt-in so the default
+    // effect-fact path and every stable CI job are untouched.
+    let emit_bodies = std::env::var("HINZU_EMIT_BODIES").is_ok();
+    let mut body_facts = bodies::BodyFacts::default();
 
     for item in rustc_public::all_local_items() {
         let name = item.name();
@@ -580,6 +586,11 @@ fn analyze() -> ControlFlow<()> {
 
         let Some(body) = inst.body() else { continue };
         walk_body(&disp, &body, &mut facts, &mut seen_root);
+        if emit_bodies {
+            if let Some(fb) = bodies::lower_body(&disp, &file, line_start, &body) {
+                body_facts.functions.push(fb);
+            }
+        }
     }
 
     let dir = std::env::var("HINZU_FACTS_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -594,6 +605,17 @@ fn analyze() -> ControlFlow<()> {
         facts.edges.len(),
         facts.effect_roots.len(),
     );
+
+    if emit_bodies {
+        let bout = format!("{dir}/bodies-{crate_name}-{}.json", std::process::id());
+        let bjson = serde_json::to_string_pretty(&body_facts).unwrap();
+        let mut bf = std::fs::File::create(&bout).unwrap();
+        bf.write_all(bjson.as_bytes()).unwrap();
+        eprintln!(
+            "[hinzu-rustc-driver] crate={crate_name} bodies={} -> {bout}",
+            body_facts.functions.len(),
+        );
+    }
     ControlFlow::Continue(())
 }
 
