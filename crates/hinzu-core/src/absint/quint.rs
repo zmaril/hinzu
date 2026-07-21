@@ -70,17 +70,17 @@ fn emit_state_vars(out: &mut String, facts: &BodyFacts) {
     for func in &facts.functions {
         let key = fn_key(&func.id);
         for (idx, local) in func.locals.iter().enumerate() {
-            let (ty, todo) = quint_type(local.kind);
+            let (ty, ty_note) = quint_type(local.kind);
             let role = local_role(idx, func.arg_count);
             out.push_str(&format!(
-                "  var {name}: {ty} // {role} of {display} ({file}:{line}){todo}\n",
+                "  var {name}: {ty} // {role} of {display} ({file}:{line}){ty_note}\n",
                 name = var_name(&key, idx),
                 ty = ty,
                 role = role,
                 display = func.display,
                 file = func.file,
                 line = func.line,
-                todo = todo,
+                ty_note = ty_note,
             ));
         }
     }
