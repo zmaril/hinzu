@@ -837,39 +837,59 @@ fn normalize(s: &str) -> String {
         .to_string()
 }
 
+/// Tracks bracket-nesting depth and string-literal state while walking a
+/// rendered type string left to right — the shared spine behind [`split_top`],
+/// [`balanced`], and [`has_top_level_arrow`], which otherwise each repeat the
+/// same depth/quote bookkeeping loop body.
+#[derive(Default)]
+struct Brackets {
+    depth: i32,
+    in_str: Option<char>,
+}
+
+impl Brackets {
+    /// Advance past one char, updating the running depth/string state. Returns
+    /// `true` iff this char is ordinary **top-level content** — outside any
+    /// string literal, at bracket-depth 0, and not itself a bracket or quote —
+    /// i.e. the character stream a splitter/scanner reasons about. Brackets and
+    /// quotes drive the state and return `false`.
+    fn feed(&mut self, c: char) -> bool {
+        if let Some(q) = self.in_str {
+            if c == q {
+                self.in_str = None;
+            }
+            return false;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                self.in_str = Some(c);
+                false
+            }
+            '<' | '(' | '[' | '{' => {
+                self.depth += 1;
+                false
+            }
+            '>' | ')' | ']' | '}' => {
+                self.depth -= 1;
+                false
+            }
+            _ => self.depth == 0,
+        }
+    }
+}
+
 /// Split `s` on a top-level `sep`, respecting `<>`, `()`, `[]`, `{}` nesting and
 /// string literals.
 fn split_top(s: &str, sep: char) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
+    let mut b = Brackets::default();
     let mut cur = String::new();
     for c in s.chars() {
-        if let Some(q) = in_str {
+        if b.feed(c) && c == sep {
+            parts.push(cur.trim().to_string());
+            cur.clear();
+        } else {
             cur.push(c);
-            if c == q {
-                in_str = None;
-            }
-            continue;
-        }
-        match c {
-            '"' | '\'' | '`' => {
-                in_str = Some(c);
-                cur.push(c);
-            }
-            '<' | '(' | '[' | '{' => {
-                depth += 1;
-                cur.push(c);
-            }
-            '>' | ')' | ']' | '}' => {
-                depth -= 1;
-                cur.push(c);
-            }
-            _ if c == sep && depth == 0 => {
-                parts.push(cur.trim().to_string());
-                cur.clear();
-            }
-            _ => cur.push(c),
         }
     }
     if !cur.trim().is_empty() {
@@ -922,49 +942,23 @@ fn strip_array_suffix(s: &str) -> Option<&str> {
 /// Whether every bracket kind is balanced across `s` (so a split/strip did not
 /// cut through a nested generic or tuple).
 fn balanced(s: &str) -> bool {
-    let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
+    let mut b = Brackets::default();
     for c in s.chars() {
-        if let Some(q) = in_str {
-            if c == q {
-                in_str = None;
-            }
-            continue;
-        }
-        match c {
-            '"' | '\'' | '`' => in_str = Some(c),
-            '<' | '(' | '[' | '{' => depth += 1,
-            '>' | ')' | ']' | '}' => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            _ => {}
+        b.feed(c);
+        if b.depth < 0 {
+            return false;
         }
     }
-    depth == 0
+    b.depth == 0
 }
 
 /// A top-level `=>` (a function type), ignoring arrows inside nested brackets.
 fn has_top_level_arrow(s: &str) -> bool {
-    let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
-    let bytes: Vec<char> = s.chars().collect();
-    for i in 0..bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = in_str {
-            if c == q {
-                in_str = None;
-            }
-            continue;
-        }
-        match c {
-            '"' | '\'' | '`' => in_str = Some(c),
-            '<' | '(' | '[' | '{' => depth += 1,
-            '>' | ')' | ']' | '}' => depth -= 1,
-            '=' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == '>' => return true,
-            _ => {}
+    let mut b = Brackets::default();
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if b.feed(c) && c == '=' && chars.get(i + 1) == Some(&'>') {
+            return true;
         }
     }
     false
