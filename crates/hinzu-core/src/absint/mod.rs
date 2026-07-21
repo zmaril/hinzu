@@ -19,10 +19,12 @@
 //! feature is built to prove.
 
 pub mod body;
+mod emit_common;
 pub mod engine;
 pub mod hazards;
 pub mod interval;
 pub mod quint;
+pub mod stateright;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -30,6 +32,7 @@ pub(crate) mod test_support;
 use body::BodyFacts;
 use hazards::{FunctionRanges, Hazard, ParamRange, RangesReport, HINZU_RANGES_VERSION};
 pub use quint::emit_quint;
+pub use stateright::emit_stateright;
 
 /// Analyze every function in a body-fact set and produce the deterministic
 /// ranges-and-hazards report. Pure: no I/O, no ordering dependence — functions
