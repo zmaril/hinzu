@@ -213,6 +213,11 @@ pub struct Stats {
     pub enums_emitted: usize,
     pub interfaces_emitted: usize,
     pub unions_synthesized: usize,
+    /// Of `unions_synthesized`, how many were *lifted* from a top-level union /
+    /// indexed-access `typeAlias` (rather than synthesized from an anonymous
+    /// inline union). These are named for their alias so field/param/return refs
+    /// resolve to them instead of degrading to `Json`.
+    pub unions_lifted: usize,
     pub ops_total: usize,
     pub ops_clean: usize,
     pub ops_degraded: usize,
@@ -253,6 +258,14 @@ pub struct FluessigOutput {
 struct Converter {
     known_enums: BTreeSet<String>,
     known_models: BTreeSet<String>,
+    /// Names of top-level `typeAlias` targets lifted into named unions (a union
+    /// of named types, or an `X[keyof X]` indexed-access expansion). A bare ref
+    /// to one of these resolves to a `Union` rather than degrading to `Json`.
+    known_unions: BTreeSet<String>,
+    /// The value types of each known interface/record, keyed by model name —
+    /// the raw field type-strings, in declaration order. Feeds `X[keyof X]`
+    /// indexed-access expansion (the union over a map's value types).
+    indexable: BTreeMap<String, Vec<String>>,
     unions: BTreeMap<String, FlUnion>,
     reasons: BTreeMap<String, usize>,
     notes: BTreeMap<String, usize>,
@@ -290,6 +303,8 @@ impl Converter {
         Converter {
             known_enums,
             known_models,
+            known_unions: BTreeSet::new(),
+            indexable: BTreeMap::new(),
             unions: BTreeMap::new(),
             reasons: BTreeMap::new(),
             notes: BTreeMap::new(),
@@ -431,6 +446,11 @@ impl Converter {
                 model: s.to_string(),
             });
         }
+        if self.known_unions.contains(s) {
+            return Parsed::clean(FlType::Union {
+                union: s.to_string(),
+            });
+        }
         // An unresolved PascalCase name: a type we can see referenced but whose
         // definition never made it into the surface (external, a class handle, a
         // dropped alias). Honest fallback: Json.
@@ -491,14 +511,7 @@ impl Converter {
         for m in members {
             let (ty, label) = self.union_member(m, &mut degraded);
             name_parts.push(pascal(&label));
-            let mut tag = camel(&label);
-            let mut i = 2;
-            while seen_tags.contains(&tag) {
-                tag = format!("{}{i}", camel(&label));
-                i += 1;
-            }
-            seen_tags.insert(tag.clone());
-            variants.push(FlUnionVariant { tag, ty });
+            push_unique_variant(&mut variants, &mut seen_tags, &label, ty);
         }
         let name = format!("{}Union", name_parts.join("Or"));
         self.unions.entry(name.clone()).or_insert(FlUnion {
@@ -538,11 +551,45 @@ impl Converter {
         if p.degraded {
             *degraded = true;
         }
-        let label = match &p.ty {
-            FlType::Scalar(s) => s.clone(),
-            _ => "member".to_string(),
-        };
+        let label = structural_label(&p.ty);
         (p.ty, label)
+    }
+
+    /// Lift a top-level union / indexed-access `typeAlias` into a **named** union
+    /// registered under the alias's own name (so `field: OrchestratorRequest`
+    /// resolves to `Union { union: "OrchestratorRequest" }`). `members` is the
+    /// flattened member list from [`expand_alias_union_members`] — each recurses
+    /// through [`parse_type`], so an in-package model/enum/lifted-union member
+    /// resolves and a sibling-package member degrades to `Json` (counted),
+    /// while its source name is kept as the variant tag. Returns whether a new
+    /// union was registered (a duplicate name is a no-op).
+    fn lift_alias_union(&mut self, name: &str, members: &[String]) -> bool {
+        if self.unions.contains_key(name) {
+            return false;
+        }
+        let mut variants: Vec<FlUnionVariant> = Vec::new();
+        let mut seen_tags: BTreeSet<String> = BTreeSet::new();
+        for m in members {
+            let t = m.trim();
+            let parsed = self.parse_type(t);
+            // Keep the member's source ident as the tag label even when the type
+            // degrades to `Json`, so tags stay readable (`rpcCommand`) rather than
+            // collapsing to `json`.
+            let label = if is_ident(t) {
+                t.to_string()
+            } else {
+                structural_label(&parsed.ty)
+            };
+            push_unique_variant(&mut variants, &mut seen_tags, &label, parsed.ty);
+        }
+        self.unions.insert(
+            name.to_string(),
+            FlUnion {
+                name: name.to_string(),
+                variants,
+            },
+        );
+        true
     }
 
     /// An inline/anonymous object literal `{ a: T; b?: U }` → a **minted**,
@@ -664,10 +711,16 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
     let mut catalog_enums: Vec<FlEnum> = Vec::new();
     let mut known_enums = BTreeSet::new();
     let mut known_models = BTreeSet::new();
+    // The value types of each interface/record, for `X[keyof X]` expansion.
+    let mut indexable: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for it in &items {
         match it.kind.as_str() {
             "interface" | "record" => {
                 known_models.insert(it.name.clone());
+                indexable.insert(
+                    it.name.clone(),
+                    it.fields.iter().map(|f| f.ty.clone()).collect(),
+                );
             }
             "enum" => {
                 known_enums.insert(it.name.clone());
@@ -696,7 +749,22 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
         }
     }
 
+    // Resolution sub-pass: recognize which top-level union / indexed-access
+    // aliases will lift, so refs to them (from any item, in any order) resolve to
+    // a `Union` in pass 2. String-literal-union aliases are already enums above.
+    let mut known_unions = BTreeSet::new();
+    for it in &items {
+        if it.kind == "typeAlias"
+            && !known_enums.contains(&it.name)
+            && expand_alias_union_members(it.alias_target.as_deref(), &indexable).is_some()
+        {
+            known_unions.insert(it.name.clone());
+        }
+    }
+
     let mut conv = Converter::new(known_enums, known_models);
+    conv.known_unions = known_unions;
+    conv.indexable = indexable;
 
     // Pass 2 — models, interfaces, and free-function ops.
     let mut models: Vec<FlModel> = Vec::new();
@@ -720,6 +788,18 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
             "enum" | "typeAlias" | "const" | "namespace" | "trait" | "struct" => {
                 // enum/typeAlias were consumed in pass 1 (or dropped as non-union);
                 // the rest have no op/model home in this spike.
+                if it.kind == "typeAlias" && conv.known_unions.contains(&it.name) {
+                    // A top-level union / indexed-access alias: lift it into a
+                    // named union rather than dropping it.
+                    if let Some(members) =
+                        expand_alias_union_members(it.alias_target.as_deref(), &conv.indexable)
+                    {
+                        if conv.lift_alias_union(&it.name, &members) {
+                            stats.unions_lifted += 1;
+                        }
+                    }
+                    continue;
+                }
                 let reason = match it.kind.as_str() {
                     "typeAlias" if conv.known_enums.contains(&it.name) => continue,
                     "enum" => continue,
@@ -1223,6 +1303,80 @@ fn string_literal_union(alias: Option<&str>) -> Option<Vec<FlEnumVariant>> {
     )
 }
 
+/// Classify a top-level `typeAlias` target as a **liftable** union and, if so,
+/// return its flattened member type-strings. Liftable shapes:
+///
+/// * a union of named types (`RpcCommand | RpcExtensionUIResponse`), and
+/// * an `X[keyof X]` indexed-access — expanded to the value types of `X`'s
+///   members when `X` is a known interface/record — optionally unioned with
+///   extra members (`ResponseMap[keyof ResponseMap] | ErrorResponse`).
+///
+/// Returns `None` (leaving the alias dropped) for: a conditional/generic target
+/// (`T extends … infer …`), a bare single alias (`type A = B`), an
+/// all-string-literal union (that's the catalog-enum path, handled in pass 1),
+/// or an indexed access whose base is not a known model (degrade gracefully).
+///
+/// NOTE: this parses the rendered `alias_target` **string** — the shape the
+/// ApiReport carries today. A later pass (structured type refs) will have hinzu
+/// emit structured members and retire this string parsing.
+fn expand_alias_union_members(
+    target: Option<&str>,
+    indexable: &BTreeMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    let s = normalize(target?);
+    // A conditional / `infer` / generic-constraint target is irreducible here.
+    if s.contains(" extends ") || s.contains("infer ") {
+        return None;
+    }
+    let top = split_top(&s, '|');
+    if top.is_empty() {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut expanded_indexed = false;
+    for member in &top {
+        let m = member.trim();
+        if let Some(base) = indexed_access_base(m) {
+            // `X[keyof X]` → the value types of X's members (or ungraceful drop
+            // when X is not a known interface/record).
+            let values = indexable.get(base)?;
+            out.extend(values.iter().cloned());
+            expanded_indexed = true;
+        } else {
+            out.push(m.to_string());
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    // Liftable iff we expanded an indexed access, or it is a genuine multi-member
+    // union (a single bare alias like `type A = B` is a different gap).
+    if expanded_indexed || top.len() >= 2 {
+        // Do not steal the string-literal-union → catalog-enum path.
+        if out.iter().all(|m| is_string_literal(m.trim())) {
+            return None;
+        }
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Recognize an `X[keyof X]` indexed-access expression and return its base `X`
+/// (the map type whose value types the access enumerates). `None` for any other
+/// shape, including `X[K]` with a specific key or a mismatched `X[keyof Y]`.
+fn indexed_access_base(s: &str) -> Option<&str> {
+    let open = s.find('[')?;
+    let inner = s.get(open + 1..)?.strip_suffix(']')?;
+    let base = s[..open].trim();
+    let key = inner.trim().strip_prefix("keyof ")?.trim();
+    if is_ident(base) && key == base {
+        Some(base)
+    } else {
+        None
+    }
+}
+
 /// The flat interface name for a package's free functions: PascalCase of the
 /// last path segment of the package name (`@earendil-works/pi-orchestrator` →
 /// `PiOrchestrator`).
@@ -1248,6 +1402,35 @@ fn pascal(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Push a union variant with a collision-free camelCase tag derived from
+/// `label` (disambiguating against `seen` with a numeric suffix). The shared
+/// tail of both union builders ([`Converter::synthesize_union`] for anonymous
+/// inline unions and [`Converter::lift_alias_union`] for named alias unions).
+fn push_unique_variant(
+    variants: &mut Vec<FlUnionVariant>,
+    seen: &mut BTreeSet<String>,
+    label: &str,
+    ty: FlType,
+) {
+    let mut tag = camel(label);
+    let mut i = 2;
+    while seen.contains(&tag) {
+        tag = format!("{}{i}", camel(label));
+        i += 1;
+    }
+    seen.insert(tag.clone());
+    variants.push(FlUnionVariant { tag, ty });
+}
+
+/// A generic label for a structural (non-ident) union member: its scalar name,
+/// else `"member"`. Used to name/tag a union built from such a member.
+fn structural_label(ty: &FlType) -> String {
+    match ty {
+        FlType::Scalar(s) => s.clone(),
+        _ => "member".to_string(),
+    }
 }
 
 /// camelCase from a label (PascalCase with a lowercased first char).
