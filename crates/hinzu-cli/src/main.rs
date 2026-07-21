@@ -1,6 +1,7 @@
 //! The hinzu CLI. A thin shell: parse argv, hand off to hinzu-core.
 
 mod adapter_harness;
+mod api_fluessig;
 mod api_py;
 mod api_rust;
 mod api_ts;
@@ -84,6 +85,14 @@ enum Cmd {
     /// Bodies come from `--bodies <json>` (no toolchain) or a live StableMIR
     /// extraction, exactly like `hinzu ranges`.
     Model(body_cmd::ModelArgs),
+    /// Convert a hinzu API report (from `hinzu api`) into the `api.json` +
+    /// `catalog.json` pair the `fluessig` binding generator consumes, so a
+    /// package's extracted public surface can drive generated bindings (a Rust
+    /// trait skeleton, and the per-language surfaces built over it). Renders the
+    /// report's string-typed signatures into fluessig's structured op/DTO IR,
+    /// degrading honestly (an unmodelable type falls back to `Json`) and writing
+    /// a coverage-stats sidecar so the lossy edges are visible, not silent.
+    ApiFluessig(ApiFluessigArgs),
 }
 
 #[derive(Parser)]
@@ -272,6 +281,23 @@ struct ApiArgs {
     lang: Option<String>,
 }
 
+#[derive(Parser)]
+struct ApiFluessigArgs {
+    /// The hinzu API report JSON (from `hinzu api --out`).
+    report: PathBuf,
+    /// Where to write the fluessig `api.json` (op layer + DTO models + unions).
+    #[arg(long)]
+    out_api: PathBuf,
+    /// Where to write the fluessig `catalog.json` (its `enums` are load-bearing;
+    /// the other arrays are empty — DTO models live in `api.json`).
+    #[arg(long)]
+    out_catalog: PathBuf,
+    /// Where to write the JSON coverage-stats sidecar. Off by default; the human
+    /// summary always prints to stderr.
+    #[arg(long)]
+    out_stats: Option<PathBuf>,
+}
+
 /// Which propagation engine `hinzu check` runs. Both produce the same effect
 /// sets; `dbsp` is the incremental-capable engine, `naive` the reference BFS.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -333,7 +359,24 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
+        Cmd::ApiFluessig(args) => match api_fluessig_cmd(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
     }
+}
+
+/// The `hinzu api-fluessig` flow: read a report, convert, write the two docs,
+/// and print the coverage summary to stderr.
+fn api_fluessig_cmd(args: ApiFluessigArgs) -> Result<ExitCode> {
+    let stats = api_fluessig::run(
+        &args.report,
+        &args.out_api,
+        &args.out_catalog,
+        args.out_stats.as_deref(),
+    )?;
+    eprint!("{}", api_fluessig::summary(&stats));
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Print an error to stderr and exit non-zero.
