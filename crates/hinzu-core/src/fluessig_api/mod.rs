@@ -143,16 +143,46 @@ pub struct FlParam {
 
 /// The structured type fluessig understands. Serializes with the exact
 /// `#[serde(untagged)]` shape of fluessig's `ApiType`: a bare scalar string, or
-/// a single-key object for model/enum/list/nullable/union.
+/// a single-key object for model/enum/list/nullable/union/foreign.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum FlType {
     Scalar(String),
-    Model { model: String },
-    Enum { r#enum: String },
-    List { list: Box<FlType> },
-    Nullable { nullable: Box<FlType> },
-    Union { union: String },
+    Model {
+        model: String,
+    },
+    Enum {
+        r#enum: String,
+    },
+    List {
+        list: Box<FlType>,
+    },
+    Nullable {
+        nullable: Box<FlType>,
+    },
+    Union {
+        union: String,
+    },
+    /// A truly-foreign type — an external/host value the surface references but
+    /// fluessig has no model for (Node's `net.Server`, a `ChildProcess`, an
+    /// `AbortSignal`). Rather than silently collapsing it to `Json`, it carries a
+    /// [`FlForeign`] so fluessig lowers it to a typed **opaque handle**. Serializes
+    /// as `{"foreign":{"name":"…","rustPath":"…"}}`, the exact wire shape of
+    /// fluessig's `ApiType::Foreign` (see `ForeignType`).
+    Foreign {
+        foreign: FlForeign,
+    },
+}
+
+/// The payload of an [`FlType::Foreign`]: the source type `name` (e.g.
+/// `net.Server`, `ChildProcess`) and a best-effort `rust_path` label for the
+/// generated opaque handle. Mirrors fluessig's `ForeignType`: `rust_path`
+/// serializes as `rustPath`, so the object reads as a single `foreign` key.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlForeign {
+    pub name: String,
+    #[serde(rename = "rustPath")]
+    pub rust_path: String,
 }
 
 impl FlType {
@@ -234,6 +264,27 @@ pub struct Stats {
     pub params_total: usize,
     pub params_degraded: usize,
     pub returns_degraded: usize,
+    /// How many type references were emitted as `Foreign` opaque handles instead
+    /// of degrading to `Json` — the truly-external refs recovered by the
+    /// opaque-handle policy.
+    pub foreign_emitted: usize,
+    /// The distinct truly-external types emitted as `Foreign`, keyed by source
+    /// name, valued by reference count. These no longer count as `unresolved type
+    /// reference`.
+    pub foreign_types: BTreeMap<String, usize>,
+    /// Unresolved refs kept as honest `Json` because they are **pi-internal**
+    /// types that are simply not in the current `--context` set — keyed by ref
+    /// name, valued by reference count. Each is resolvable by adding the defining
+    /// package to `--context`; not misrepresented as external.
+    pub context_expandable: BTreeMap<String, usize>,
+    /// Unresolved refs naming an **in-scope item with no DTO form** — a `class`
+    /// handle, a dropped non-union alias (keyed by ref name, valued by reference
+    /// count). Kept as honest `Json`; adding a `--context` package cannot help, so
+    /// these are reported apart from [`context_expandable`](Self::context_expandable).
+    pub unmodeled_refs: BTreeMap<String, usize>,
+    /// Unresolved refs left as `Json` because they are **generic type parameters**
+    /// (`T`, a declared generic of the owning item) — no external handle applies.
+    pub generic_params: BTreeMap<String, usize>,
     /// Items dropped with no fluessig home, keyed by a human reason.
     pub dropped: BTreeMap<String, usize>,
     /// Every type-string the parser could not model, keyed by cause. The sum is
@@ -293,6 +344,23 @@ struct Converter {
     /// Context type names actually referenced (transitively) by the emitted
     /// surface — the worklist driving scoped cross-package emission.
     needed: BTreeSet<String>,
+    /// Truly-external refs emitted as `Foreign` opaque handles (name → refcount).
+    foreign_types: BTreeMap<String, usize>,
+    /// Pi-internal refs kept as `Json` because they are not in the current
+    /// `--context` set (name → refcount) — resolvable by adding their package.
+    context_expandable: BTreeMap<String, usize>,
+    /// Refs naming an in-scope item with no DTO form — a `class` handle, a dropped
+    /// alias (name → refcount). Kept as `Json`; NOT a context gap.
+    unmodeled_refs: BTreeMap<String, usize>,
+    /// Names declared in some report but resolving to no model/enum/union (class,
+    /// dropped alias, const) — the lookup behind [`unmodeled_refs`].
+    known_nonmodel: BTreeSet<String>,
+    /// Generic-type-parameter refs kept as `Json` (name → refcount).
+    generic_params: BTreeMap<String, usize>,
+    /// The declared generic parameters of the item currently being parsed (`T`,
+    /// `TSchema`), so a bare ref to one is recognized as a generic rather than an
+    /// unresolved external. Set around each item's fields/signature, then cleared.
+    current_generics: BTreeSet<String>,
 }
 
 /// The outcome of parsing one rendered type string.
@@ -329,6 +397,12 @@ impl Converter {
             name_hint: Vec::new(),
             context_names: BTreeSet::new(),
             needed: BTreeSet::new(),
+            foreign_types: BTreeMap::new(),
+            context_expandable: BTreeMap::new(),
+            unmodeled_refs: BTreeMap::new(),
+            known_nonmodel: BTreeSet::new(),
+            generic_params: BTreeMap::new(),
+            current_generics: BTreeSet::new(),
         }
     }
 
@@ -461,6 +535,12 @@ impl Converter {
                 _ => return self.degrade("unmodeled generic type"),
             }
         }
+        // A dotted, module-qualified name (`net.Server`, `NodeJS.ProcessEnv`) is
+        // never a fluessig model — it is a truly-external host type. Emit a
+        // `Foreign` opaque handle rather than an `unparsable type expression`.
+        if let Some(foreign) = dotted_foreign(s) {
+            return self.emit_foreign(s, foreign);
+        }
         if !is_ident(s) {
             return self.degrade("unparsable type expression");
         }
@@ -482,10 +562,48 @@ impl Converter {
                 union: s.to_string(),
             });
         }
-        // An unresolved PascalCase name: a type we can see referenced but whose
-        // definition never made it into the surface (external, a class handle, a
-        // dropped alias). Honest fallback: Json.
+        // An unresolved bare name. The opaque-handle policy sorts it into three
+        // honest buckets (see [`Converter::resolve_unresolved`]): a generic type
+        // parameter, a truly-external type (→ `Foreign`), or a pi-internal type
+        // merely absent from the current `--context` set (→ honest `Json`).
+        self.resolve_unresolved(s)
+    }
+
+    /// Classify an unresolved bare PascalCase-ish name under the opaque-handle
+    /// policy. Order matters: generics first (never opaqued), then the
+    /// external/builtin allowlist (→ `Foreign`), else it is presumed pi-internal
+    /// and kept as honest `Json` — the conservative default, so a pi type is never
+    /// misrepresented as external.
+    fn resolve_unresolved(&mut self, s: &str) -> Parsed {
+        if self.current_generics.contains(s) || is_generic_param(s) {
+            // A generic type parameter has no external handle — keep the current
+            // `Json` fallback, recorded so the residual is legible.
+            Stats::bump(&mut self.generic_params, s);
+            return self.degrade("unresolved type reference");
+        }
+        if let Some(foreign) = builtin_foreign(s) {
+            return self.emit_foreign(s, foreign);
+        }
+        if self.known_nonmodel.contains(s) {
+            // Declared in scope but with no DTO form (a `class` handle, a dropped
+            // alias) — honest `Json`, but NOT a context gap; adding a package would
+            // not help. Recorded separately so the residual is not misreported.
+            Stats::bump(&mut self.unmodeled_refs, s);
+            return self.degrade("unresolved type reference");
+        }
+        // Presumed pi-internal, just not in the current `--context` set. Honest
+        // `Json` (not opaqued), recorded so the summary can point at the package
+        // to add — never misrepresented as external.
+        Stats::bump(&mut self.context_expandable, s);
         self.degrade("unresolved type reference")
+    }
+
+    /// Emit a `Foreign` opaque handle for a truly-external ref, counting it under
+    /// `foreign_types` (and, at fold time, `foreign_emitted`). Not a degradation:
+    /// the type is faithfully carried as a typed handle rather than a `Json` blob.
+    fn emit_foreign(&mut self, seen_as: &str, foreign: FlForeign) -> Parsed {
+        Stats::bump(&mut self.foreign_types, seen_as);
+        Parsed::clean(FlType::Foreign { foreign })
     }
 
     /// A multi-member top-level union. Null/undefined members make it nullable;
@@ -862,10 +980,25 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
         }
     }
 
+    // Names that ARE declared (in the primary or a context report) but resolve to
+    // no DTO/enum/union — a `class` (its op surface, not a data model), a dropped
+    // non-union alias, a const. A ref to one is honestly unresolved but is NOT a
+    // context gap (adding a package cannot help — it is in scope, just not a
+    // model), so it is reported separately from the pi-internal-not-in-context set.
+    let mut known_nonmodel: BTreeSet<String> = items
+        .iter()
+        .chain(ctx_items.iter())
+        .map(|it| it.name.clone())
+        .collect();
+    known_nonmodel.retain(|n| {
+        !known_models.contains(n) && !known_enums.contains(n) && !known_unions.contains(n)
+    });
+
     let mut conv = Converter::new(known_enums, known_models);
     conv.known_unions = known_unions;
     conv.indexable = indexable;
     conv.context_names = context_names;
+    conv.known_nonmodel = known_nonmodel;
 
     // Pass 2 — models, interfaces, and free-function ops.
     let mut models: Vec<FlModel> = Vec::new();
@@ -988,6 +1121,11 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     stats.unions_synthesized = unions.len();
     stats.degradation_reasons = conv.reasons;
     stats.notes = conv.notes;
+    stats.foreign_emitted = conv.foreign_types.values().sum();
+    stats.foreign_types = conv.foreign_types;
+    stats.context_expandable = conv.context_expandable;
+    stats.unmodeled_refs = conv.unmodeled_refs;
+    stats.generic_params = conv.generic_params;
 
     let source = Some(format!("{} (via hinzu api-fluessig)", report.package.name));
     let api = FlApiDoc {
@@ -1032,6 +1170,7 @@ fn enum_from_item(it: &ApiItem) -> FlEnum {
 
 /// Build a DTO model from an `interface`/`record` item, tallying degraded fields.
 fn build_model(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> FlModel {
+    conv.current_generics = generic_names(&it.generics);
     let mut fields = Vec::new();
     for f in &it.fields {
         // A method-shaped field on an interface (a rendered function type) has no
@@ -1055,6 +1194,7 @@ fn build_model(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> FlModel
             nullable: f.optional || was_nullable,
         });
     }
+    conv.current_generics.clear();
     FlModel {
         name: it.name.clone(),
         doc: it.doc.clone(),
@@ -1101,6 +1241,10 @@ fn build_class_interface(
 fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlOp> {
     let sig = it.signature.as_ref()?;
     stats.ops_total += 1;
+    // The op's own generics plus the owning item's — either can spell a bare
+    // type-param ref (`T`, `TParams`) in a param/return position.
+    conv.current_generics = generic_names(&it.generics);
+    conv.current_generics.extend(generic_names(&sig.generics));
     let mut degraded = false;
 
     // Return type: unwrap Promise (→ async) and Async{Iterable,Generator} (→ stream).
@@ -1165,6 +1309,7 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
         });
     }
 
+    conv.current_generics.clear();
     if degraded {
         stats.ops_degraded += 1;
     } else {

@@ -87,6 +87,38 @@ pub fn summary(stats: &Stats) -> String {
         stats.params_degraded,
         stats.returns_degraded,
     ));
+    if stats.foreign_emitted > 0 {
+        s.push_str(&format!(
+            "  foreign opaque handles: {} reference(s) across {} external type(s) (was Json)\n",
+            stats.foreign_emitted,
+            stats.foreign_types.len(),
+        ));
+        for (k, n) in &stats.foreign_types {
+            s.push_str(&format!("    {n:>3}  {k}\n"));
+        }
+    }
+    if !stats.context_expandable.is_empty() {
+        let refs: usize = stats.context_expandable.values().sum();
+        s.push_str(&format!(
+            "  pi-internal, kept as honest Json ({} ref(s), {} type(s)) — resolvable by adding the defining package to --context:\n",
+            refs,
+            stats.context_expandable.len(),
+        ));
+        for (k, n) in &stats.context_expandable {
+            s.push_str(&format!("    {n:>3}  {k}\n"));
+        }
+    }
+    if !stats.unmodeled_refs.is_empty() {
+        let refs: usize = stats.unmodeled_refs.values().sum();
+        s.push_str(&format!(
+            "  in-scope but no DTO form ({} ref(s), {} type(s)) — a class handle / dropped alias, kept as honest Json (not a context gap):\n",
+            refs,
+            stats.unmodeled_refs.len(),
+        ));
+        for (k, n) in &stats.unmodeled_refs {
+            s.push_str(&format!("    {n:>3}  {k}\n"));
+        }
+    }
     if !stats.dropped.is_empty() {
         s.push_str("  dropped items:\n");
         for (k, n) in &stats.dropped {

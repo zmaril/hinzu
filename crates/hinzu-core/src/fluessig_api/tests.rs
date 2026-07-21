@@ -863,6 +863,167 @@ fn no_context_is_backward_compatible() {
     assert_eq!(out_irrelevant.stats.context_types_pulled, 0);
 }
 
+// ───────────────────── foreign opaque-handle policy ─────────────────────────
+
+/// The `Foreign` variant serializes to fluessig's EXACT wire shape — a single
+/// `foreign` key over `{name, rustPath}` — so the converter's output round-trips
+/// through fluessig's `ApiType::Foreign` serde.
+#[test]
+fn foreign_serializes_to_exact_wire_shape() {
+    let ty = FlType::Foreign {
+        foreign: FlForeign {
+            name: "http.Server".to_string(),
+            rust_path: "http::Server".to_string(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&ty).unwrap(),
+        r#"{"foreign":{"name":"http.Server","rustPath":"http::Server"}}"#
+    );
+}
+
+/// A truly-external DOTTED builtin path (`http.Server`) → `Foreign`, with the
+/// `rust_path` mapping `.` → `::`. Not a degradation.
+#[test]
+fn dotted_builtin_ref_emits_foreign_with_colon_path() {
+    let mut c = conv();
+    let p = c.parse_type("http.Server");
+    assert_eq!(
+        p.ty,
+        FlType::Foreign {
+            foreign: FlForeign {
+                name: "http.Server".to_string(),
+                rust_path: "http::Server".to_string(),
+            }
+        }
+    );
+    assert!(
+        !p.degraded,
+        "a Foreign handle is faithful, not a Json fallback"
+    );
+    assert_eq!(c.foreign_types.get("http.Server"), Some(&1));
+    // It is NOT counted as an unresolved reference.
+    assert_eq!(c.reasons.get("unresolved type reference"), None);
+    assert_eq!(c.reasons.get("unparsable type expression"), None);
+}
+
+/// A bare truly-external builtin name on the allowlist (`Server`, imported from
+/// `node:net`) → `Foreign`, mapped to its canonical dotted source name/path.
+#[test]
+fn bare_builtin_ref_emits_foreign() {
+    let mut c = conv();
+    let p = c.parse_type("Server");
+    assert_eq!(
+        p.ty,
+        FlType::Foreign {
+            foreign: FlForeign {
+                name: "net.Server".to_string(),
+                rust_path: "net::Server".to_string(),
+            }
+        }
+    );
+    assert!(!p.degraded);
+    assert_eq!(c.foreign_types.get("Server"), Some(&1));
+}
+
+/// A generic type parameter (`T`, or a declared generic of the owning item) is
+/// NEVER opaqued — it stays the honest `Json` fallback and is recorded under
+/// `generic_params`, not `foreign_types`.
+#[test]
+fn generic_type_param_stays_non_foreign() {
+    // A single-letter param.
+    let mut c = conv();
+    let p = c.parse_type("T");
+    assert_eq!(p.ty, FlType::json());
+    assert!(p.degraded);
+    assert_eq!(c.generic_params.get("T"), Some(&1));
+    assert!(c.foreign_types.is_empty());
+
+    // A multi-letter declared generic of the owning item (`TSchema`).
+    let mut c2 = conv();
+    c2.current_generics.insert("TSchema".to_string());
+    let p2 = c2.parse_type("TSchema");
+    assert_eq!(p2.ty, FlType::json());
+    assert_eq!(c2.generic_params.get("TSchema"), Some(&1));
+    assert!(c2.foreign_types.is_empty());
+}
+
+/// A pi-internal type merely absent from the current `--context` set is kept as
+/// honest `Json` and recorded under `context_expandable` — NOT opaqued as
+/// external (never misrepresented) and NOT a generic.
+#[test]
+fn pi_internal_not_in_context_stays_json_not_foreign() {
+    let mut c = conv();
+    let p = c.parse_type("ImageContent");
+    assert_eq!(p.ty, FlType::json());
+    assert!(p.degraded);
+    assert_eq!(c.context_expandable.get("ImageContent"), Some(&1));
+    assert!(c.foreign_types.is_empty());
+    assert!(c.generic_params.is_empty());
+}
+
+/// End-to-end: an op returning a truly-external type emits a `Foreign` return
+/// (the `startIpcServer` → `Server` case), the op counts as CLEAN, and the stats
+/// carry `foreign_emitted` while `Server` no longer counts as unresolved.
+#[test]
+fn foreign_return_flips_op_clean_end_to_end() {
+    let func = {
+        let mut it = ApiItem::new("function", "m#startIpcServer", "startIpcServer", "m");
+        it.signature = Some(Signature {
+            params: vec![],
+            return_type: Some("Promise<Server>".to_string()),
+            is_async: true,
+            receiver: None,
+            error_type: None,
+            generics: vec![],
+        });
+        it
+    };
+    let out = build_fluessig(&demo_report(vec![func]), &[]);
+
+    let iface = &out.api.interfaces[0];
+    let op = iface
+        .ops
+        .iter()
+        .find(|o| o.name == "startIpcServer")
+        .unwrap();
+    assert_eq!(
+        op.returns,
+        FlType::Foreign {
+            foreign: FlForeign {
+                name: "net.Server".to_string(),
+                rust_path: "net::Server".to_string(),
+            }
+        }
+    );
+    assert_eq!(out.stats.foreign_emitted, 1);
+    assert_eq!(out.stats.foreign_types.get("Server"), Some(&1));
+    assert_eq!(out.stats.ops_clean, 1);
+    assert_eq!(out.stats.ops_degraded, 0);
+    assert_eq!(
+        out.stats
+            .degradation_reasons
+            .get("unresolved type reference"),
+        None
+    );
+}
+
+/// An in-scope `class` used as a value type has no DTO form: it stays honest
+/// `Json` under `unmodeled_refs`, NOT `context_expandable` (adding a package
+/// cannot help) and NOT `Foreign` (it is pi-internal, not external).
+#[test]
+fn in_scope_class_ref_is_unmodeled_not_context_gap() {
+    let holder = field_ref_model("Holder", "RpcProcessInstance");
+    let class = ApiItem::new("class", "m#RpcProcessInstance", "RpcProcessInstance", "m");
+    let out = build_fluessig(&demo_report(vec![holder, class]), &[]);
+
+    let h = out.api.models.iter().find(|m| m.name == "Holder").unwrap();
+    assert_eq!(h.fields[0].ty, FlType::json());
+    assert_eq!(out.stats.unmodeled_refs.get("RpcProcessInstance"), Some(&1));
+    assert_eq!(out.stats.context_expandable.get("RpcProcessInstance"), None);
+    assert!(out.stats.foreign_types.is_empty());
+}
+
 #[test]
 fn unused_variant_field_is_ignored() {
     // Guard: Variant is imported for completeness of the api surface but the
