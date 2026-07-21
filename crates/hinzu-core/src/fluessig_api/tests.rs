@@ -350,9 +350,16 @@ fn build_fluessig_end_to_end() {
         });
         it
     };
-    let dropped_const = ApiItem::new("const", "m#VERSION", "VERSION", "m");
+    // A `string` const whose value is a RUNTIME expression: it is emitted into
+    // `consts[]` (no longer dropped) but carries no `value`.
+    let version_const = {
+        let mut it = ApiItem::new("const", "m#VERSION", "VERSION", "m");
+        it.const_type = Some("string".to_string());
+        it.const_value = Some("pkg.version || \"0.0.0\"".to_string());
+        it
+    };
 
-    let report = demo_report(vec![iface, alias, func, class, method, dropped_const]);
+    let report = demo_report(vec![iface, alias, func, class, method, version_const]);
 
     let out = build_fluessig(&report, &[]);
 
@@ -392,17 +399,25 @@ fn build_fluessig_end_to_end() {
         }
     );
 
-    // Coverage: const dropped, both ops clean.
+    // Coverage: the const is emitted (not dropped), both ops clean.
     assert_eq!(out.stats.items_in, 6);
     assert_eq!(out.stats.ops_total, 2);
     assert_eq!(out.stats.ops_clean, 2);
-    assert_eq!(out.stats.dropped.get("const dropped"), Some(&1));
+    assert_eq!(out.stats.consts_emitted, 1);
+    assert_eq!(out.stats.dropped.get("const dropped"), None);
+    assert_eq!(out.api.consts.len(), 1);
+    assert_eq!(out.api.consts[0].name, "VERSION");
+    assert_eq!(out.api.consts[0].ty, scalar("string"));
+    // A runtime expression carries no statically-known value.
+    assert_eq!(out.api.consts[0].value, None);
 
     // The api.json serializes with the untagged FlType shape fluessig reads.
     let json = serde_json::to_string(&out.api).unwrap();
     assert!(json.contains("\"enum\":\"InstanceStatus\""));
     assert!(json.contains("\"model\":\"Summary\""));
     assert!(json.contains("\"async\":true"));
+    // The const rides in a `consts[]` array with a bare-scalar `type` and no value.
+    assert!(json.contains("\"consts\":[{\"name\":\"VERSION\",\"type\":\"string\"}]"));
 }
 
 #[test]
@@ -1035,4 +1050,136 @@ fn unused_variant_field_is_ignored() {
         doc: None,
     };
     assert_eq!(v.discriminant.as_deref(), Some("1"));
+}
+
+// ─────────────────────────── exported consts ────────────────────────────────
+
+/// A `const` item with the given TS type / raw value expression.
+fn const_item(name: &str, ty: Option<&str>, value: Option<&str>) -> ApiItem {
+    let mut it = ApiItem::new("const", &format!("m#{name}"), name, "m");
+    it.const_type = ty.map(str::to_string);
+    it.const_value = value.map(str::to_string);
+    it
+}
+
+/// A string const whose value is a SIMPLE literal → an `FlConst` carrying the
+/// unquoted string, with `type: "string"` and a real `value` (the literal-value
+/// path that round-trips downstream to a `pub const`).
+#[test]
+fn string_const_with_literal_value_is_emitted_with_value() {
+    let out = build_fluessig(
+        &demo_report(vec![const_item("GREETING", Some("string"), Some("\"hi\""))]),
+        &[],
+    );
+    assert_eq!(out.stats.consts_emitted, 1);
+    assert!(out.stats.dropped.is_empty());
+    assert_eq!(out.api.consts.len(), 1);
+    let c = &out.api.consts[0];
+    assert_eq!(c.name, "GREETING");
+    assert_eq!(c.ty, scalar("string"));
+    assert_eq!(c.value, Some(FlConstValue::Str("hi".to_string())));
+    // Untagged value serializes as the bare JSON string.
+    let json = serde_json::to_string(&out.api).unwrap();
+    assert!(json.contains("\"name\":\"GREETING\",\"type\":\"string\",\"value\":\"hi\""));
+}
+
+/// A VERSION-style const whose value is a RUNTIME expression (`pkg.version ||
+/// "0.0.0"`) → emitted with `type: "string"` but NO value (the converter never
+/// evaluates expressions).
+#[test]
+fn version_style_runtime_expr_const_has_no_value() {
+    let out = build_fluessig(
+        &demo_report(vec![const_item(
+            "VERSION",
+            Some("string"),
+            Some("pkg.version || \"0.0.0\""),
+        )]),
+        &[],
+    );
+    assert_eq!(out.stats.consts_emitted, 1);
+    let c = &out.api.consts[0];
+    assert_eq!(c.ty, scalar("string"));
+    assert_eq!(c.value, None);
+    // A concatenation is not a simple literal either.
+    assert_eq!(
+        const_value_for(&scalar("string"), Some("\"a\" + \"b\"")),
+        None
+    );
+}
+
+/// A `number` const maps through the existing scalar path to `float64`; an
+/// integer literal value rides untagged as `Int`.
+#[test]
+fn number_const_maps_to_float64_scalar() {
+    let out = build_fluessig(
+        &demo_report(vec![const_item("MAX", Some("number"), Some("42"))]),
+        &[],
+    );
+    assert_eq!(out.stats.consts_emitted, 1);
+    let c = &out.api.consts[0];
+    assert_eq!(c.ty, scalar("float64"));
+    assert_eq!(c.value, Some(FlConstValue::Int(42)));
+    // A boolean const round-trips its literal too.
+    let b = build_fluessig(
+        &demo_report(vec![const_item("ON", Some("boolean"), Some("true"))]),
+        &[],
+    );
+    assert_eq!(b.api.consts[0].ty, scalar("boolean"));
+    assert_eq!(b.api.consts[0].value, Some(FlConstValue::Bool(true)));
+}
+
+/// An intrinsically-untyped const (`any`) has no fluessig type form: it is NOT
+/// emitted as a bogus typed const, but counted honestly under
+/// `dropped["const dropped (untyped)"]`.
+#[test]
+fn any_const_is_honestly_skipped_not_emitted() {
+    let out = build_fluessig(
+        &demo_report(vec![const_item("isBunBinary", Some("any"), None)]),
+        &[],
+    );
+    assert_eq!(out.stats.consts_emitted, 0);
+    assert!(out.api.consts.is_empty());
+    assert_eq!(out.stats.dropped.get("const dropped (untyped)"), Some(&1));
+    // No `consts` key is serialized when empty (byte-compat with pre-const shape).
+    let json = serde_json::to_string(&out.api).unwrap();
+    assert!(!json.contains("\"consts\""));
+}
+
+/// A const referencing an in-package `class` (no DTO form) is still EMITTED — the
+/// declaration and its referenced type stay visible — lowering to whatever
+/// `parse_type` yields (here honest `Json`), distinct from the untyped-`any` skip.
+#[test]
+fn class_typed_const_is_emitted_as_parse_type_yields() {
+    let out = build_fluessig(
+        &demo_report(vec![
+            const_item("supervisor", Some("Supervisor"), Some("new Supervisor()")),
+            ApiItem::new("class", "m#Supervisor", "Supervisor", "m"),
+        ]),
+        &[],
+    );
+    assert_eq!(out.stats.consts_emitted, 1);
+    let c = out
+        .api
+        .consts
+        .iter()
+        .find(|c| c.name == "supervisor")
+        .unwrap();
+    assert_eq!(c.ty, FlType::json());
+    assert_eq!(c.value, None);
+    assert!(!out.stats.dropped.contains_key("const dropped (untyped)"));
+}
+
+/// A report with NO const serializes byte-identically to the pre-const shape:
+/// the `consts` key is absent, and `consts_emitted` is 0.
+#[test]
+fn no_const_report_serializes_without_consts_key() {
+    let items = vec![
+        field_ref_model("Holder", "InstanceStatus"),
+        union_alias_item("InstanceStatus", "\"online\" | \"offline\""),
+    ];
+    let out = build_fluessig(&demo_report(items), &[]);
+    assert_eq!(out.stats.consts_emitted, 0);
+    assert!(out.api.consts.is_empty());
+    let json = serde_json::to_string(&out.api).unwrap();
+    assert!(!json.contains("\"consts\""));
 }
