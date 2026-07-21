@@ -22,9 +22,14 @@ pub mod body;
 pub mod engine;
 pub mod hazards;
 pub mod interval;
+pub mod quint;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use body::BodyFacts;
 use hazards::{FunctionRanges, Hazard, ParamRange, RangesReport, HINZU_RANGES_VERSION};
+pub use quint::emit_quint;
 
 /// Analyze every function in a body-fact set and produce the deterministic
 /// ranges-and-hazards report. Pure: no I/O, no ordering dependence — functions
@@ -80,40 +85,8 @@ pub fn analyze_bodies(facts: &BodyFacts) -> RangesReport {
 #[cfg(test)]
 mod tests {
     use super::body::*;
+    use super::test_support::{binop_fn, guarded_divide_fn};
     use super::*;
-
-    /// Build a one-block function `id(a, b) { _0 = a <op> b; return }` over two
-    /// integer params.
-    fn binop_fn(id: &str, op: BinOp) -> FunctionBody {
-        FunctionBody {
-            id: id.into(),
-            display: id.into(),
-            file: "demo.rs".into(),
-            line: 1,
-            arg_count: 2,
-            locals: vec![
-                Local { kind: NumKind::Int }, // _0 return
-                Local { kind: NumKind::Int }, // _1 = a
-                Local { kind: NumKind::Int }, // _2 = b
-            ],
-            blocks: vec![Block {
-                stmts: vec![Stmt {
-                    place: 0,
-                    rvalue: Rvalue::Binary {
-                        kind: op,
-                        left: Operand::Local { local: 1 },
-                        right: Operand::Local { local: 2 },
-                    },
-                    loc: Loc {
-                        file: "demo.rs".into(),
-                        line: 2,
-                        col: 5,
-                    },
-                }],
-                terminator: Terminator::Return,
-            }],
-        }
-    }
 
     #[test]
     fn an_unguarded_integer_divide_is_flagged() {
@@ -169,78 +142,9 @@ mod tests {
     #[test]
     fn a_guarded_integer_divide_is_not_flagged() {
         // fn safe(a, b) { if b != 0 { _0 = a / b } else { _0 = 0 }; return }
-        //   bb0: _3 = Ne(_2, 0); switchInt(_3) -> [0: bb2(else), otherwise: bb1(then)]
-        //   bb1: _0 = _1 / _2; goto bb3
-        //   bb2: _0 = 0; goto bb3
-        //   bb3: return
-        let f = FunctionBody {
-            id: "app::safe".into(),
-            display: "safe".into(),
-            file: "demo.rs".into(),
-            line: 1,
-            arg_count: 2,
-            locals: vec![
-                Local { kind: NumKind::Int }, // _0
-                Local { kind: NumKind::Int }, // _1 = a
-                Local { kind: NumKind::Int }, // _2 = b
-                Local {
-                    kind: NumKind::Bool,
-                }, // _3 = b != 0
-            ],
-            blocks: vec![
-                Block {
-                    stmts: vec![Stmt {
-                        place: 3,
-                        rvalue: Rvalue::Binary {
-                            kind: BinOp::Ne,
-                            left: Operand::Local { local: 2 },
-                            right: Operand::Const {
-                                value: ConstVal::Int(0),
-                            },
-                        },
-                        loc: Loc::default(),
-                    }],
-                    terminator: Terminator::SwitchInt {
-                        discr: Operand::Local { local: 3 },
-                        targets: vec![SwitchTarget { value: 0, block: 2 }],
-                        otherwise: Some(1),
-                    },
-                },
-                Block {
-                    stmts: vec![Stmt {
-                        place: 0,
-                        rvalue: Rvalue::Binary {
-                            kind: BinOp::Div,
-                            left: Operand::Local { local: 1 },
-                            right: Operand::Local { local: 2 },
-                        },
-                        loc: Loc {
-                            file: "demo.rs".into(),
-                            line: 3,
-                            col: 9,
-                        },
-                    }],
-                    terminator: Terminator::Goto { block: 3 },
-                },
-                Block {
-                    stmts: vec![Stmt {
-                        place: 0,
-                        rvalue: Rvalue::Use {
-                            operand: Operand::Const {
-                                value: ConstVal::Int(0),
-                            },
-                        },
-                        loc: Loc::default(),
-                    }],
-                    terminator: Terminator::Goto { block: 3 },
-                },
-                Block {
-                    stmts: vec![],
-                    terminator: Terminator::Return,
-                },
-            ],
-        };
-        let report = analyze_bodies(&BodyFacts { functions: vec![f] });
+        let report = analyze_bodies(&BodyFacts {
+            functions: vec![guarded_divide_fn()],
+        });
         assert!(
             report.hazards.is_empty(),
             "guarded divide should not be flagged, got {:?}",

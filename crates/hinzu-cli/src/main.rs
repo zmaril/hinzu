@@ -4,6 +4,7 @@ mod adapter_harness;
 mod api_py;
 mod api_rust;
 mod api_ts;
+mod body_cmd;
 mod go_adapter;
 mod portdiff_config;
 mod portdiff_html;
@@ -70,21 +71,19 @@ enum Cmd {
     /// Rust bodies are extracted from MIR by the StableMIR driver; `--bodies`
     /// takes a pre-extracted body-fact JSON instead (no toolchain needed). Exits
     /// non-zero when a hazard is found, so it is usable as a CI gate.
-    Ranges(RangesArgs),
-}
-
-#[derive(Parser)]
-struct RangesArgs {
-    /// The project to analyze (a cargo project, when extracting live).
-    path: PathBuf,
-    /// Pre-extracted body facts as JSON (the StableMIR driver's `bodies-*.json`
-    /// schema), in place of a live extraction. Lets the analysis run with no
-    /// nightly toolchain.
-    #[arg(long)]
-    bodies: Option<PathBuf>,
-    /// Where to write the ranges JSON. Defaults to stdout.
-    #[arg(long)]
-    out: Option<PathBuf>,
+    Ranges(body_cmd::RangesArgs),
+    /// Lower the extracted body IR into a formal-model SKELETON a model checker
+    /// can consume — Phase A of the code-derived verification pipeline. Emits one
+    /// Quint `module derived { ... }` with clearly-delimited `BEGIN GENERATED` /
+    /// `END GENERATED` regions (state vars typed by numeric kind, straight-line
+    /// statement assignments, arithmetic/comparison operators) and explicit
+    /// `// AGENT-TODO` holes for every judgment call the lowering cannot make
+    /// honestly (float abstraction, control-flow encoding, environment
+    /// nondeterminism, the invariants). The holes are comments, so the skeleton
+    /// parses as valid Quint as-is; see notes/model-finishing.md to finish it.
+    /// Bodies come from `--bodies <json>` (no toolchain) or a live StableMIR
+    /// extraction, exactly like `hinzu ranges`.
+    Model(body_cmd::ModelArgs),
 }
 
 #[derive(Parser)]
@@ -326,7 +325,11 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
-        Cmd::Ranges(args) => match ranges(args) {
+        Cmd::Ranges(args) => match body_cmd::ranges(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
+        Cmd::Model(args) => match body_cmd::model(args) {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
@@ -409,40 +412,6 @@ fn api(args: ApiArgs) -> Result<ExitCode> {
     let json =
         serde_json::to_string_pretty(&report).context("serializing the API report to JSON")?;
     write_json(args.out.as_deref(), &json, "api report")
-}
-
-/// The `hinzu ranges` flow. Loads body facts (from `--bodies` JSON, or by
-/// extracting them live with the StableMIR driver — all the file/process I/O is
-/// on the CLI side), runs the pure abstract-interpretation engine, writes the
-/// deterministic ranges-and-hazards JSON, and returns a non-zero code when a
-/// hazard is found so it is usable as a CI gate.
-fn ranges(args: RangesArgs) -> Result<ExitCode> {
-    let bodies = if let Some(path) = args.bodies.as_deref() {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("reading body facts from {}", path.display()))?;
-        hinzu_core::absint::body::BodyFacts::from_json(&json)
-            .with_context(|| format!("parsing body facts from {}", path.display()))?
-    } else {
-        if !rust_adapter::is_cargo_project(&args.path) {
-            anyhow::bail!(
-                "{} is not a cargo project — `hinzu ranges` extracts Rust MIR bodies today; \
-                 pass --bodies <json> to analyze pre-extracted facts",
-                args.path.display()
-            );
-        }
-        rust_adapter::extract_bodies(&args.path)?
-    };
-
-    let report = hinzu_core::absint::analyze_bodies(&bodies);
-    let json =
-        serde_json::to_string_pretty(&report).context("serializing the ranges report to JSON")?;
-    write_json(args.out.as_deref(), &json, "ranges report")?;
-
-    if report.hazards.is_empty() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        Ok(ExitCode::FAILURE)
-    }
 }
 
 /// Resolve the language for `hinzu api`: an explicit `--lang` (lowercased), else
@@ -1243,7 +1212,7 @@ fn build_graph_from_source(
 
 /// Write pretty JSON to `out` (with a trailing newline) or stdout. `what` names
 /// the document in any I/O error.
-fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
+pub(crate) fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
     match out {
         Some(out) => {
             std::fs::write(out, format!("{json}\n"))
