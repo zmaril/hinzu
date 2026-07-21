@@ -35,8 +35,10 @@
 //!   (`RpcCommand | RpcExtensionUIResponse` → `RpcCommandOrRpcExtensionUIResponse`).
 //! * `number` → `float64` (TS does not distinguish int/float — an ambiguity we
 //!   record but do not treat as a degradation).
-//! * `const`, `namespace`, `trait`, and non-union `typeAlias` items are dropped
-//!   (counted).
+//! * An exported `const` whose declared type is representable (a scalar, or a
+//!   model/union/foreign ref via [`Converter::parse_type`]) → a `consts[]` entry
+//!   (see [`FlConst`]); an intrinsically-untyped one (`any`) is honestly skipped.
+//! * `namespace`, `trait`, and non-union `typeAlias` items are dropped (counted).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +76,43 @@ pub struct FlApiDoc {
     pub models: Vec<FlModel>,
     pub unions: Vec<FlUnion>,
     pub interfaces: Vec<FlInterface>,
+    /// Top-level EXPORTED CONSTANTS the surface declares — an
+    /// `export const VERSION: string = "…"` has no op/DTO home, so it rides here
+    /// (see [`FlConst`]). `skip_serializing_if` empty keeps a no-const output
+    /// byte-identical to the pre-const shape (fluessig's loader defaults the key).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub consts: Vec<FlConst>,
+}
+
+/// A top-level exported constant, in the exact wire shape of fluessig's
+/// `ApiConst`. Its `type` reuses the shared [`FlType`] lowering ([`FlType::Scalar`]
+/// for a scalar const, a model/union/foreign ref otherwise), and `value` carries
+/// the compile-time literal **only** when the const's source is a simple literal
+/// (a fully-quoted string, a plain number, `true`/`false`) — a runtime expression
+/// (`pkg.version || "0.0.0"`) leaves `value` absent so fluessig emits a documented
+/// non-representable note rather than a broken `pub const`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FlConst {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    #[serde(rename = "type")]
+    pub ty: FlType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<FlConstValue>,
+}
+
+/// The literal a [`FlConst`] carries — the untagged wire shape of fluessig's
+/// `ConstValue`. Serializes as the bare JSON scalar the value naturally is
+/// (`"0.80.10"`, `42`, `3.14`, `true`); the const's declared `type` remains the
+/// authority for lowering, this is only the value carrier.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum FlConstValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
 }
 
 /// A DTO model (from a TS `interface` / `record`).
@@ -251,6 +290,12 @@ pub struct Stats {
     pub enums_emitted: usize,
     pub interfaces_emitted: usize,
     pub unions_synthesized: usize,
+    /// Top-level exported consts emitted into `api.json`'s `consts[]` — a const
+    /// whose declared type is representable (a scalar, or a model/union/foreign ref
+    /// via [`Converter::parse_type`]). No longer counted in [`Self::dropped`]. An
+    /// intrinsically-untyped const (`any`) stays honestly counted under
+    /// `dropped["const dropped (untyped)"]` instead.
+    pub consts_emitted: usize,
     /// Of `unions_synthesized`, how many were *lifted* from a top-level union /
     /// indexed-access `typeAlias` (rather than synthesized from an anonymous
     /// inline union). These are named for their alias so field/param/return refs
@@ -1003,6 +1048,7 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     // Pass 2 — models, interfaces, and free-function ops.
     let mut models: Vec<FlModel> = Vec::new();
     let mut interfaces: Vec<FlInterface> = Vec::new();
+    let mut consts: Vec<FlConst> = Vec::new();
     let mut free_ops: Vec<FlOp> = Vec::new();
 
     for it in &items {
@@ -1018,8 +1064,15 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
                     free_ops.push(op);
                 }
             }
+            "const" => {
+                // Emit a representable const into `consts[]` (was dropped). An
+                // intrinsically-untyped one (`any`) is skipped inside `build_const`.
+                if let Some(c) = build_const(&mut conv, &mut stats, it) {
+                    consts.push(c);
+                }
+            }
             "method" => { /* handled with its owning class */ }
-            "enum" | "typeAlias" | "const" | "namespace" | "trait" | "struct" => {
+            "enum" | "typeAlias" | "namespace" | "trait" | "struct" => {
                 // enum/typeAlias were consumed in pass 1 (or dropped as non-union);
                 // the rest have no op/model home in this spike.
                 if it.kind == "typeAlias" && conv.known_unions.contains(&it.name) {
@@ -1038,7 +1091,6 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
                     "typeAlias" if conv.known_enums.contains(&it.name) => continue,
                     "enum" => continue,
                     "typeAlias" => "typeAlias (non-string-union) dropped",
-                    "const" => "const dropped",
                     "namespace" => "namespace dropped",
                     "trait" => "trait dropped",
                     _ => "unsupported item dropped",
@@ -1111,6 +1163,7 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
 
     models.sort_by(|a, b| a.name.cmp(&b.name));
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+    consts.sort_by(|a, b| a.name.cmp(&b.name));
     catalog_enums.sort_by(|a, b| a.name.cmp(&b.name));
     let mut unions: Vec<FlUnion> = conv.unions.into_values().collect();
     unions.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1134,6 +1187,7 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
         models,
         unions,
         interfaces,
+        consts,
     };
     let catalog = FlCatalog {
         fluessig: FlVersions::default(),
@@ -1324,6 +1378,79 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
         params,
         returns,
     })
+}
+
+/// Build an [`FlConst`] from a `const` item, or `None` when the const has no
+/// representable type. The declared `type` is lowered through the shared
+/// [`Converter::parse_type`], so a scalar becomes a bare scalar (`number` →
+/// `float64`, `boolean` → `boolean`, …) and a model/union/foreign ref resolves
+/// exactly as it does for a field/param — no parallel scalar-mapping path.
+///
+/// An intrinsically-untyped const (`any`/`unknown`/`object`, or no declared type)
+/// has NO fluessig type form: emitting it would be a zero-information
+/// `{"type":"Json"}`. It is honestly skipped and counted under
+/// `dropped["const dropped (untyped)"]` rather than dropped silently or forged
+/// into a bogus typed const. A named-but-unmodeled ref (a `class` handle like
+/// `OrchestratorSupervisor`) is NOT untyped — it lowers to whatever `parse_type`
+/// yields (here honest `Json`) and is still emitted, so the const's existence and
+/// its referenced type stay visible in the surface.
+///
+/// `const_value` is RAW EXPRESSION TEXT, not a literal, so a `value` is attached
+/// only when it is a SIMPLE literal AND the type is a const-representable scalar
+/// (see [`const_value_for`]); any runtime expression leaves `value` absent.
+fn build_const(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlConst> {
+    let raw = it.const_type.as_deref().map(normalize).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() || is_untyped_ts_type(raw) {
+        Stats::bump(&mut stats.dropped, "const dropped (untyped)");
+        return None;
+    }
+    let parsed = conv.parse_type(raw);
+    let value = const_value_for(&parsed.ty, it.const_value.as_deref());
+    stats.consts_emitted += 1;
+    Some(FlConst {
+        name: it.name.clone(),
+        doc: it.doc.clone(),
+        ty: parsed.ty,
+        value,
+    })
+}
+
+/// Extract a [`FlConstValue`] from a const's raw `const_value` text — but ONLY
+/// when the value is a SIMPLE literal and the declared `ty` is a
+/// const-representable scalar the literal matches. Anything else (a runtime
+/// expression like `pkg.version || "0.0.0"`, a non-scalar type, a form/type
+/// mismatch) → `None`, so a runtime-valued const round-trips as a typed const
+/// with no value rather than a fabricated one. The value form follows the literal
+/// (untagged), matching fluessig's `ConstValue`.
+fn const_value_for(ty: &FlType, raw: Option<&str>) -> Option<FlConstValue> {
+    let raw = raw?.trim();
+    let FlType::Scalar(scalar) = ty else {
+        return None;
+    };
+    match scalar.as_str() {
+        "string" => simple_string_literal(raw).map(FlConstValue::Str),
+        "boolean" => match raw {
+            "true" => Some(FlConstValue::Bool(true)),
+            "false" => Some(FlConstValue::Bool(false)),
+            _ => None,
+        },
+        "int32" | "int64" => raw.parse::<i64>().ok().map(FlConstValue::Int),
+        "float64" => {
+            // A bare integer literal for a float const rides as `Int` (fluessig's
+            // untagged carrier and rust-core both accept it); a fractional literal
+            // rides as `Float`.
+            if let Ok(i) = raw.parse::<i64>() {
+                Some(FlConstValue::Int(i))
+            } else {
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(FlConstValue::Float)
+            }
+        }
+        _ => None,
+    }
 }
 
 mod helpers;

@@ -280,6 +280,47 @@ pub(super) fn is_string_literal(s: &str) -> bool {
         || (s.starts_with('`') && s.ends_with('`') && s.len() >= 2)
 }
 
+/// Whether a rendered TS type is intrinsically **untyped** — `any`, `unknown`, or
+/// `object`. Such a const has no fluessig type form (it would collapse to a
+/// zero-information `Json`), so it is skipped rather than emitted. A named ref that
+/// merely lacks a DTO form (a `class`) is NOT untyped and is handled by
+/// [`super::Converter::parse_type`] instead.
+pub(super) fn is_untyped_ts_type(s: &str) -> bool {
+    matches!(s.trim(), "any" | "unknown" | "object")
+}
+
+/// If `s` is exactly ONE fully-quoted string literal (`"foo"`, `'foo'`, or a
+/// substitution-free `` `foo` ``), return its unquoted contents. Returns `None`
+/// for any compound or non-literal expression — a concatenation (`"a" + "b"`), a
+/// disjunction (`pkg.version || "0.0.0"`), or a template with a `${…}`
+/// substitution — so only a genuinely simple string literal yields a const value.
+pub(super) fn simple_string_literal(s: &str) -> Option<String> {
+    let s = s.trim();
+    let mut chars = s.chars();
+    let q = chars.next()?;
+    if q != '"' && q != '\'' && q != '`' {
+        return None;
+    }
+    if s.chars().count() < 2 || !s.ends_with(q) {
+        return None;
+    }
+    let inner = &s[q.len_utf8()..s.len() - q.len_utf8()];
+    // Reject a further unescaped closing quote of the same kind inside — that means
+    // `s` is not a single literal (`"a" + "b"` → inner holds an unescaped `"`).
+    let mut prev = '\0';
+    for c in inner.chars() {
+        if c == q && prev != '\\' {
+            return None;
+        }
+        prev = c;
+    }
+    // A template literal with a substitution is a runtime expression, not a literal.
+    if q == '`' && inner.contains("${") {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 pub(super) fn is_numeric_literal(s: &str) -> bool {
     let t = s.strip_suffix('n').unwrap_or(s); // bigint literal `42n`
     !t.is_empty()
