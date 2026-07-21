@@ -1166,7 +1166,7 @@ fn class_typed_const_is_emitted_as_parse_type_yields() {
         .unwrap();
     assert_eq!(c.ty, FlType::json());
     assert_eq!(c.value, None);
-    assert!(out.stats.dropped.get("const dropped (untyped)").is_none());
+    assert!(!out.stats.dropped.contains_key("const dropped (untyped)"));
 }
 
 /// A report with NO const serializes byte-identically to the pre-const shape:
