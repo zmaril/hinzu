@@ -148,6 +148,15 @@ pub struct Definition {
     pub file: String,
     pub line_start: u32,
     pub line_end: u32,
+    /// Whether this callable is a React component — a semantic tag the adapter
+    /// layers on an ordinary callable, decided by the type checker (its return
+    /// type is a React element, or it is used in JSX element-name position), not
+    /// by a naming convention. The component-shaped rules (starting with
+    /// `effect-in-component`) read it; every non-JSX adapter and every callable
+    /// that is not a component simply leaves it `false`. Absent in JSON written
+    /// before the flag existed, so it defaults to `false`.
+    #[serde(default)]
+    pub is_component: bool,
 }
 
 /// Build a [`Definition`] for tests. The `display` is the last `::`-segment of
@@ -162,6 +171,7 @@ pub(crate) fn make_def(id: &str, file: &str, line_start: u32, line_end: u32) -> 
         file: file.to_string(),
         line_start,
         line_end,
+        is_component: false,
     }
 }
 
@@ -287,6 +297,16 @@ pub struct Edge {
     pub resolution: EdgeResolution,
     pub evidence_file: String,
     pub evidence_line: u32,
+    /// Whether this edge is a *seam*: it enters a sanctioned React boundary — the
+    /// value passed to an effect hook (`useEffect` / `useLayoutEffect`) or a JSX
+    /// event-handler prop (`onClick`, `onSubmit`, …). Such an edge still carries
+    /// the effect for the architectural region check (the component really does
+    /// trigger it), but the `effect-in-component` rule cuts it: an effect reached
+    /// only through a seam runs outside render and is not a synchronous-render
+    /// smell. Absent in JSON written before seams existed, so it defaults to
+    /// `false`, and every non-React edge leaves it `false`.
+    #[serde(default)]
+    pub seam: bool,
 }
 
 /// Serde default for an edge whose JSON omits `resolution`: a plain call.
@@ -304,6 +324,7 @@ impl Edge {
             resolution: EdgeResolution::Call,
             evidence_file: evidence_file.to_string(),
             evidence_line,
+            seam: false,
         }
     }
 
@@ -316,6 +337,7 @@ impl Edge {
             resolution: EdgeResolution::Reference,
             evidence_file: evidence_file.to_string(),
             evidence_line,
+            seam: false,
         }
     }
 
@@ -331,7 +353,16 @@ impl Edge {
             resolution: EdgeResolution::Reference,
             evidence_file: evidence_file.to_string(),
             evidence_line,
+            seam: false,
         }
+    }
+
+    /// Mark this edge as a seam — the value passed to an effect hook or a JSX
+    /// event-handler prop. Chains onto a constructor: `Edge::reference(…).seam()`.
+    /// See the [`seam`](Edge::seam) field for what the flag governs.
+    pub fn seam(mut self) -> Self {
+        self.seam = true;
+        self
     }
 }
 

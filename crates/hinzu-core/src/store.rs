@@ -20,12 +20,13 @@ use crate::facts::{
 /// schema; enums are stored as their lowercase string forms.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS definitions (
-    id         TEXT PRIMARY KEY,
-    display    TEXT NOT NULL,
-    language   TEXT NOT NULL,
-    file       TEXT NOT NULL,
-    line_start INTEGER NOT NULL,
-    line_end   INTEGER NOT NULL
+    id           TEXT PRIMARY KEY,
+    display      TEXT NOT NULL,
+    language     TEXT NOT NULL,
+    file         TEXT NOT NULL,
+    line_start   INTEGER NOT NULL,
+    line_end     INTEGER NOT NULL,
+    is_component INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS edges (
     caller        TEXT NOT NULL,
@@ -33,7 +34,8 @@ CREATE TABLE IF NOT EXISTS edges (
     kind          TEXT NOT NULL,
     resolution    TEXT NOT NULL,
     evidence_file TEXT NOT NULL,
-    evidence_line INTEGER NOT NULL
+    evidence_line INTEGER NOT NULL,
+    seam          INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS effect_roots (
     symbol TEXT NOT NULL,
@@ -46,9 +48,10 @@ CREATE TABLE IF NOT EXISTS effect_summaries (
 );
 ";
 
-/// Read a six-column row into a typed tuple. Shared by the definitions and
-/// edges queries so the per-column `get` sequence lives in exactly one place.
-fn six_cols<A, B, C, D, E, F>(r: &rusqlite::Row) -> rusqlite::Result<(A, B, C, D, E, F)>
+/// Read a seven-column row into a typed tuple. Shared by the definitions and
+/// edges queries so the per-column `get` sequence lives in exactly one place;
+/// the trailing column is each table's `bool` flag (`is_component` / `seam`).
+fn seven_cols<A, B, C, D, E, F, G>(r: &rusqlite::Row) -> rusqlite::Result<(A, B, C, D, E, F, G)>
 where
     A: rusqlite::types::FromSql,
     B: rusqlite::types::FromSql,
@@ -56,6 +59,7 @@ where
     D: rusqlite::types::FromSql,
     E: rusqlite::types::FromSql,
     F: rusqlite::types::FromSql,
+    G: rusqlite::types::FromSql,
 {
     Ok((
         r.get(0)?,
@@ -64,6 +68,7 @@ where
         r.get(3)?,
         r.get(4)?,
         r.get(5)?,
+        r.get(6)?,
     ))
 }
 
@@ -99,8 +104,8 @@ impl Store {
         {
             let mut def = tx.prepare(
                 "INSERT OR REPLACE INTO definitions \
-                 (id, display, language, file, line_start, line_end) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (id, display, language, file, line_start, line_end, is_component) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for d in facts.defs.values() {
                 def.execute((
@@ -110,13 +115,14 @@ impl Store {
                     &d.file,
                     d.line_start,
                     d.line_end,
+                    d.is_component,
                 ))?;
             }
 
             let mut edge = tx.prepare(
                 "INSERT INTO edges \
-                 (caller, callee, kind, resolution, evidence_file, evidence_line) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (caller, callee, kind, resolution, evidence_file, evidence_line, seam) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for e in &facts.edges {
                 edge.execute((
@@ -126,6 +132,7 @@ impl Store {
                     e.resolution.as_str(),
                     &e.evidence_file,
                     e.evidence_line,
+                    e.seam,
                 ))?;
             }
 
@@ -143,12 +150,15 @@ impl Store {
     pub fn load_facts(&self) -> Result<FactSet> {
         let mut facts = FactSet::default();
 
-        let mut defs = self
-            .conn
-            .prepare("SELECT id, display, language, file, line_start, line_end FROM definitions")?;
-        let rows = defs.query_map([], six_cols::<String, String, String, String, u32, u32>)?;
+        let mut defs = self.conn.prepare(
+            "SELECT id, display, language, file, line_start, line_end, is_component FROM definitions",
+        )?;
+        let rows = defs.query_map(
+            [],
+            seven_cols::<String, String, String, String, u32, u32, bool>,
+        )?;
         for row in rows {
-            let (id, display, language, file, line_start, line_end) = row?;
+            let (id, display, language, file, line_start, line_end, is_component) = row?;
             facts.add_def(Definition {
                 id,
                 display,
@@ -156,15 +166,19 @@ impl Store {
                 file,
                 line_start,
                 line_end,
+                is_component,
             });
         }
 
         let mut edges = self.conn.prepare(
-            "SELECT caller, callee, kind, resolution, evidence_file, evidence_line FROM edges",
+            "SELECT caller, callee, kind, resolution, evidence_file, evidence_line, seam FROM edges",
         )?;
-        let rows = edges.query_map([], six_cols::<String, String, String, String, String, u32>)?;
+        let rows = edges.query_map(
+            [],
+            seven_cols::<String, String, String, String, String, u32, bool>,
+        )?;
         for row in rows {
-            let (caller, callee, kind, resolution, evidence_file, evidence_line) = row?;
+            let (caller, callee, kind, resolution, evidence_file, evidence_line, seam) = row?;
             facts.add_edge(Edge {
                 caller,
                 callee,
@@ -172,6 +186,7 @@ impl Store {
                 resolution: EdgeResolution::from_str(&resolution)?,
                 evidence_file,
                 evidence_line,
+                seam,
             });
         }
 

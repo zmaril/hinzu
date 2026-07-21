@@ -93,11 +93,12 @@ pub fn check_facts(
     let summaries = engine.propagate(&facts);
     store.write_summaries(&summaries)?;
 
-    // Fold every enabled rule over the shared context. Today that is the ported
-    // effect-region rule alone, so the findings — and the report and exit code
-    // they drive — are identical to running the effect-region check directly.
+    // Fold every enabled rule over the shared context: the effect-region rule
+    // always runs, and each named rule (`effect-in-component`, …) runs only when
+    // `[rules].enable` lists it — so a policy that enables none drives the same
+    // report and exit code as running the effect-region check directly.
     let cx = RuleContext::new(&facts, &summaries, policy);
-    let findings = RuleEngine::with_builtin().run(&cx);
+    let findings = RuleEngine::with_all_rules().run(&cx);
     let report = format_report("hinzu effect analysis", &facts, &summaries, &findings)?;
     // Only errors fail the run. `on_unknown = "warn"` produces reported-but-
     // non-failing warnings, so the count that drives the exit code is the
@@ -175,6 +176,7 @@ fn demo_facts() -> FactSet {
         file: core_file.to_string(),
         line_start: 1,
         line_end: 8,
+        is_component: false,
     });
     facts.add_def(Definition {
         id: "crate::core::handle_request".to_string(),
@@ -183,6 +185,7 @@ fn demo_facts() -> FactSet {
         file: core_file.to_string(),
         line_start: 10,
         line_end: 20,
+        is_component: false,
     });
     facts.add_def(Definition {
         id: "crate::io::load_file".to_string(),
@@ -191,6 +194,7 @@ fn demo_facts() -> FactSet {
         file: adapter_file.to_string(),
         line_start: 1,
         line_end: 6,
+        is_component: false,
     });
 
     facts.add_edge(Edge::call(
@@ -283,6 +287,7 @@ mod tests {
             file: "src/hot.rs".to_string(),
             line_start: 1,
             line_end: 4,
+            is_component: false,
         });
         // The call the driver emits for `v.push(i)` — a no-body std leaf.
         facts.add_edge(Edge::call(

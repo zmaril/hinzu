@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`effect-in-component` — the first component-aware rule: flag a React
+  component that performs I/O directly while it renders.** A component may reach
+  the filesystem, network, database, or a subprocess — but through an effect hook
+  (`useEffect`, `useLayoutEffect`) or an event handler (`onClick`, …), not
+  synchronously while React is computing the render. The rule walks the same
+  call/use graph the effect analysis does, restricted to a component's **render
+  path**: it drops the *seam* edges the TypeScript adapter now marks — the value
+  handed to an effect hook or an event-handler prop — so an effect reached only
+  through a seam is sanctioned, while an effect on the synchronous render path is
+  flagged with the evidence path down to the root (`Dashboard -> loadUser ->
+  global::fetch`). Identification is a type-checker decision, not a naming guess:
+  the adapter tags a definition `is_component` when a JSX tag resolves to it or
+  its return type is a React element, following `memo`/`forwardRef` wrappers and
+  renames a regex would lose. Turn it on with `enable = ["effect-in-component"]`
+  under `[rules]`; its `forbid` list narrows the effect set. Run against
+  powdermonkey and immersion it identified 147 and 17 components with no
+  false-positive findings — every component's I/O already lived in a hook or a
+  handler, exactly where the rule leaves it alone.
 - **`hinzu ranges` — freerange-style numeric range / abstract-interpretation
   analysis, catching integer divide-by-zero at compile time on Rust via MIR
   intervals.** A new subcommand infers, per function, the interval each value can

@@ -76,6 +76,11 @@ const CRYPTO_RANDOM = new Set([
   "generateKeyPairSync",
 ]);
 
+// The hooks whose callback runs *after* render (a sanctioned effect seam), as
+// opposed to `useMemo`/`useCallback`, whose callbacks run synchronously during
+// render and so are NOT seams. Matches the design note's `allow_seams` default.
+const SEAM_HOOKS = new Set(["useEffect", "useLayoutEffect"]);
+
 // Well-known effectful npm packages the ecosystem treats as I/O primitives. These
 // are part of the shared seed vocabulary (the catalog lists them), so a call into
 // one is an effect root, not an Unknown. Every *other* third-party package stays
@@ -205,6 +210,65 @@ forEachOwnedSourceFile(program, ownedRel, (sf, rel, relNoExt) => {
 });
 console.error(`hinzu-ts: definitions ${defs.size}`);
 
+// --- React component identification (is_component) ---------------------------
+// A component is not a naming convention — the type checker decides it. A def is
+// a component when either it is used in JSX element-name position (`<Foo/>`
+// resolves, through re-exports and `memo`/`forwardRef` wrappers, back to it) or
+// its call signature returns a React element type. Both are checker queries; a
+// regex cannot follow a rename or see through a wrapper.
+const componentDefIds = new Set();
+// The JSX element type (`JSX.Element`), captured from the first JSX element the
+// program contains, so the return-type test has something to compare against.
+let jsxElementType = null;
+
+// The first function-like descendant of `node` (or `node` itself) that is a
+// registered def — how a component's wrapped form is reached: `const C = fn`,
+// `const C = memo(fn)`, `const C = forwardRef((props, ref) => …)`. The wrapper
+// call is not a component; the function it wraps is.
+function firstFunctionDefIn(node) {
+  let found = null;
+  const visit = (x) => {
+    if (found) return;
+    if (defIdByNode.has(x)) {
+      found = defIdByNode.get(x);
+      return;
+    }
+    ts.forEachChild(x, visit);
+  };
+  visit(node);
+  return found;
+}
+
+// Map a resolved symbol to the def id of the callable it names, unwrapping a
+// variable binding to its initializing function (or the function inside a
+// `memo`/`forwardRef` wrapper). Returns null when the symbol has no local def.
+function defIdForSymbol(sym) {
+  if (!sym) return null;
+  const decls = (sym.getDeclarations && sym.getDeclarations()) || [];
+  for (const d of decls) {
+    if (defIdByNode.has(d)) return defIdByNode.get(d);
+    if (ts.isVariableDeclaration(d) && d.initializer) {
+      const id = firstFunctionDefIn(d.initializer);
+      if (id) return id;
+    }
+  }
+  return null;
+}
+
+// Resolve a JSX tag (`<Foo/>`, `<ns.Bar/>`) to a local def and mark it a
+// component. Intrinsic tags (`<div/>`) resolve to no local def and are ignored.
+function markComponentFromJsxTag(tag) {
+  let sym = checker.getSymbolAtLocation(tag);
+  if (!sym) return;
+  if (sym.flags & ts.SymbolFlags.Alias) {
+    try {
+      sym = checker.getAliasedSymbol(sym);
+    } catch {}
+  }
+  const id = defIdForSymbol(sym);
+  if (id) componentDefIds.add(id);
+}
+
 // --- edges + effect roots ----------------------------------------------------
 const edges = []; // {caller, callee, kind, resolution, evidence_file, evidence_line}
 const rootSet = new Map(); // symbol -> effect (deduped effect roots)
@@ -220,17 +284,21 @@ function moduleIdFor(rel) {
   return `<module>@${rel}`;
 }
 
-function addEdge(caller, callee, kind, evFile, evLine) {
+function addEdge(caller, callee, kind, evFile, evLine, seam = false) {
   if (!caller || !callee || caller === callee) return;
   if (moduleMeta.has(caller)) moduleUsed.add(caller);
-  edges.push({
+  const edge = {
     caller,
     callee,
     kind,
     resolution: kind,
     evidence_file: evFile,
     evidence_line: evLine,
-  });
+  };
+  // Emit `seam` only when set, so a non-React edge stays byte-identical to
+  // before (the Rust side defaults an absent flag to false).
+  if (seam) edge.seam = true;
+  edges.push(edge);
 }
 function addEffectLeaf(caller, symbol, effect, evFile, evLine, kind = "call") {
   addEdge(caller, symbol, kind, evFile, evLine);
@@ -573,6 +641,20 @@ for (const sf of program.getSourceFiles()) {
     const atModule = enclosing === null;
     const line = lineOf(sf, n.getStart());
 
+    // Component identification, independent of the effect graph. Capture the
+    // JSX element type once (for the return-type test below), and mark any def a
+    // JSX tag resolves to.
+    if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) {
+      if (!jsxElementType) {
+        try {
+          jsxElementType = checker.getTypeAtLocation(n);
+        } catch {}
+      }
+    }
+    if (ts.isJsxOpeningElement(n) || ts.isJsxSelfClosingElement(n)) {
+      markComponentFromJsxTag(n.tagName);
+    }
+
     if (caller) {
       // Ambient global effect reached by property access (process.env, Date.now),
       // whether called or used as a value.
@@ -604,6 +686,78 @@ for (const sf of program.getSourceFiles()) {
   ts.forEachChild(sf, walk);
 }
 
+// Return-type criterion: a function-like def whose (non-nullable) return type is
+// assignable to the JSX element type is a component — the case a component that
+// is never used in JSX position within the analyzed files (a root, a
+// dynamically-referenced page) would otherwise miss. Guarded three ways: it needs
+// the checker's assignability predicate, a JSX element type, and — crucially —
+// that type must be *discriminating*. A degenerate `JSX.Element` (a project whose
+// JSX namespace declares an empty `interface Element {}`) is structurally `{}`,
+// which every non-null type is assignable to, so the test would flag every
+// function. Requiring the JSX type to carry members (a real React element has
+// `type`/`props`/`key`) rejects that case and keeps the criterion sound; such a
+// project still gets components from the JSX-usage criterion above. Any
+// per-signature failure is swallowed so extraction never aborts on it.
+const jsxDiscriminates =
+  jsxElementType && checker.getPropertiesOfType(jsxElementType).length > 0;
+// A degenerate return type — `never` (a subtype of *every* type), `any`, an error
+// type, or a nullish/`void` constituent — is assignable to the JSX element type
+// without being a React element. `never` alone falsely matches every throwing or
+// error-typed function, which on a repo with pervasive type-resolution gaps is
+// most of them. Rejecting these before the assignability test is what keeps the
+// return-type criterion sound; the JSX-usage criterion still identifies a real
+// component the checker mistypes.
+const DEGENERATE_RETURN =
+  ts.TypeFlags.Any |
+  ts.TypeFlags.Unknown |
+  ts.TypeFlags.Never |
+  ts.TypeFlags.Void |
+  ts.TypeFlags.Null |
+  ts.TypeFlags.Undefined;
+if (jsxDiscriminates && typeof checker.isTypeAssignableTo === "function") {
+  for (const [node, id] of defIdByNode) {
+    if (componentDefIds.has(id) || !isFunctionLike(node)) continue;
+    try {
+      const sig = checker.getSignatureFromDeclaration(node);
+      if (!sig) continue;
+      const rt = checker.getNonNullableType(checker.getReturnTypeOfSignature(sig));
+      const parts = rt.isUnion() ? rt.types : [rt];
+      if (parts.some((t) => t.flags & DEGENERATE_RETURN)) continue;
+      if (checker.isTypeAssignableTo(rt, jsxElementType)) componentDefIds.add(id);
+    } catch {}
+  }
+}
+console.error(`hinzu-ts: components ${componentDefIds.size}`);
+
+// The name a call expression invokes, for the seam-hook check: `useEffect(…)`
+// (identifier) or `React.useEffect(…)` (property access).
+function calleeNameOfCall(call) {
+  const e = call.expression;
+  if (ts.isIdentifier(e)) return e.text;
+  if (ts.isPropertyAccessExpression(e)) return e.name.text;
+  return null;
+}
+
+// Whether a value-position reference sits in a sanctioned React seam: passed as
+// an argument to an effect hook (`useEffect(loadUser)`) or bound to a JSX
+// event-handler prop (`onClick={loadUser}`). An edge marked here still carries
+// its effect for the region check; only the `effect-in-component` rule cuts it.
+// Inline callbacks (`useEffect(() => …)`, `onClick={() => …}`) never draw an
+// edge from the component, so they need no marking — this covers the named case.
+function isSeamReference(node) {
+  const p = node.parent;
+  if (!p) return false;
+  if (ts.isCallExpression(p) && p.arguments.includes(node)) {
+    const name = calleeNameOfCall(p);
+    if (name && SEAM_HOOKS.has(name)) return true;
+  }
+  if (ts.isJsxExpression(p) && p.parent && ts.isJsxAttribute(p.parent)) {
+    const attr = p.parent.name.getText();
+    if (/^on[A-Z]/.test(attr)) return true;
+  }
+  return false;
+}
+
 // Reference-level taint: a value-position use (a bare identifier or an `a.b`
 // member) that is NOT the callee of a call — a function or effectful symbol
 // passed as a value (callback, default parameter, stored, returned, in an
@@ -624,7 +778,9 @@ function handleReference(n, caller, rel, line, importMap) {
     const fnDecl = (s?.getDeclarations?.() || []).find(isFunctionLike);
     const calleeId = fnDecl && defIdByNode.get(fnDecl);
     if (calleeId && calleeId !== caller) {
-      addEdge(caller, calleeId, "reference", rel, line);
+      // A named function handed to an effect hook or an event handler is a seam:
+      // the effect it carries runs outside render, so the component rule cuts it.
+      addEdge(caller, calleeId, "reference", rel, line, isSeamReference(n));
       refEdges++;
       return;
     }
@@ -741,8 +897,12 @@ console.error(
 );
 
 // --- emit the FactSet JSON ---------------------------------------------------
+// A component carries `is_component: true`; every other def stays byte-identical
+// to before (the Rust side defaults the absent flag to false).
 const out = {
-  definitions: [...defs.values()],
+  definitions: [...defs.values()].map((d) =>
+    componentDefIds.has(d.id) ? { ...d, is_component: true } : d,
+  ),
   edges,
   effect_roots: [...rootSet.entries()].map(([symbol, effect]) => ({ symbol, effect })),
 };
