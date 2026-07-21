@@ -39,7 +39,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 pub mod profile;
-pub use profile::{profile_for_language, rust_syn_profile, ts_tsc_profile, LanguageProfile};
+pub use profile::{
+    profile_for, profile_for_language, rust_stablemir_profile, rust_syn_profile, ts_tsc_profile,
+    LanguageProfile,
+};
 
 /// The schema version embedded in every emitted similarity document, so a
 /// consumer can branch on shape changes.
@@ -314,6 +317,13 @@ pub struct AnalyzeParams {
     pub min_statements: u32,
     /// Only analyze signatures in this language, if set.
     pub language_filter: Option<String>,
+    /// The extractor that produced these signatures (`"syn"`, `"stablemir"`,
+    /// `"tsc-checker"`, …), if known. Selects the extractor-aware
+    /// [`profile::profile_for`] so a resolved run reports the resolved
+    /// capabilities (and lifts the confidence cap); `None` falls back to the
+    /// language-keyed default profile. A single analysis is over one homogeneous
+    /// document, so one extractor applies to all its signatures.
+    pub extractor: Option<String>,
 }
 
 impl Default for AnalyzeParams {
@@ -325,6 +335,7 @@ impl Default for AnalyzeParams {
             min_size: p.min_size,
             min_statements: p.min_statements,
             language_filter: p.language_filter,
+            extractor: None,
         }
     }
 }
@@ -405,13 +416,19 @@ pub fn analyze(
         None => signatures,
     };
 
-    // Languages present + their shipped profiles (the fidelity block).
+    // Languages present + their shipped profiles (the fidelity block). When the
+    // producing extractor is known, resolve the extractor-aware profile so a
+    // resolved run (Rust/`stablemir`) reports resolved capabilities and lifts the
+    // confidence cap; otherwise fall back to the language-keyed default.
     let mut languages: Vec<String> = signatures.iter().map(|s| s.language.clone()).collect();
     languages.sort();
     languages.dedup();
     let profiles: Vec<LanguageProfile> = languages
         .iter()
-        .filter_map(|l| profile_for_language(l))
+        .filter_map(|l| match &params.extractor {
+            Some(ext) => profile_for(l, ext),
+            None => profile_for_language(l),
+        })
         .collect();
 
     // Step 1: filter trivial defs.

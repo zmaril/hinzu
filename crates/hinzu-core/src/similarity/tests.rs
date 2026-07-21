@@ -407,6 +407,76 @@ fn every_finding_family_is_in_its_language_profile() {
     }
 }
 
+/// The resolved-type (`stablemir`) extractor lifts the syntactic confidence cap:
+/// two identical Rust bodies analyzed as a `stablemir` run report the resolved
+/// profile and a confidence above the 0.85 syntactic ceiling, where the same
+/// inputs under the default `syn` profile are capped. This is the per-profile cap,
+/// exercised end-to-end through `analyze`.
+#[test]
+fn stablemir_extractor_lifts_the_confidence_cap() {
+    let a = sig("crate::m::alpha", "a.rs");
+    let b = sig("crate::m::beta", "a.rs");
+
+    // Default (syn): capped at the syntactic ceiling, syn profile reported.
+    let syn = analyze_default(vec![a.clone(), b.clone()]);
+    assert_eq!(syn.profiles.len(), 1);
+    assert_eq!(syn.profiles[0].extractor, "syn");
+    assert!(syn.candidates[0].confidence <= SYNTACTIC_CONFIDENCE_CAP + 1e-9);
+
+    // stablemir: cap lifted, resolved profile reported, confidence above 0.85.
+    let params = AnalyzeParams {
+        extractor: Some("stablemir".to_string()),
+        ..AnalyzeParams::default()
+    };
+    let mir = analyze("root", vec![a, b], &params);
+    assert_eq!(mir.profiles.len(), 1);
+    assert_eq!(mir.profiles[0].extractor, "stablemir");
+    assert_eq!(mir.profiles[0].capability("types_resolved"), "yes");
+    let f = &mir.candidates[0];
+    assert!(
+        f.confidence > SYNTACTIC_CONFIDENCE_CAP,
+        "resolved run should exceed the syntactic cap, was {}",
+        f.confidence
+    );
+    // The resolved run states the structural (not syntactic) caveat honestly.
+    assert!(f
+        .counter_evidence
+        .iter()
+        .any(|c| c.contains("structural match only")));
+    assert!(!f
+        .counter_evidence
+        .iter()
+        .any(|c| c.contains("syntactic match only")));
+}
+
+/// `profile_for` is extractor-aware: a Rust `stablemir` run resolves the resolved
+/// profile, any other Rust extractor (and the language-keyed default) resolves the
+/// syntactic one, and the resolved profile keeps the SAME abstraction families as
+/// the syn profile so the classifier's family routing is unaffected.
+#[test]
+fn profile_for_selects_resolved_or_syntactic() {
+    assert_eq!(
+        profile_for("rust", "stablemir")
+            .unwrap()
+            .capability("types_resolved"),
+        "yes"
+    );
+    assert_eq!(
+        profile_for("rust", "syn")
+            .unwrap()
+            .capability("types_resolved"),
+        "syntactic"
+    );
+    // An unknown Rust extractor conservatively falls back to the syntactic profile.
+    assert_eq!(profile_for("rust", "whatever").unwrap().extractor, "syn");
+    // Same families as syn, so the classifier never names a family the routing
+    // (which validates via the syn-keyed `profile_for_language`) would reject.
+    assert_eq!(
+        rust_stablemir_profile().abstraction_families,
+        rust_syn_profile().abstraction_families
+    );
+}
+
 /// Union-find clusters a transitive chain a~b~c into one cluster even if a and c
 /// were never directly compared.
 #[test]

@@ -106,6 +106,49 @@ resolved identity (aliases look different); macro invocations are opaque; and
 there is no monomorphization (it cannot confirm two generic instantiations are
 structurally identical at the type level).
 
+**The Rust/`stablemir` profile is the RESOLVED path — same shape, richer edges.**
+
+A second Rust extractor reduces the *same* `StructuralSignature` shape from the
+compiler's own **monomorphized MIR**, via the StableMIR (`rustc_public`) driver
+(`crates/hinzu-rustc-driver`, run as `RUSTC_WORKSPACE_WRAPPER`, emitting a sibling
+`sigs-*.json` next to the effect `facts-*.json`). Because MIR is
+post-type-resolution and post-monomorphization it lifts three of the syn caveats
+and states the new costs honestly:
+
+```
+types_resolved:              yes       (resolved types — a type alias collapses to its constructor)
+call_targets_known:          yes       (resolved MIR call terminators, not a name guess)
+macro_expansion_visible:     yes       (MIR is post-expansion — macro-generated logic is visible)
+control_flow_available:      partial   (flat basic blocks; structured nesting lowered away)
+generics_visible:            yes
+dynamic_dispatch_understood: partial   (fn-pointer / dyn calls still unresolved)
+suggestion_scope:            language_specific
+abstraction_families: (identical to the syn Rust profile)
+```
+
+What it buys: a type alias (`type Bytes = Vec<u8>`) collapses to its underlying
+constructor (`Vec<_>`) instead of an opaque leaf, differently-written-but-same
+types match, the call sequence is resolved callees (including `?` lowered to
+`Try::branch`/`from_residual`), and macro-generated bodies are compared rather
+than skipped. What it costs: source-level nesting is lowered (so `max_nesting`
+reads 0, and `if`/`match`/loops are read best-effort from `SwitchInt` fan-out and
+CFG back-edges), and indirect dispatch stays unresolved. A generic fn that is
+never monomorphized at the item level is signed from its polymorphic body, so its
+type *parameters* read as `_` (like syn) — the resolution win lands on concrete
+functions and on aliases in any signature.
+
+Crucially, the **confidence cap is per-profile**: a syntactic profile caps
+confidence at 0.85 (a syntactic extractor can never confirm two slots are the
+same type), while the resolved `stablemir` profile is *not* capped — the same
+per-profile mechanism that already lets the type-resolved TypeScript profile run
+uncapped. The output's `profiles[]` records which extractor actually produced the
+run. The two Rust extractors are never mixed in one analysis (a run is
+homogeneous — one language, one extractor — so their different MIR-vs-AST feature
+spaces never cross-compare). Selected by `hinzu similar --rust-extractor
+{auto,syn,stablemir}`: `auto` uses the driver when the pinned nightly is
+available and falls back to `syn` otherwise (the toolchain-free CI mode);
+`stablemir` requires the driver and errors honestly if it is missing.
+
 ### `Finding` — one per candidate cluster (>= 2 members)
 
 `{ id, members[], pattern, differences[], likely_abstraction, confidence,
@@ -213,9 +256,18 @@ skipped with a warning rather than sinking the whole run.
 - **Advisory, not a verdict.** The output is a set of *candidates to
   investigate*, deliberately not a refactor and not a correctness claim.
 
+The syn-specific limitations above (no monomorphization, name-matched call
+targets, opaque macros, written-form types) are lifted by the Rust/`stablemir`
+extractor, which trades them for the flat-CFG / unresolved-dynamic-dispatch costs
+its own profile records — see the `stablemir` profile above.
+
 ## Phasing
 
-- **Phase 1 (this):** the pure engine + the language-profile model + the
-  subcommand wiring + the Rust/`syn` extractor.
-- **Later:** the TypeScript extractor (emits the same signatures + a TS profile),
-  cross-language clustering, and richer abstraction-family heuristics.
+- **Phase 1:** the pure engine + the language-profile model + the subcommand
+  wiring + the Rust/`syn` extractor.
+- **Phase 2:** the TypeScript/`tsc-checker` extractor (same signatures + a
+  type-resolved TS profile) and the language-aware abstraction-family classifier.
+- **Phase 3 (this):** the resolved Rust path — the Rust/`stablemir` extractor over
+  monomorphized MIR + its profile + the per-profile confidence cap +
+  `--rust-extractor {auto,syn,stablemir}`.
+- **Later:** cross-language clustering and richer abstraction-family heuristics.
