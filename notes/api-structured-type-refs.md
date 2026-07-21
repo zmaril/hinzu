@@ -31,12 +31,12 @@ Two consumers do exactly this today:
   parse into something it can model, it degrades to `Json`. Its own coverage
   sidecar names the failure modes bluntly: `unparsable type expression`,
   `unresolved type reference`, `unmodeled generic type`. Each is a place where a
-  string had to be re-interpreted and the interpretation ran out of road.
+  string had to be re-interpreted and the interpretation then failed.
 - **`api-diff` (#34).** A structural API diff wants to say "field `x` changed
   from `Foo` to `Bar`" and, better, "the referenced symbol moved from module `a`
   to module `b`" — not merely "this string differs." With only strings it must
   re-parse both sides and re-derive the reference graph the extractor already
-  had in hand, then guess whether two differently-rendered strings denote the
+  computed, then guess whether two differently-rendered strings denote the
   same symbol.
 
 In both cases the extractor *knew* the referenced symbol at extraction time —
@@ -132,10 +132,10 @@ with no schema change at all.
 
 So the value of v2 is not a higher score. It is that the score stops being
 defended by a string parser: the converter gets simpler and less fragile,
-`api-diff` gets a structural basis, and future consumers get the reference graph
-for free. If the only goal were the orchestrator parity number, this note would
-not be worth implementing. The goal is to stop paying, again and again, to
-reconstruct a fact the extractor already knew.
+`api-diff` gets a structural basis, and future consumers read the reference graph
+directly instead of rebuilding it. If the only goal were the orchestrator parity
+number, this note would not be worth implementing. The goal is to stop paying,
+again and again, to reconstruct a fact the extractor already knew.
 
 ## Not in scope
 
