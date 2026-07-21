@@ -42,6 +42,7 @@ extern crate rustc_middle;
 extern crate rustc_public;
 
 mod bodies;
+mod signatures;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -102,7 +103,7 @@ struct EffectRoot {
 /// effect matching runs on the callee's *path*, not on type arguments. Without
 /// this, `Option::<std::fs::FileType>::is_some_and` matches `std::fs` — a false
 /// positive, because `std::fs::FileType` is a type argument, not a callee.
-fn strip_generics(name: &str) -> String {
+pub(crate) fn strip_generics(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut depth = 0usize;
     for c in name.chars() {
@@ -147,7 +148,7 @@ fn effect_category(name: &str) -> Option<&'static str> {
 /// statically-known trait-method name). Shared by the call path
 /// ([`CallCollector::visit_terminator`]) and the reference path
 /// ([`CallCollector::reference_operand`]) so both resolve a callee identically.
-fn fndef_name(def: FnDef, _args: &GenericArgs) -> String {
+pub(crate) fn fndef_name(def: FnDef, _args: &GenericArgs) -> String {
     // Derive the callee name from its polymorphic def path rather than resolving a
     // monomorphic `Instance`.
     //
@@ -505,6 +506,9 @@ fn analyze() -> ControlFlow<()> {
     // effect-fact path and every stable CI job are untouched.
     let emit_bodies = std::env::var("HINZU_EMIT_BODIES").is_ok();
     let mut body_facts = bodies::BodyFacts::default();
+    // Structural signatures for `hinzu similar --rust-extractor stablemir`,
+    // emitted to a sibling `sigs-*.json` (the effect `facts-*.json` is unchanged).
+    let mut sigs: Vec<signatures::Signature> = Vec::new();
 
     for item in rustc_public::all_local_items() {
         let name = item.name();
@@ -528,7 +532,8 @@ fn analyze() -> ControlFlow<()> {
                 // Either way its signature-type dependencies come from the item
                 // type (the ADTs are concrete named types, monomorphization or
                 // not) and are emitted below.
-                if def_ids.insert(name.clone(), ()).is_none() {
+                let is_new_def = def_ids.insert(name.clone(), ()).is_none();
+                if is_new_def {
                     facts
                         .definitions
                         .push(make_def(name.clone(), file.clone(), line_start, line_end));
@@ -551,6 +556,28 @@ fn analyze() -> ControlFlow<()> {
                         walk_body(&name, &body, &mut facts, &mut seen_root);
                     }
                 }
+                // Structural signature: a generic fn is never enumerated as a
+                // monomorphic `Instance`, so sign it here from its polymorphic
+                // body — its type parameters shape to `_` (honestly unresolved,
+                // like syn), but its resolved call targets, macro-expanded body,
+                // and any type aliases in its signature still land. Only `fn`
+                // items are signable (a static/const/closure has no fn signature;
+                // `build_signature` returns `None` for those anyway).
+                if is_new_def && matches!(item.kind(), ItemKind::Fn) {
+                    if let Some(body) = item.body() {
+                        if let Some(s) = signatures::build_signature(
+                            name.clone(),
+                            item.ty(),
+                            &body,
+                            file.clone(),
+                            line_start,
+                            line_end,
+                            "function",
+                        ) {
+                            sigs.push(s);
+                        }
+                    }
+                }
                 emit_signature_type_edges(
                     &name,
                     &file,
@@ -566,7 +593,8 @@ fn analyze() -> ControlFlow<()> {
             continue;
         }
         let disp = inst.name();
-        if def_ids.insert(disp.clone(), ()).is_none() {
+        let is_new_def = def_ids.insert(disp.clone(), ()).is_none();
+        if is_new_def {
             facts
                 .definitions
                 .push(make_def(disp.clone(), file.clone(), line_start, line_end));
@@ -591,16 +619,50 @@ fn analyze() -> ControlFlow<()> {
                 body_facts.functions.push(fb);
             }
         }
+
+        // Structural signature from the MONOMORPHIZED type + body: fully resolved
+        // parameter/return shapes and resolved call targets — the resolved-type
+        // win over syn. Keyed by the same monomorphic def id as the definition.
+        if is_new_def {
+            if let Some(s) = signatures::build_signature(
+                disp.clone(),
+                inst.ty(),
+                &body,
+                file.clone(),
+                line_start,
+                line_end,
+                "function",
+            ) {
+                sigs.push(s);
+            }
+        }
     }
 
     let dir = std::env::var("HINZU_FACTS_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let crate_name = rustc_public::local_crate().name;
-    let out = format!("{dir}/facts-{crate_name}-{}.json", std::process::id());
+    let pid = std::process::id();
+    let out = format!("{dir}/facts-{crate_name}-{pid}.json");
     let json = serde_json::to_string_pretty(&facts).unwrap();
     let mut f = std::fs::File::create(&out).unwrap();
     f.write_all(json.as_bytes()).unwrap();
+
+    // Structural signatures go to a SIBLING `sigs-*.json` in the same dir, so the
+    // effect `facts-*.json` schema is untouched and the CLI's similarity adapter
+    // merges these independently of the effect-facts merge.
+    let sig_count = sigs.len();
+    let sig_out = format!("{dir}/sigs-{crate_name}-{pid}.json");
+    let sig_doc = signatures::SigDoc {
+        language: "rust".to_string(),
+        extractor: "stablemir".to_string(),
+        signatures: sigs,
+    };
+    let sig_json = serde_json::to_string_pretty(&sig_doc).unwrap();
+    let mut sf = std::fs::File::create(&sig_out).unwrap();
+    sf.write_all(sig_json.as_bytes()).unwrap();
+
     eprintln!(
-        "[hinzu-rustc-driver] crate={crate_name} defs={} edges={} roots={} -> {out}",
+        "[hinzu-rustc-driver] crate={crate_name} defs={} edges={} roots={} sigs={sig_count} \
+         -> {out}",
         facts.definitions.len(),
         facts.edges.len(),
         facts.effect_roots.len(),
