@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use crate::write_json;
-use crate::{rust_adapter, structural_rust, ts_adapter};
+use crate::{library_tier, rust_adapter, structural_rust, ts_adapter};
 
 #[derive(Parser)]
 pub struct SimilarArgs {
@@ -49,6 +49,15 @@ pub struct SimilarArgs {
     /// project and for `--structural`.
     #[arg(long, value_enum, default_value_t = RustExtractor::Auto)]
     rust_extractor: RustExtractor,
+    /// A `--libraries` config (TOML) that turns on the curated-library "adopt the
+    /// library" tier: match local code against the shapes libraries the user
+    /// likes expose (e.g. this hand-written `impl Display`+`impl Error` is what
+    /// `#[derive(thiserror::Error)]` eliminates; this manual accumulation loop is
+    /// the shape of `itertools::process_results`). Advisory and evidence-carrying;
+    /// absent the flag the run is the base intra-repo analysis unchanged. See
+    /// `notes/design/similarity-libraries.md`.
+    #[arg(long)]
+    libraries: Option<PathBuf>,
     /// Where to write the similarity JSON. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -93,6 +102,15 @@ pub fn run(args: SimilarArgs) -> Result<ExitCode> {
     // doc's own extractor is threaded in so each run reports the RIGHT profile
     // (resolved `stablemir` vs syntactic `syn`) and applies the matching
     // confidence cap.
+    // Keep the local Rust signatures for the curated-library tier before the
+    // docs are consumed by the base analysis (the library tier scores local
+    // singletons AND cluster members, so it wants them all).
+    let local_rust_sigs: Vec<hinzu_core::similarity::StructuralSignature> = docs
+        .iter()
+        .filter(|d| d.language == "rust")
+        .flat_map(|d| d.signatures.iter().cloned())
+        .collect();
+
     let outputs: Vec<hinzu_core::similarity::SimilarityOutput> = docs
         .into_iter()
         .map(|doc| {
@@ -103,7 +121,18 @@ pub fn run(args: SimilarArgs) -> Result<ExitCode> {
             hinzu_core::similarity::analyze(&root, doc.signatures, &doc_params)
         })
         .collect();
-    let output = merge_similarity_outputs(&root, outputs, &params);
+    let mut output = merge_similarity_outputs(&root, outputs, &params);
+
+    // The curated-library tier, when `--libraries` is given.
+    if let Some(cfg_path) = &args.libraries {
+        library_tier::run(
+            cfg_path,
+            &args.path,
+            args.structural.is_some(),
+            &local_rust_sigs,
+            &mut output,
+        )?;
+    }
 
     print_similarity_summary(&output);
 
@@ -170,6 +199,8 @@ fn merge_similarity_outputs(
         },
         stats,
         candidates,
+        // The library tier runs after the merge and sets this on `output`.
+        library_candidates: Vec::new(),
     }
 }
 
@@ -280,12 +311,7 @@ fn print_similarity_summary(output: &hinzu_core::similarity::SimilarityOutput) {
             output.stats.clusters_rejected_low_cohesion, output.params.min_cohesion,
         );
     }
-    let langs_with_profiles: Vec<&str> = output
-        .profiles
-        .iter()
-        .map(|p| p.language.as_str())
-        .collect();
-    if langs_with_profiles.is_empty() && !output.languages.is_empty() {
+    if output.profiles.is_empty() && !output.languages.is_empty() {
         eprintln!(
             "note: no shipped structural profile for {} — findings are unprofiled",
             output.languages.join(", ")
@@ -307,4 +333,6 @@ fn print_similarity_summary(output: &hinzu_core::similarity::SimilarityOutput) {
             );
         }
     }
+
+    library_tier::print_summary(output);
 }

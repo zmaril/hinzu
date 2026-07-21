@@ -40,8 +40,14 @@ use serde::{Deserialize, Serialize};
 
 pub mod profile;
 pub use profile::{
-    profile_for, profile_for_language, rust_stablemir_profile, rust_syn_profile, ts_tsc_profile,
-    LanguageProfile,
+    curated_pattern_profile, profile_for, profile_for_language, rust_stablemir_profile,
+    rust_syn_profile, rustdoc_source_profile, ts_tsc_profile, LanguageProfile,
+};
+
+pub mod libraries;
+pub use libraries::{
+    match_libraries, CuratedSelection, ExternalKind, ExternalRef, ExternalSource, LibraryFinding,
+    LibraryParams, MatchMode, TraitImpl, TypeImplFacts, VirtualSignature,
 };
 
 /// The schema version embedded in every emitted similarity document, so a
@@ -381,6 +387,12 @@ pub struct SimilarityOutput {
     pub stats: SimilarityStats,
     /// The candidate clusters, sorted by confidence descending.
     pub candidates: Vec<Finding>,
+    /// The curated-library "adopt the library" candidates — local code that has
+    /// the shape of an external library item worth investigating adopting. Empty
+    /// (and omitted from JSON) unless the run was given a `--libraries` config, so
+    /// a base run's document is byte-identical to the frozen v1 shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_candidates: Vec<LibraryFinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +551,9 @@ pub fn analyze(
             candidates_found: findings.len(),
         },
         candidates: findings,
+        // Populated only by the CLI's library tier when `--libraries` is given;
+        // the pure base analysis never sets it.
+        library_candidates: Vec::new(),
     }
 }
 
