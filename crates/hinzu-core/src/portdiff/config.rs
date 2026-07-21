@@ -25,14 +25,18 @@ pub struct NamingRules {
     pub keep_pascal_types: bool,
     /// Keep SCREAMING_SNAKE constants verbatim (both languages spell them same).
     pub keep_screaming_consts: bool,
-    /// The target crate prefix on target ids (`atilla_ai`). Retained for id-based
-    /// fallback and documentation; module anchoring uses [`Self::target_src_prefix`]
-    /// (the defining file), which is more reliable than the id.
-    pub strip_crate_prefix: String,
-    /// The workspace-relative source directory of the **target** crate
-    /// (`crates/atilla-ai/src`); a target file under it is anchored to a module by
-    /// stripping this prefix. Falls back to the generic `crates/<x>/src/` shape.
-    pub target_src_prefix: String,
+    /// The target crate prefixes on target ids (`[atilla_ai]`). Retained for
+    /// id-based fallback and documentation; module anchoring uses
+    /// [`Self::target_src_prefix`] (the defining file), which is more reliable than
+    /// the id. One entry per target crate a source package maps to (usually one).
+    pub strip_crate_prefix: Vec<String>,
+    /// The workspace-relative source directories of the **target** crates
+    /// (`[crates/atilla-ai/src]`); a target file under any of them is anchored to a
+    /// module by stripping the matching prefix. Falls back to the generic
+    /// `crates/<x>/src/` shape. One entry per target crate a source package maps to
+    /// (usually one); merging several crates' graphs is how a source package ported
+    /// across crates stays visible to the matcher.
+    pub target_src_prefix: Vec<String>,
     /// The leading directory of the **source** package (`src`) stripped before a
     /// source file becomes a module path.
     pub source_src_prefix: String,
@@ -94,8 +98,8 @@ impl PortDiffConfig {
                 fn_case: "camel_to_snake".to_string(),
                 keep_pascal_types: true,
                 keep_screaming_consts: true,
-                strip_crate_prefix: "atilla_ai".to_string(),
-                target_src_prefix: "crates/atilla-ai/src".to_string(),
+                strip_crate_prefix: vec!["atilla_ai".to_string()],
+                target_src_prefix: vec!["crates/atilla-ai/src".to_string()],
                 source_src_prefix: "src".to_string(),
             },
             ported_threshold: 0.6,

@@ -884,11 +884,37 @@ fn extract_target_graph_live(
              pinned nightly), or supply a pre-extracted target graph"
         );
     }
-    eprintln!(
-        "extracting target graph from {}",
-        resolved.target_path.display()
-    );
-    build_graph_from_source(&resolved.target_path, None, None)
+    // A source package may have been ported across several crates. Extract each
+    // and merge the graphs into one target index; symbols keep their real
+    // `crates/<crate>/…` file paths, so the `file.starts_with("crates/")` filter
+    // and per-file attribution in core still work unchanged.
+    let mut graphs = Vec::with_capacity(resolved.target_paths.len());
+    for path in &resolved.target_paths {
+        eprintln!("extracting target graph from {}", path.display());
+        graphs.push(build_graph_from_source(path, None, None)?);
+    }
+    Ok(merge_target_graphs(graphs))
+}
+
+/// Concatenate several extracted target graphs into one. `port_diff` reads only
+/// `symbols` and `edges`; the file rollups are merged too for completeness. The
+/// crates occupy disjoint id namespaces (`crates/<crate>/…` paths, `<crate>::…`
+/// ids), so a plain concatenation needs no de-duplication. A single-crate package
+/// returns its one graph unchanged.
+fn merge_target_graphs(
+    graphs: Vec<hinzu_core::graph::GraphOutput>,
+) -> hinzu_core::graph::GraphOutput {
+    let mut iter = graphs.into_iter();
+    let mut merged = iter
+        .next()
+        .expect("a resolved package always has at least one target crate");
+    for g in iter {
+        merged.symbols.extend(g.symbols);
+        merged.edges.extend(g.edges);
+        merged.files.extend(g.files);
+        merged.file_edges.extend(g.file_edges);
+    }
+    merged
 }
 
 /// Read a per-package graph from the cache (`<dir>/<pkg>-<kind>.json`) when it is
