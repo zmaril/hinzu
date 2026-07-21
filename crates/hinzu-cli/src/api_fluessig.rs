@@ -10,20 +10,32 @@ use anyhow::{Context, Result};
 use hinzu_core::api::ApiReport;
 use hinzu_core::fluessig_api::{build_fluessig, Stats};
 
-/// Read `apireport`, convert, and write the two documents. Returns the coverage
-/// [`Stats`] so the CLI can print/persist the feasibility evidence.
+/// Read and parse one hinzu API report off disk.
+fn read_report(path: &Path) -> Result<ApiReport> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the API report from {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing {} as a hinzu API report", path.display()))
+}
+
+/// Read `apireport` (primary) plus any `context` sibling-package reports,
+/// convert, and write the two documents. Returns the coverage [`Stats`] so the
+/// CLI can print/persist the feasibility evidence. All filesystem effects live
+/// here; core only transforms the parsed values.
 pub fn run(
     apireport: &Path,
+    context: &[std::path::PathBuf],
     out_api: &Path,
     out_catalog: &Path,
     out_stats: Option<&Path>,
 ) -> Result<Stats> {
-    let text = std::fs::read_to_string(apireport)
-        .with_context(|| format!("reading the API report from {}", apireport.display()))?;
-    let report: ApiReport = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {} as a hinzu API report", apireport.display()))?;
+    let report = read_report(apireport)?;
+    let context_reports: Vec<ApiReport> = context
+        .iter()
+        .map(|p| read_report(p))
+        .collect::<Result<_>>()?;
 
-    let out = build_fluessig(&report);
+    let out = build_fluessig(&report, &context_reports);
 
     let api_json =
         serde_json::to_string_pretty(&out.api).context("serializing the fluessig api.json")?;
@@ -57,6 +69,12 @@ pub fn summary(stats: &Stats) -> String {
         stats.unions_synthesized,
         stats.unions_lifted,
     ));
+    if stats.context_reports > 0 {
+        s.push_str(&format!(
+            "  cross-package: {} context report(s), {} sibling type(s) pulled in (transitively referenced)\n",
+            stats.context_reports, stats.context_types_pulled,
+        ));
+    }
     s.push_str(&format!(
         "  ops: {} total, {} cleanly typed, {} degraded (a param/return fell back to Json)\n",
         stats.ops_total, stats.ops_clean, stats.ops_degraded,

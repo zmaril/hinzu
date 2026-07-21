@@ -205,6 +205,14 @@ pub struct FlEnumVariant {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Stats {
     pub items_in: usize,
+    /// How many sibling-package (context) reports fed the resolution namespace.
+    /// `0` in the single-report path.
+    pub context_reports: usize,
+    /// Of the emitted types, how many were *pulled in* from a context report by
+    /// the scoped transitive closure (sibling models/enums/unions the primary
+    /// references). Counted toward `models_emitted`/`enums_emitted`/
+    /// `unions_synthesized` as well — this is the cross-package slice of them.
+    pub context_types_pulled: usize,
     pub by_kind: BTreeMap<String, usize>,
     pub models_emitted: usize,
     /// Of `models_emitted`, how many were *minted* from an inline/anonymous
@@ -277,6 +285,14 @@ struct Converter {
     /// The naming context (owning op/field path) used to name the next minted
     /// model — e.g. `["SpawnInstance", "Options"]` → `SpawnInstanceOptions`.
     name_hint: Vec<String>,
+    /// The names that resolve to a **context** (sibling-package) type rather than
+    /// a primary-package one. A resolved ref to any of these is recorded in
+    /// [`needed`](Self::needed) so the type is pulled into the scoped emission.
+    /// Empty in the single-report path, so that path is untouched.
+    context_names: BTreeSet<String>,
+    /// Context type names actually referenced (transitively) by the emitted
+    /// surface — the worklist driving scoped cross-package emission.
+    needed: BTreeSet<String>,
 }
 
 /// The outcome of parsing one rendered type string.
@@ -311,6 +327,18 @@ impl Converter {
             minted: BTreeMap::new(),
             minted_by_sig: BTreeMap::new(),
             name_hint: Vec::new(),
+            context_names: BTreeSet::new(),
+            needed: BTreeSet::new(),
+        }
+    }
+
+    /// Record a resolved ref: if `name` names a context (sibling-package) type,
+    /// add it to the worklist so scoped emission pulls it (and, transitively,
+    /// whatever it references) into the output. A no-op for primary-package
+    /// names, so the single-report path never populates the worklist.
+    fn note_ref(&mut self, name: &str) {
+        if self.context_names.contains(name) {
+            self.needed.insert(name.to_string());
         }
     }
 
@@ -437,16 +465,19 @@ impl Converter {
             return self.degrade("unparsable type expression");
         }
         if self.known_enums.contains(s) {
+            self.note_ref(s);
             return Parsed::clean(FlType::Enum {
                 r#enum: s.to_string(),
             });
         }
         if self.known_models.contains(s) {
+            self.note_ref(s);
             return Parsed::clean(FlType::Model {
                 model: s.to_string(),
             });
         }
         if self.known_unions.contains(s) {
+            self.note_ref(s);
             return Parsed::clean(FlType::Union {
                 union: s.to_string(),
             });
@@ -530,6 +561,7 @@ impl Converter {
         let t = m.trim();
         if is_ident(t) {
             if self.known_enums.contains(t) {
+                self.note_ref(t);
                 return (
                     FlType::Enum {
                         r#enum: t.to_string(),
@@ -538,6 +570,7 @@ impl Converter {
                 );
             }
             // Keep the name as metadata even when the model is not (yet) defined.
+            self.note_ref(t);
             return (
                 FlType::Model {
                     model: t.to_string(),
@@ -695,11 +728,21 @@ impl Converter {
 
 /// Convert a hinzu [`ApiReport`] into fluessig's `api.json` + `catalog.json`
 /// (plus coverage [`Stats`]). Pure: transforms only in-memory data.
-pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
+///
+/// `context` is a slice of **sibling-package** reports the primary imports types
+/// from. Their models/enums/liftable-union aliases populate the resolution
+/// namespace so the primary's refs to sibling types (`RpcCommand`,
+/// `RpcResponse`, …) resolve instead of degrading to `Json`. Emission stays
+/// **scoped**: only the sibling types the primary surface *transitively
+/// references* are pulled into the output as real `models[]`/`unions[]`/`enums`;
+/// the context packages' own op surface is never emitted. Pass `&[]` for the
+/// single-report behavior (byte-identical to the pre-context path).
+pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutput {
     let items: Vec<&ApiItem> = report.modules.iter().flat_map(|m| m.items.iter()).collect();
 
     let mut stats = Stats {
         items_in: items.len(),
+        context_reports: context.len(),
         ..Default::default()
     };
     for it in &items {
@@ -713,6 +756,10 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
     let mut known_models = BTreeSet::new();
     // The value types of each interface/record, for `X[keyof X]` expansion.
     let mut indexable: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Every primary-package item name — a context type of the same name is
+    // skipped (the primary's own definition is authoritative and already
+    // emitted), so cross-package resolution never shadows or duplicates it.
+    let primary_names: BTreeSet<String> = items.iter().map(|it| it.name.clone()).collect();
     for it in &items {
         match it.kind.as_str() {
             "interface" | "record" => {
@@ -724,22 +771,62 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
             }
             "enum" => {
                 known_enums.insert(it.name.clone());
-                catalog_enums.push(FlEnum {
-                    name: it.name.clone(),
-                    variants: it
-                        .variants
-                        .iter()
-                        .map(|v| FlEnumVariant {
-                            name: v.name.clone(),
-                            value: v.discriminant.clone(),
-                        })
-                        .collect(),
-                });
+                catalog_enums.push(enum_from_item(it));
             }
             "typeAlias" => {
                 if let Some(variants) = string_literal_union(it.alias_target.as_deref()) {
                     known_enums.insert(it.name.clone());
                     catalog_enums.push(FlEnum {
+                        name: it.name.clone(),
+                        variants,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 1c — sibling-package (context) namespace. Registers context type NAMES
+    // into the resolution namespace so the primary's refs resolve, and records how
+    // to emit each on demand (`context_models`/`context_enum_defs`/
+    // `context_unions`). Nothing is emitted here — the scoped closure below pulls
+    // in only the transitively-referenced ones. A name the primary already owns is
+    // skipped. `indexable` is merged (primary wins) so cross-package `X[keyof X]`
+    // still expands.
+    let ctx_items: Vec<&ApiItem> = context
+        .iter()
+        .flat_map(|r| r.modules.iter().flat_map(|m| m.items.iter()))
+        .collect();
+    let mut context_names: BTreeSet<String> = BTreeSet::new();
+    let mut context_models: BTreeMap<String, &ApiItem> = BTreeMap::new();
+    let mut context_enum_defs: BTreeMap<String, FlEnum> = BTreeMap::new();
+    // First register models/enums + `indexable`, so alias liftability (which reads
+    // `indexable`) sees every context map type before it is tested.
+    for it in &ctx_items {
+        if primary_names.contains(&it.name) {
+            continue;
+        }
+        match it.kind.as_str() {
+            "interface" | "record" => {
+                known_models.insert(it.name.clone());
+                indexable
+                    .entry(it.name.clone())
+                    .or_insert_with(|| it.fields.iter().map(|f| f.ty.clone()).collect());
+                context_names.insert(it.name.clone());
+                context_models.entry(it.name.clone()).or_insert(it);
+            }
+            "enum" => {
+                known_enums.insert(it.name.clone());
+                context_names.insert(it.name.clone());
+                context_enum_defs
+                    .entry(it.name.clone())
+                    .or_insert_with(|| enum_from_item(it));
+            }
+            "typeAlias" => {
+                if let Some(variants) = string_literal_union(it.alias_target.as_deref()) {
+                    known_enums.insert(it.name.clone());
+                    context_names.insert(it.name.clone());
+                    context_enum_defs.entry(it.name.clone()).or_insert(FlEnum {
                         name: it.name.clone(),
                         variants,
                     });
@@ -761,10 +848,24 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
             known_unions.insert(it.name.clone());
         }
     }
+    // The same for context liftable-union aliases (deferred emission).
+    let mut context_unions: BTreeMap<String, &ApiItem> = BTreeMap::new();
+    for it in &ctx_items {
+        if it.kind == "typeAlias"
+            && !primary_names.contains(&it.name)
+            && !known_enums.contains(&it.name)
+            && expand_alias_union_members(it.alias_target.as_deref(), &indexable).is_some()
+        {
+            known_unions.insert(it.name.clone());
+            context_names.insert(it.name.clone());
+            context_unions.entry(it.name.clone()).or_insert(it);
+        }
+    }
 
     let mut conv = Converter::new(known_enums, known_models);
     conv.known_unions = known_unions;
     conv.indexable = indexable;
+    conv.context_names = context_names;
 
     // Pass 2 — models, interfaces, and free-function ops.
     let mut models: Vec<FlModel> = Vec::new();
@@ -832,6 +933,45 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
         });
     }
 
+    // Scoped cross-package emission — a transitive closure over the sibling types
+    // the primary surface referenced. Each round emits the newly-`needed` context
+    // types as real fluessig types; emitting a context model/union parses its
+    // fields/members, which may reference further context types (`RpcCommand` →
+    // its inline objects; `AgentSessionEvent` → `AgentMessage`), growing the
+    // worklist. Deterministic: `needed` is a `BTreeSet`, so each batch is
+    // name-sorted, and only referenced types are pulled (never a context package's
+    // whole op surface). Truly-foreign refs (`ChildProcess`, `http.Server`) were
+    // never registered as context types, so they still degrade to `Json` here.
+    let mut emitted_ctx: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let batch: Vec<String> = conv
+            .needed
+            .iter()
+            .filter(|n| !emitted_ctx.contains(n.as_str()))
+            .cloned()
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        for name in batch {
+            emitted_ctx.insert(name.clone());
+            if let Some(it) = context_models.get(name.as_str()) {
+                models.push(build_model(&mut conv, &mut stats, it));
+            } else if let Some(en) = context_enum_defs.get(name.as_str()) {
+                catalog_enums.push(en.clone());
+            } else if let Some(it) = context_unions.get(name.as_str()) {
+                if let Some(members) =
+                    expand_alias_union_members(it.alias_target.as_deref(), &conv.indexable)
+                {
+                    if conv.lift_alias_union(&name, &members) {
+                        stats.unions_lifted += 1;
+                    }
+                }
+            }
+        }
+    }
+    stats.context_types_pulled = emitted_ctx.len();
+
     // Fold in models minted from inline object literals (deduped by field-set).
     stats.models_minted = conv.minted.len();
     models.extend(std::mem::take(&mut conv.minted).into_values());
@@ -871,6 +1011,22 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
         api,
         catalog,
         stats,
+    }
+}
+
+/// Build a catalog [`FlEnum`] from a real `enum` item's variants (name + wire
+/// discriminant). Shared by the primary and context namespace passes.
+fn enum_from_item(it: &ApiItem) -> FlEnum {
+    FlEnum {
+        name: it.name.clone(),
+        variants: it
+            .variants
+            .iter()
+            .map(|v| FlEnumVariant {
+                name: v.name.clone(),
+                value: v.discriminant.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1025,423 +1181,8 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
     })
 }
 
-// ─────────────────────────── string helpers ─────────────────────────────────
-
-/// Collapse newlines/tabs/runs-of-spaces so a multi-line rendered type is one
-/// tidy line, and drop a leading `|` (TS renders wide unions with a leading bar).
-fn normalize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_space = false;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-            }
-            prev_space = true;
-        } else {
-            out.push(c);
-            prev_space = false;
-        }
-    }
-    let t = out.trim();
-    t.strip_prefix("| ")
-        .or_else(|| t.strip_prefix('|'))
-        .unwrap_or(t)
-        .trim()
-        .to_string()
-}
-
-/// Tracks bracket-nesting depth and string-literal state while walking a
-/// rendered type string left to right — the shared spine behind [`split_top`],
-/// [`balanced`], and [`has_top_level_arrow`], which otherwise each repeat the
-/// same depth/quote bookkeeping loop body.
-#[derive(Default)]
-struct Brackets {
-    depth: i32,
-    in_str: Option<char>,
-}
-
-impl Brackets {
-    /// Advance past one char, updating the running depth/string state. Returns
-    /// `true` iff this char is ordinary **top-level content** — outside any
-    /// string literal, at bracket-depth 0, and not itself a bracket or quote —
-    /// i.e. the character stream a splitter/scanner reasons about. Brackets and
-    /// quotes drive the state and return `false`.
-    fn feed(&mut self, c: char) -> bool {
-        if let Some(q) = self.in_str {
-            if c == q {
-                self.in_str = None;
-            }
-            return false;
-        }
-        match c {
-            '"' | '\'' | '`' => {
-                self.in_str = Some(c);
-                false
-            }
-            '<' | '(' | '[' | '{' => {
-                self.depth += 1;
-                false
-            }
-            '>' | ')' | ']' | '}' => {
-                self.depth -= 1;
-                false
-            }
-            _ => self.depth == 0,
-        }
-    }
-}
-
-/// Split `s` on every top-level char satisfying `is_sep`, respecting `<>`,
-/// `()`, `[]`, `{}` nesting and string literals. The shared spine behind
-/// [`split_top`] and [`split_object_members`].
-fn split_top_by(s: &str, is_sep: impl Fn(char) -> bool) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut b = Brackets::default();
-    let mut cur = String::new();
-    for c in s.chars() {
-        if b.feed(c) && is_sep(c) {
-            parts.push(cur.trim().to_string());
-            cur.clear();
-        } else {
-            cur.push(c);
-        }
-    }
-    if !cur.trim().is_empty() {
-        parts.push(cur.trim().to_string());
-    }
-    parts
-}
-
-/// Split `s` on a top-level `sep` (nesting- and string-aware).
-fn split_top(s: &str, sep: char) -> Vec<String> {
-    split_top_by(s, |c| c == sep)
-}
-
-/// Split an inline object body into its member strings, respecting nesting and
-/// string literals. Object-type members are separated by `;` (or `,`).
-fn split_object_members(s: &str) -> Vec<String> {
-    split_top_by(s, |c| c == ';' || c == ',')
-}
-
-/// Split one object member `name: T` / `name?: T` at its first top-level colon
-/// into `(name, type)`. `None` when there is no top-level colon (a bare call
-/// signature like `close(): void` splits at the colon after `)`, leaving a
-/// non-ident name half that the caller rejects) — the `readonly` modifier, if
-/// present, is stripped from the name half.
-fn split_object_member(s: &str) -> Option<(String, String)> {
-    let mut b = Brackets::default();
-    for (i, c) in s.char_indices() {
-        if b.feed(c) && c == ':' {
-            let name = s[..i].trim();
-            let name = name.strip_prefix("readonly ").unwrap_or(name).trim();
-            let ty = s[i + 1..].trim();
-            if name.is_empty() || ty.is_empty() {
-                return None;
-            }
-            return Some((name.to_string(), ty.to_string()));
-        }
-    }
-    None
-}
-
-/// A deterministic, order-independent signature of a field-set, so two inline
-/// objects with the same fields (in any order) dedupe to a single minted model.
-fn object_signature(fields: &[FlField]) -> String {
-    let mut parts: Vec<String> = fields
-        .iter()
-        .map(|f| format!("{}={}|{}", f.name, fltype_key(&f.ty), f.nullable))
-        .collect();
-    parts.sort();
-    parts.join(";")
-}
-
-/// A stable string key for an [`FlType`] (used only for dedup signatures — kept
-/// self-contained so it stays inside hinzu-core's pure region).
-fn fltype_key(t: &FlType) -> String {
-    match t {
-        FlType::Scalar(s) => format!("s:{s}"),
-        FlType::Model { model } => format!("m:{model}"),
-        FlType::Enum { r#enum } => format!("e:{}", r#enum),
-        FlType::List { list } => format!("l[{}]", fltype_key(list)),
-        FlType::Nullable { nullable } => format!("n[{}]", fltype_key(nullable)),
-        FlType::Union { union } => format!("u:{union}"),
-    }
-}
-
-/// `Foo<Bar>` with `head == "Foo"` → `Some("Bar")` (the whole inner, including
-/// any nested generics/commas). Returns `None` unless `s` is exactly
-/// `head<...>`.
-fn strip_generic(s: &str, head: &str) -> Option<String> {
-    let rest = s.strip_prefix(head)?;
-    let rest = rest.strip_prefix('<')?;
-    let inner = rest.strip_suffix('>')?;
-    // Guard against `head` being a prefix of a longer identifier
-    // (`PromiseLike<…>` must not match `Promise`).
-    if !balanced(inner) {
-        return None;
-    }
-    Some(inner.trim().to_string())
-}
-
-/// Any generic `Head<Inner>` → `Some(("Head", "Inner"))`.
-fn split_generic_head(s: &str) -> Option<(&str, String)> {
-    let open = s.find('<')?;
-    if !s.ends_with('>') {
-        return None;
-    }
-    let head = &s[..open];
-    if !is_ident(head) {
-        return None;
-    }
-    let inner = &s[open + 1..s.len() - 1];
-    if !balanced(inner) {
-        return None;
-    }
-    Some((head, inner.trim().to_string()))
-}
-
-/// A trailing balanced `[]` array suffix → the element type.
-fn strip_array_suffix(s: &str) -> Option<&str> {
-    let inner = s.strip_suffix("[]")?;
-    if inner.is_empty() || !balanced(inner) {
-        return None;
-    }
-    Some(inner.trim())
-}
-
-/// Whether every bracket kind is balanced across `s` (so a split/strip did not
-/// cut through a nested generic or tuple).
-fn balanced(s: &str) -> bool {
-    let mut b = Brackets::default();
-    for c in s.chars() {
-        b.feed(c);
-        if b.depth < 0 {
-            return false;
-        }
-    }
-    b.depth == 0
-}
-
-/// A top-level `=>` (a function type), ignoring arrows inside nested brackets.
-fn has_top_level_arrow(s: &str) -> bool {
-    let mut b = Brackets::default();
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        if b.feed(c) && c == '=' && chars.get(i + 1) == Some(&'>') {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_string_literal(s: &str) -> bool {
-    (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
-        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
-        || (s.starts_with('`') && s.ends_with('`') && s.len() >= 2)
-}
-
-fn is_numeric_literal(s: &str) -> bool {
-    let t = s.strip_suffix('n').unwrap_or(s); // bigint literal `42n`
-    !t.is_empty()
-        && t.chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+')
-        && t.chars().any(|c| c.is_ascii_digit())
-}
-
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-}
-
-/// If a type came back `Nullable<T>`, peel it and report that it was nullable
-/// (so the field/param `nullable`/`optional` flag carries it instead).
-fn unwrap_nullable(t: FlType) -> (FlType, bool) {
-    match t {
-        FlType::Nullable { nullable } => (*nullable, true),
-        other => (other, false),
-    }
-}
-
-/// A rendered destructured/rest param name (`{ a, b }`, `...args`) is not a Rust
-/// ident; give it a stable placeholder.
-fn sanitize_param(name: &str) -> String {
-    if name.is_empty() {
-        "arg".to_string()
-    } else if let Some(rest) = name.strip_prefix("...") {
-        rest.to_string()
-    } else if is_ident(name) {
-        name.to_string()
-    } else {
-        "arg".to_string()
-    }
-}
-
-/// Parse a rendered union type-alias target into enum variants iff every member
-/// is a string literal.
-fn string_literal_union(alias: Option<&str>) -> Option<Vec<FlEnumVariant>> {
-    let s = normalize(alias?);
-    let members = split_top(&s, '|');
-    if members.len() < 2 || !members.iter().all(|m| is_string_literal(m.trim())) {
-        return None;
-    }
-    Some(
-        members
-            .iter()
-            .map(|m| {
-                let inner = m.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`');
-                FlEnumVariant {
-                    name: inner.to_string(),
-                    value: None,
-                }
-            })
-            .collect(),
-    )
-}
-
-/// Classify a top-level `typeAlias` target as a **liftable** union and, if so,
-/// return its flattened member type-strings. Liftable shapes:
-///
-/// * a union of named types (`RpcCommand | RpcExtensionUIResponse`), and
-/// * an `X[keyof X]` indexed-access — expanded to the value types of `X`'s
-///   members when `X` is a known interface/record — optionally unioned with
-///   extra members (`ResponseMap[keyof ResponseMap] | ErrorResponse`).
-///
-/// Returns `None` (leaving the alias dropped) for: a conditional/generic target
-/// (`T extends … infer …`), a bare single alias (`type A = B`), an
-/// all-string-literal union (that's the catalog-enum path, handled in pass 1),
-/// or an indexed access whose base is not a known model (degrade gracefully).
-///
-/// NOTE: this parses the rendered `alias_target` **string** — the shape the
-/// ApiReport carries today. A later pass (structured type refs) will have hinzu
-/// emit structured members and retire this string parsing.
-fn expand_alias_union_members(
-    target: Option<&str>,
-    indexable: &BTreeMap<String, Vec<String>>,
-) -> Option<Vec<String>> {
-    let s = normalize(target?);
-    // A conditional / `infer` / generic-constraint target is irreducible here.
-    if s.contains(" extends ") || s.contains("infer ") {
-        return None;
-    }
-    let top = split_top(&s, '|');
-    if top.is_empty() {
-        return None;
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut expanded_indexed = false;
-    for member in &top {
-        let m = member.trim();
-        if let Some(base) = indexed_access_base(m) {
-            // `X[keyof X]` → the value types of X's members (or ungraceful drop
-            // when X is not a known interface/record).
-            let values = indexable.get(base)?;
-            out.extend(values.iter().cloned());
-            expanded_indexed = true;
-        } else {
-            out.push(m.to_string());
-        }
-    }
-    if out.is_empty() {
-        return None;
-    }
-    // Liftable iff we expanded an indexed access, or it is a genuine multi-member
-    // union (a single bare alias like `type A = B` is a different gap).
-    if expanded_indexed || top.len() >= 2 {
-        // Do not steal the string-literal-union → catalog-enum path.
-        if out.iter().all(|m| is_string_literal(m.trim())) {
-            return None;
-        }
-        Some(out)
-    } else {
-        None
-    }
-}
-
-/// Recognize an `X[keyof X]` indexed-access expression and return its base `X`
-/// (the map type whose value types the access enumerates). `None` for any other
-/// shape, including `X[K]` with a specific key or a mismatched `X[keyof Y]`.
-fn indexed_access_base(s: &str) -> Option<&str> {
-    let open = s.find('[')?;
-    let inner = s.get(open + 1..)?.strip_suffix(']')?;
-    let base = s[..open].trim();
-    let key = inner.trim().strip_prefix("keyof ")?.trim();
-    if is_ident(base) && key == base {
-        Some(base)
-    } else {
-        None
-    }
-}
-
-/// The flat interface name for a package's free functions: PascalCase of the
-/// last path segment of the package name (`@earendil-works/pi-orchestrator` →
-/// `PiOrchestrator`).
-fn package_interface_name(pkg: &str) -> String {
-    let last = pkg.rsplit('/').next().unwrap_or(pkg);
-    let p = pascal(last);
-    if p.is_empty() {
-        "Api".to_string()
-    } else {
-        p
-    }
-}
-
-/// PascalCase from an arbitrary label (splitting on `-`, `_`, and spaces).
-fn pascal(s: &str) -> String {
-    s.split(['-', '_', ' ', '.'])
-        .filter(|w| !w.is_empty())
-        .map(|w| {
-            let mut cs = w.chars();
-            match cs.next() {
-                Some(f) => f.to_ascii_uppercase().to_string() + cs.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
-}
-
-/// Push a union variant with a collision-free camelCase tag derived from
-/// `label` (disambiguating against `seen` with a numeric suffix). The shared
-/// tail of both union builders ([`Converter::synthesize_union`] for anonymous
-/// inline unions and [`Converter::lift_alias_union`] for named alias unions).
-fn push_unique_variant(
-    variants: &mut Vec<FlUnionVariant>,
-    seen: &mut BTreeSet<String>,
-    label: &str,
-    ty: FlType,
-) {
-    let mut tag = camel(label);
-    let mut i = 2;
-    while seen.contains(&tag) {
-        tag = format!("{}{i}", camel(label));
-        i += 1;
-    }
-    seen.insert(tag.clone());
-    variants.push(FlUnionVariant { tag, ty });
-}
-
-/// A generic label for a structural (non-ident) union member: its scalar name,
-/// else `"member"`. Used to name/tag a union built from such a member.
-fn structural_label(ty: &FlType) -> String {
-    match ty {
-        FlType::Scalar(s) => s.clone(),
-        _ => "member".to_string(),
-    }
-}
-
-/// camelCase from a label (PascalCase with a lowercased first char).
-fn camel(s: &str) -> String {
-    let p = pascal(s);
-    let mut cs = p.chars();
-    match cs.next() {
-        Some(f) => f.to_ascii_lowercase().to_string() + cs.as_str(),
-        None => String::new(),
-    }
-}
+mod helpers;
+use helpers::*;
 
 #[cfg(test)]
 mod tests;
