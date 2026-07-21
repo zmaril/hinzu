@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`hinzu ranges` — freerange-style numeric range / abstract-interpretation
+  analysis, catching integer divide-by-zero at compile time on Rust via MIR
+  intervals.** A new subcommand infers, per function, the interval each value can
+  hold (interval + integer flag + may-be-NaN + one excluded point, with
+  IEEE-754-exact float arithmetic) and flags arithmetic hazards — integer
+  divide-by-zero and remainder-by-zero today — as evidence-carrying facts: which
+  function, which statement location, and the divisor range that proves it. The
+  architecture keeps the analysis **language-agnostic**: the interval domain, the
+  worklist abstract-interpretation engine (with widening and branch refinement),
+  and the hazard detection live in a pure `hinzu_core::absint` module (passes the
+  functional-core self-check — no I/O, only `alloc`), consuming a
+  language-neutral body-fact IR. Only the fact **extraction** is Rust-specific:
+  the StableMIR driver, under `HINZU_EMIT_BODIES`, lowers each function's MIR
+  basic blocks, assignment statements, and terminators into that IR — so a new
+  language later is a new extractor feeding the same engine. rustc inserts a
+  divide-by-zero assert before integer division; the engine deliberately does not
+  refine on that assert (which would prove every division safe), so what it proves
+  is that the inserted panic is *reachable* — while a user guard (`if c != 0 { ..
+  / c }`, compiled to a `SwitchInt`) is refined and correctly discharges the
+  divisor (the excluded-point trick). Analysis is intraprocedural; the `Call`
+  terminator carries the seam for interprocedural range propagation (freerange's
+  requirement peeling) to ride hinzu's call-graph fixpoint later. `hinzu ranges
+  <path>` emits deterministic JSON (per-function parameter/return ranges + hazards
+  with evidence) and exits non-zero when a hazard is found, so it is usable as a
+  CI gate; `--bodies <json>` analyzes pre-extracted body facts with no nightly
+  toolchain. A committed `crates/hinzu-cli/tests/fixtures/ranges-demo` (bodies
+  extracted from the real driver) gives stable-CI coverage — an unguarded `width
+  / count` and `x % n` are flagged, a guarded divide and a divide by a nonzero
+  constant are not — plus an `#[ignore]`d live end-to-end test over the demo
+  crate.
 - **Full reference-level parity for the native TypeScript adapter — higher-order
   and module-level (import-time) effects in the tsc compiler API.** The adapter
   already drew `reference` edges for a bare identifier resolving to an owned

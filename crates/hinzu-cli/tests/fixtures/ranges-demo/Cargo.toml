@@ -1,0 +1,14 @@
+# A tiny fixture crate for `hinzu ranges`: functions with and without a
+# divide-by-zero hazard, used by the end-to-end test and the committed
+# bodies.json (extracted from this crate by the StableMIR driver).
+[package]
+name = "ranges-demo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Standalone crate — not a member of the hinzu workspace.
+[workspace]

@@ -62,6 +62,29 @@ enum Cmd {
     /// (deciding what a generated binding should expose). Rust is extracted via
     /// `rustdoc --output-format=json`; TypeScript and Python are later phases.
     Api(ApiArgs),
+    /// Freerange-style numeric range analysis: infer the interval each value can
+    /// hold and flag arithmetic hazards — integer divide-by-zero / remainder-by-
+    /// zero today — as evidence-carrying facts (which function, which statement,
+    /// and the divisor range that proves it). Emits deterministic JSON: per-
+    /// function parameter/return ranges plus the hazards found. Intraprocedural.
+    /// Rust bodies are extracted from MIR by the StableMIR driver; `--bodies`
+    /// takes a pre-extracted body-fact JSON instead (no toolchain needed). Exits
+    /// non-zero when a hazard is found, so it is usable as a CI gate.
+    Ranges(RangesArgs),
+}
+
+#[derive(Parser)]
+struct RangesArgs {
+    /// The project to analyze (a cargo project, when extracting live).
+    path: PathBuf,
+    /// Pre-extracted body facts as JSON (the StableMIR driver's `bodies-*.json`
+    /// schema), in place of a live extraction. Lets the analysis run with no
+    /// nightly toolchain.
+    #[arg(long)]
+    bodies: Option<PathBuf>,
+    /// Where to write the ranges JSON. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -277,6 +300,10 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
+        Cmd::Ranges(args) => match ranges(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
     }
 }
 
@@ -356,6 +383,40 @@ fn api(args: ApiArgs) -> Result<ExitCode> {
     let json =
         serde_json::to_string_pretty(&report).context("serializing the API report to JSON")?;
     write_json(args.out.as_deref(), &json, "api report")
+}
+
+/// The `hinzu ranges` flow. Loads body facts (from `--bodies` JSON, or by
+/// extracting them live with the StableMIR driver — all the file/process I/O is
+/// on the CLI side), runs the pure abstract-interpretation engine, writes the
+/// deterministic ranges-and-hazards JSON, and returns a non-zero code when a
+/// hazard is found so it is usable as a CI gate.
+fn ranges(args: RangesArgs) -> Result<ExitCode> {
+    let bodies = if let Some(path) = args.bodies.as_deref() {
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("reading body facts from {}", path.display()))?;
+        hinzu_core::absint::body::BodyFacts::from_json(&json)
+            .with_context(|| format!("parsing body facts from {}", path.display()))?
+    } else {
+        if !rust_adapter::is_cargo_project(&args.path) {
+            anyhow::bail!(
+                "{} is not a cargo project — `hinzu ranges` extracts Rust MIR bodies today; \
+                 pass --bodies <json> to analyze pre-extracted facts",
+                args.path.display()
+            );
+        }
+        rust_adapter::extract_bodies(&args.path)?
+    };
+
+    let report = hinzu_core::absint::analyze_bodies(&bodies);
+    let json =
+        serde_json::to_string_pretty(&report).context("serializing the ranges report to JSON")?;
+    write_json(args.out.as_deref(), &json, "ranges report")?;
+
+    if report.hazards.is_empty() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
 }
 
 /// Resolve the language for `hinzu api`: an explicit `--lang` (lowercased), else
