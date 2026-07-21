@@ -71,6 +71,44 @@ enum Cmd {
     /// takes a pre-extracted body-fact JSON instead (no toolchain needed). Exits
     /// non-zero when a hazard is found, so it is usable as a CI gate.
     Ranges(RangesArgs),
+    /// Lower the extracted body IR into a formal-model SKELETON a model checker
+    /// can consume — Phase A of the code-derived verification pipeline. Emits one
+    /// Quint `module derived { ... }` with clearly-delimited `BEGIN GENERATED` /
+    /// `END GENERATED` regions (state vars typed by numeric kind, straight-line
+    /// statement assignments, arithmetic/comparison operators) and explicit
+    /// `// AGENT-TODO` holes for every judgment call the lowering cannot make
+    /// honestly (float abstraction, control-flow encoding, environment
+    /// nondeterminism, the invariants). The holes are comments, so the skeleton
+    /// parses as valid Quint as-is; see notes/model-finishing.md to finish it.
+    /// Bodies come from `--bodies <json>` (no toolchain) or a live StableMIR
+    /// extraction, exactly like `hinzu ranges`.
+    Model(ModelArgs),
+}
+
+/// The formal-model backend `hinzu model` lowers the body IR to. Structured as an
+/// enum so more targets can be added without changing the CLI surface.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EmitTarget {
+    /// A Quint (`.qnt`) module skeleton.
+    Quint,
+    // phase D: Stateright
+}
+
+#[derive(Parser)]
+struct ModelArgs {
+    /// The project to analyze (a cargo project, when extracting live).
+    path: PathBuf,
+    /// Pre-extracted body facts as JSON (the StableMIR driver's `bodies-*.json`
+    /// schema), in place of a live extraction. Lets the lowering run with no
+    /// nightly toolchain.
+    #[arg(long)]
+    bodies: Option<PathBuf>,
+    /// The formal-model backend to emit. Defaults to Quint.
+    #[arg(long, value_enum, default_value_t = EmitTarget::Quint)]
+    emit: EmitTarget,
+    /// Where to write the model text. Defaults to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -330,6 +368,10 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => report_error(e),
         },
+        Cmd::Model(args) => match model(args) {
+            Ok(code) => code,
+            Err(e) => report_error(e),
+        },
     }
 }
 
@@ -417,21 +459,7 @@ fn api(args: ApiArgs) -> Result<ExitCode> {
 /// deterministic ranges-and-hazards JSON, and returns a non-zero code when a
 /// hazard is found so it is usable as a CI gate.
 fn ranges(args: RangesArgs) -> Result<ExitCode> {
-    let bodies = if let Some(path) = args.bodies.as_deref() {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("reading body facts from {}", path.display()))?;
-        hinzu_core::absint::body::BodyFacts::from_json(&json)
-            .with_context(|| format!("parsing body facts from {}", path.display()))?
-    } else {
-        if !rust_adapter::is_cargo_project(&args.path) {
-            anyhow::bail!(
-                "{} is not a cargo project — `hinzu ranges` extracts Rust MIR bodies today; \
-                 pass --bodies <json> to analyze pre-extracted facts",
-                args.path.display()
-            );
-        }
-        rust_adapter::extract_bodies(&args.path)?
-    };
+    let bodies = load_bodies(&args.path, args.bodies.as_deref(), "ranges")?;
 
     let report = hinzu_core::absint::analyze_bodies(&bodies);
     let json =
@@ -443,6 +471,44 @@ fn ranges(args: RangesArgs) -> Result<ExitCode> {
     } else {
         Ok(ExitCode::FAILURE)
     }
+}
+
+/// Load body facts for the body-IR commands: from a `--bodies` JSON file (no
+/// toolchain), or by extracting Rust MIR live with the StableMIR driver. `cmd`
+/// names the subcommand in the not-a-cargo-project error. All the file/process
+/// I/O is on the CLI side; the core lowering stays pure.
+fn load_bodies(
+    path: &Path,
+    bodies: Option<&Path>,
+    cmd: &str,
+) -> Result<hinzu_core::absint::body::BodyFacts> {
+    if let Some(bodies) = bodies {
+        let json = std::fs::read_to_string(bodies)
+            .with_context(|| format!("reading body facts from {}", bodies.display()))?;
+        hinzu_core::absint::body::BodyFacts::from_json(&json)
+            .with_context(|| format!("parsing body facts from {}", bodies.display()))
+    } else {
+        if !rust_adapter::is_cargo_project(path) {
+            anyhow::bail!(
+                "{} is not a cargo project — `hinzu {cmd}` extracts Rust MIR bodies today; \
+                 pass --bodies <json> to analyze pre-extracted facts",
+                path.display()
+            );
+        }
+        rust_adapter::extract_bodies(path)
+    }
+}
+
+/// The `hinzu model` flow. Loads body facts exactly like `hinzu ranges`, lowers
+/// them to a formal-model skeleton with the pure emitter for the chosen backend,
+/// and writes the model text (to `--out` or stdout). No analysis gate — the
+/// output is a skeleton to finish, so it always exits zero on success.
+fn model(args: ModelArgs) -> Result<ExitCode> {
+    let bodies = load_bodies(&args.path, args.bodies.as_deref(), "model")?;
+    let text = match args.emit {
+        EmitTarget::Quint => hinzu_core::absint::emit_quint(&bodies),
+    };
+    write_text(args.out.as_deref(), &text, "quint model")
 }
 
 /// Resolve the language for `hinzu api`: an explicit `--lang` (lowercased), else
@@ -1250,6 +1316,20 @@ fn write_json(out: Option<&Path>, json: &str, what: &str) -> Result<ExitCode> {
                 .with_context(|| format!("writing {what} to {}", out.display()))?;
         }
         None => println!("{json}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write text (already terminated by its own trailing newline) to `out` or
+/// stdout. Like [`write_json`] but does not re-wrap the payload — used for the
+/// `hinzu model` skeletons, whose emitters produce a final newline themselves.
+fn write_text(out: Option<&Path>, text: &str, what: &str) -> Result<ExitCode> {
+    match out {
+        Some(out) => {
+            std::fs::write(out, text)
+                .with_context(|| format!("writing {what} to {}", out.display()))?;
+        }
+        None => print!("{text}"),
     }
     Ok(ExitCode::SUCCESS)
 }

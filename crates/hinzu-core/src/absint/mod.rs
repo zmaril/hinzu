@@ -22,9 +22,11 @@ pub mod body;
 pub mod engine;
 pub mod hazards;
 pub mod interval;
+pub mod quint;
 
 use body::BodyFacts;
 use hazards::{FunctionRanges, Hazard, ParamRange, RangesReport, HINZU_RANGES_VERSION};
+pub use quint::emit_quint;
 
 /// Analyze every function in a body-fact set and produce the deterministic
 /// ranges-and-hazards report. Pure: no I/O, no ordering dependence — functions
