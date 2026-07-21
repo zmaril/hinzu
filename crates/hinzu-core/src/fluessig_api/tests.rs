@@ -7,13 +7,7 @@ use crate::api::{
 };
 
 fn conv() -> Converter {
-    Converter {
-        known_enums: BTreeSet::new(),
-        known_models: BTreeSet::new(),
-        unions: BTreeMap::new(),
-        reasons: BTreeMap::new(),
-        notes: BTreeMap::new(),
-    }
+    Converter::new(BTreeSet::new(), BTreeSet::new())
 }
 
 fn scalar(s: &str) -> FlType {
@@ -118,9 +112,105 @@ fn function_and_object_types_degrade() {
     let mut c = conv();
     assert!(c.parse_type("(event: E) => void").degraded);
     assert!(c.parse_type("() => void").degraded);
-    assert!(c.parse_type("{ a: string; b: number }").degraded);
+    // An object with a call/method member is not a plain data record — it stays
+    // a `Json` fallback (the callback lane), under a distinct reason.
+    assert!(c.parse_type("{ handleRpc(x: string): void }").degraded);
+    assert_eq!(
+        c.reasons.get("inline object with call/index signature"),
+        Some(&1)
+    );
     assert!(c.parse_type("RequestMap[keyof RequestMap]").degraded);
     assert!(c.parse_type("Record<string, number>").degraded);
+}
+
+#[test]
+fn inline_object_param_mints_named_model() {
+    let mut c = conv();
+    // The naming context the op layer sets before parsing a param type.
+    c.name_hint.push("SpawnInstanceOptions".to_string());
+    let p = c.parse_type("{ cwd: string; label?: string | undefined; }");
+    assert!(!p.degraded);
+    assert_eq!(
+        p.ty,
+        FlType::Model {
+            model: "SpawnInstanceOptions".to_string()
+        }
+    );
+    let m = &c.minted["SpawnInstanceOptions"];
+    assert_eq!(m.fields.len(), 2);
+    assert_eq!(m.fields[0].name, "cwd");
+    assert_eq!(m.fields[0].ty, scalar("string"));
+    assert!(!m.fields[0].nullable);
+    // `label?: string | undefined` → a nullable string field.
+    assert_eq!(m.fields[1].name, "label");
+    assert_eq!(m.fields[1].ty, scalar("string"));
+    assert!(m.fields[1].nullable);
+    // The minted model registers so later refs resolve to it.
+    assert!(c.known_models.contains("SpawnInstanceOptions"));
+}
+
+#[test]
+fn inline_object_return_mints_named_model() {
+    let mut c = conv();
+    c.name_hint.push("CreateInstanceResult".to_string());
+    let p = c.parse_type("{ id: string; count: number }");
+    assert!(!p.degraded);
+    assert_eq!(
+        p.ty,
+        FlType::Model {
+            model: "CreateInstanceResult".to_string()
+        }
+    );
+    let m = &c.minted["CreateInstanceResult"];
+    assert_eq!(m.fields.len(), 2);
+    assert_eq!(m.fields[1].name, "count");
+    assert_eq!(m.fields[1].ty, scalar("float64"));
+}
+
+#[test]
+fn identical_inline_objects_dedupe_to_one_model() {
+    let mut c = conv();
+    c.name_hint.push("AOptions".to_string());
+    let a = c.parse_type("{ cwd: string }");
+    c.name_hint.pop();
+    c.name_hint.push("BOptions".to_string());
+    // Same field-set (even a different member separator/order is normalized).
+    let b = c.parse_type("{ cwd: string }");
+    assert_eq!(a.ty, b.ty);
+    assert_eq!(
+        a.ty,
+        FlType::Model {
+            model: "AOptions".to_string()
+        }
+    );
+    // Only one model minted despite two occurrences.
+    assert_eq!(c.minted.len(), 1);
+}
+
+#[test]
+fn nested_inline_object_mints_nested_models() {
+    let mut c = conv();
+    c.name_hint.push("OuterOptions".to_string());
+    let p = c.parse_type("{ meta: { id: string }; name: string }");
+    assert!(!p.degraded);
+    assert_eq!(
+        p.ty,
+        FlType::Model {
+            model: "OuterOptions".to_string()
+        }
+    );
+    // Two models: the outer, plus the nested one named by the field path.
+    assert_eq!(c.minted.len(), 2);
+    let outer = &c.minted["OuterOptions"];
+    assert_eq!(
+        outer.fields[0].ty,
+        FlType::Model {
+            model: "OuterOptionsMeta".to_string()
+        }
+    );
+    let nested = &c.minted["OuterOptionsMeta"];
+    assert_eq!(nested.fields[0].name, "id");
+    assert_eq!(nested.fields[0].ty, scalar("string"));
 }
 
 #[test]

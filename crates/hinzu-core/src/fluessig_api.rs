@@ -207,6 +207,9 @@ pub struct Stats {
     pub items_in: usize,
     pub by_kind: BTreeMap<String, usize>,
     pub models_emitted: usize,
+    /// Of `models_emitted`, how many were *minted* from an inline/anonymous
+    /// object literal (rather than a named `interface`/`record` item).
+    pub models_minted: usize,
     pub enums_emitted: usize,
     pub interfaces_emitted: usize,
     pub unions_synthesized: usize,
@@ -253,6 +256,14 @@ struct Converter {
     unions: BTreeMap<String, FlUnion>,
     reasons: BTreeMap<String, usize>,
     notes: BTreeMap<String, usize>,
+    /// Models synthesized from inline/anonymous object literals, keyed by name.
+    minted: BTreeMap<String, FlModel>,
+    /// Field-set signature → minted model name, so identical inline objects
+    /// collapse to a single model instead of emitting N copies.
+    minted_by_sig: BTreeMap<String, String>,
+    /// The naming context (owning op/field path) used to name the next minted
+    /// model — e.g. `["SpawnInstance", "Options"]` → `SpawnInstanceOptions`.
+    name_hint: Vec<String>,
 }
 
 /// The outcome of parsing one rendered type string.
@@ -273,6 +284,21 @@ impl Parsed {
 }
 
 impl Converter {
+    /// A fresh converter over a resolution context (the known enum/model names),
+    /// with empty accumulators. The one place the [`Converter`] shape is built.
+    fn new(known_enums: BTreeSet<String>, known_models: BTreeSet<String>) -> Self {
+        Converter {
+            known_enums,
+            known_models,
+            unions: BTreeMap::new(),
+            reasons: BTreeMap::new(),
+            notes: BTreeMap::new(),
+            minted: BTreeMap::new(),
+            minted_by_sig: BTreeMap::new(),
+            name_hint: Vec::new(),
+        }
+    }
+
     fn degrade(&mut self, reason: &str) -> Parsed {
         Stats::bump(&mut self.reasons, reason);
         Parsed {
@@ -330,9 +356,9 @@ impl Converter {
         if has_top_level_arrow(s) {
             return self.degrade("function type");
         }
-        // An object literal `{ ... }`.
+        // An object literal `{ ... }`: mint a named model from its fields.
         if s.starts_with('{') {
-            return self.degrade("inline object literal");
+            return self.parse_inline_object(s);
         }
         // Indexed / conditional / mapped types (`X[keyof X]`, `T extends ...`).
         if s.contains(" extends ") || s.contains("keyof ") || s.contains("infer ") {
@@ -518,6 +544,104 @@ impl Converter {
         };
         (p.ty, label)
     }
+
+    /// An inline/anonymous object literal `{ a: T; b?: U }` → a **minted**,
+    /// named model (rather than a `Json` blob). Members that are call/method or
+    /// index signatures — or an empty/unparsable body — still degrade honestly,
+    /// since those are not plain data records (that's the callback lane). Each
+    /// field type recurses through [`parse_type`], so a nested inline object
+    /// mints a nested model and a known name resolves; identical field-sets
+    /// dedupe to one model.
+    fn parse_inline_object(&mut self, s: &str) -> Parsed {
+        let inner = match s.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+            Some(i) => i.trim(),
+            None => return self.degrade("inline object literal"),
+        };
+        if inner.is_empty() {
+            return self.degrade("empty inline object literal");
+        }
+        let mut fields: Vec<FlField> = Vec::new();
+        for member in split_object_members(inner) {
+            if member.is_empty() {
+                continue;
+            }
+            let Some((raw_name, raw_ty)) = split_object_member(&member) else {
+                // A call/method/index signature — not a plain data record.
+                return self.degrade("inline object with call/index signature");
+            };
+            let (field_name, optional) = match raw_name.strip_suffix('?') {
+                Some(n) => (n.trim().to_string(), true),
+                None => (raw_name, false),
+            };
+            if !is_ident(&field_name) {
+                return self.degrade("inline object with call/index signature");
+            }
+            // Recurse, extending the naming path so a nested inline object mints
+            // a nested, readably-named model.
+            self.name_hint.push(pascal(&field_name));
+            let parsed = self.parse_type(&raw_ty);
+            self.name_hint.pop();
+            let (ty, was_nullable) = unwrap_nullable(parsed.ty);
+            fields.push(FlField {
+                name: field_name,
+                ty,
+                nullable: optional || was_nullable,
+            });
+        }
+        if fields.is_empty() {
+            return self.degrade("empty inline object literal");
+        }
+        Parsed::clean(self.mint_object_model(fields))
+    }
+
+    /// Register (deduplicated by field-set) a minted model for `fields` and
+    /// return a `Model` ref to it. Deterministic: the name comes from the active
+    /// [`name_hint`] path, disambiguated against every known/minted name.
+    fn mint_object_model(&mut self, fields: Vec<FlField>) -> FlType {
+        let sig = object_signature(&fields);
+        if let Some(existing) = self.minted_by_sig.get(&sig) {
+            return FlType::Model {
+                model: existing.clone(),
+            };
+        }
+        let name = self.unique_minted_name();
+        self.known_models.insert(name.clone());
+        self.minted_by_sig.insert(sig, name.clone());
+        self.minted.insert(
+            name.clone(),
+            FlModel {
+                name: name.clone(),
+                doc: None,
+                fields,
+            },
+        );
+        Stats::bump(&mut self.notes, "inline object literal → minted model");
+        FlType::Model { model: name }
+    }
+
+    /// A readable, collision-free name for the model about to be minted: the
+    /// joined naming path (falling back to `InlineObject` at the top level),
+    /// suffixed with a counter only if that name is already taken.
+    fn unique_minted_name(&self) -> String {
+        let base = self.name_hint.concat();
+        let base = if base.is_empty() {
+            "InlineObject".to_string()
+        } else {
+            base
+        };
+        let taken = |n: &str| self.known_models.contains(n) || self.known_enums.contains(n);
+        if !taken(&base) {
+            return base;
+        }
+        let mut i = 2;
+        loop {
+            let cand = format!("{base}{i}");
+            if !taken(&cand) {
+                return cand;
+            }
+            i += 1;
+        }
+    }
 }
 
 // ─────────────────────────── orchestration ──────────────────────────────────
@@ -572,13 +696,7 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
         }
     }
 
-    let mut conv = Converter {
-        known_enums,
-        known_models,
-        unions: BTreeMap::new(),
-        reasons: BTreeMap::new(),
-        notes: BTreeMap::new(),
-    };
+    let mut conv = Converter::new(known_enums, known_models);
 
     // Pass 2 — models, interfaces, and free-function ops.
     let mut models: Vec<FlModel> = Vec::new();
@@ -634,6 +752,10 @@ pub fn build_fluessig(report: &ApiReport) -> FluessigOutput {
         });
     }
 
+    // Fold in models minted from inline object literals (deduped by field-set).
+    stats.models_minted = conv.minted.len();
+    models.extend(std::mem::take(&mut conv.minted).into_values());
+
     models.sort_by(|a, b| a.name.cmp(&b.name));
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     catalog_enums.sort_by(|a, b| a.name.cmp(&b.name));
@@ -683,7 +805,10 @@ fn build_model(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> FlModel
             continue;
         }
         stats.fields_total += 1;
+        conv.name_hint
+            .push(format!("{}{}", pascal(&it.name), pascal(&f.name)));
         let parsed = conv.parse_type(&f.ty);
+        conv.name_hint.pop();
         let (ty, was_nullable) = unwrap_nullable(parsed.ty);
         if parsed.degraded {
             stats.fields_degraded += 1;
@@ -745,6 +870,7 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
     // Return type: unwrap Promise (→ async) and Async{Iterable,Generator} (→ stream).
     let mut is_async = sig.is_async;
     let mut shape = "unary";
+    conv.name_hint.push(format!("{}Result", pascal(&it.name)));
     let (returns, ret_degraded) = match sig.return_type.as_deref() {
         None => (FlType::Scalar("void".to_string()), false),
         Some(rt) => {
@@ -767,6 +893,7 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
             }
         }
     };
+    conv.name_hint.pop();
     if ret_degraded {
         stats.returns_degraded += 1;
         degraded = true;
@@ -775,7 +902,14 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
     let mut params = Vec::new();
     for p in &sig.params {
         stats.params_total += 1;
+        let role = if p.name.is_empty() {
+            "Arg".to_string()
+        } else {
+            pascal(&p.name)
+        };
+        conv.name_hint.push(format!("{}{}", pascal(&it.name), role));
         let parsed = conv.parse_type(&p.ty);
+        conv.name_hint.pop();
         if parsed.degraded {
             stats.params_degraded += 1;
             degraded = true;
@@ -878,14 +1012,15 @@ impl Brackets {
     }
 }
 
-/// Split `s` on a top-level `sep`, respecting `<>`, `()`, `[]`, `{}` nesting and
-/// string literals.
-fn split_top(s: &str, sep: char) -> Vec<String> {
+/// Split `s` on every top-level char satisfying `is_sep`, respecting `<>`,
+/// `()`, `[]`, `{}` nesting and string literals. The shared spine behind
+/// [`split_top`] and [`split_object_members`].
+fn split_top_by(s: &str, is_sep: impl Fn(char) -> bool) -> Vec<String> {
     let mut parts = Vec::new();
     let mut b = Brackets::default();
     let mut cur = String::new();
     for c in s.chars() {
-        if b.feed(c) && c == sep {
+        if b.feed(c) && is_sep(c) {
             parts.push(cur.trim().to_string());
             cur.clear();
         } else {
@@ -896,6 +1031,62 @@ fn split_top(s: &str, sep: char) -> Vec<String> {
         parts.push(cur.trim().to_string());
     }
     parts
+}
+
+/// Split `s` on a top-level `sep` (nesting- and string-aware).
+fn split_top(s: &str, sep: char) -> Vec<String> {
+    split_top_by(s, |c| c == sep)
+}
+
+/// Split an inline object body into its member strings, respecting nesting and
+/// string literals. Object-type members are separated by `;` (or `,`).
+fn split_object_members(s: &str) -> Vec<String> {
+    split_top_by(s, |c| c == ';' || c == ',')
+}
+
+/// Split one object member `name: T` / `name?: T` at its first top-level colon
+/// into `(name, type)`. `None` when there is no top-level colon (a bare call
+/// signature like `close(): void` splits at the colon after `)`, leaving a
+/// non-ident name half that the caller rejects) — the `readonly` modifier, if
+/// present, is stripped from the name half.
+fn split_object_member(s: &str) -> Option<(String, String)> {
+    let mut b = Brackets::default();
+    for (i, c) in s.char_indices() {
+        if b.feed(c) && c == ':' {
+            let name = s[..i].trim();
+            let name = name.strip_prefix("readonly ").unwrap_or(name).trim();
+            let ty = s[i + 1..].trim();
+            if name.is_empty() || ty.is_empty() {
+                return None;
+            }
+            return Some((name.to_string(), ty.to_string()));
+        }
+    }
+    None
+}
+
+/// A deterministic, order-independent signature of a field-set, so two inline
+/// objects with the same fields (in any order) dedupe to a single minted model.
+fn object_signature(fields: &[FlField]) -> String {
+    let mut parts: Vec<String> = fields
+        .iter()
+        .map(|f| format!("{}={}|{}", f.name, fltype_key(&f.ty), f.nullable))
+        .collect();
+    parts.sort();
+    parts.join(";")
+}
+
+/// A stable string key for an [`FlType`] (used only for dedup signatures — kept
+/// self-contained so it stays inside hinzu-core's pure region).
+fn fltype_key(t: &FlType) -> String {
+    match t {
+        FlType::Scalar(s) => format!("s:{s}"),
+        FlType::Model { model } => format!("m:{model}"),
+        FlType::Enum { r#enum } => format!("e:{}", r#enum),
+        FlType::List { list } => format!("l[{}]", fltype_key(list)),
+        FlType::Nullable { nullable } => format!("n[{}]", fltype_key(nullable)),
+        FlType::Union { union } => format!("u:{union}"),
+    }
 }
 
 /// `Foo<Bar>` with `head == "Foo"` → `Some("Bar")` (the whole inner, including
