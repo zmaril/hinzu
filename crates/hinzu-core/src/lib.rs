@@ -17,6 +17,7 @@ pub mod absint;
 pub mod api;
 pub mod effects;
 pub mod facts;
+pub mod fluessig_api;
 pub mod graph;
 pub mod plan;
 pub mod policy;
