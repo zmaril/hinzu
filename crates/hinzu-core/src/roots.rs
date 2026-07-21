@@ -780,6 +780,7 @@ mod tests {
             file: "src/lib.rs".to_string(),
             line_start: 1,
             line_end: 3,
+            is_component: false,
         });
         // A foreign no-body call nobody vouched for -> Unknown. (Outside both
         // the std and the shipped library packs.)
@@ -829,6 +830,7 @@ mod tests {
             resolution: EdgeResolution::Unresolved,
             evidence_file: "src/lib.rs".to_string(),
             evidence_line: 9,
+            seam: false,
         });
         RootSeeds::default().seed_unknowns(&mut facts);
         assert!(facts
@@ -847,6 +849,7 @@ mod tests {
             file: "src/store.rs".to_string(),
             line_start: 1,
             line_end: 3,
+            is_component: false,
         });
         // The monomorphized call carries a turbofish the generic def lacks; it
         // must still count as seen (a local-crate callee), not Unknown.
@@ -1056,6 +1059,7 @@ mod tests {
             file: "src/io.ts".to_string(),
             line_start: 1,
             line_end: 3,
+            is_component: false,
         });
         facts.add_edge(Edge::call(
             "src/io#readConfig",
@@ -1163,6 +1167,7 @@ mod tests {
             file: "src/db.ts".to_string(),
             line_start: 1,
             line_end: 4,
+            is_component: false,
         });
         for callee in [
             "drizzle-orm::eq",
@@ -1386,6 +1391,7 @@ mod tests {
             file: "src/ctx.py".to_string(),
             line_start: 1,
             line_end: 3,
+            is_component: false,
         });
         facts.add_edge(Edge::call(
             "src/ctx.py#run",

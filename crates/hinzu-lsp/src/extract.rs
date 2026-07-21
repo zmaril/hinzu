@@ -372,6 +372,7 @@ impl<'c> Extractor<'c> {
                         file: relpath.to_string(),
                         line_start: lo,
                         line_end: hi,
+                        is_component: false,
                     },
                 );
                 self.anchors
@@ -677,6 +678,7 @@ impl<'c> Extractor<'c> {
                         file: relpath.clone(),
                         line_start: 1,
                         line_end,
+                        is_component: false,
                     },
                 );
                 self.n_module_defs += 1;
@@ -892,6 +894,7 @@ impl<'c> Extractor<'c> {
             resolution,
             evidence_file: evidence_file.to_string(),
             evidence_line,
+            seam: false,
         });
     }
 

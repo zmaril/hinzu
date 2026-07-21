@@ -1182,6 +1182,7 @@ mod tests {
             resolution: EdgeResolution::Unresolved,
             evidence_file: "d.rs".to_string(),
             evidence_line: 2,
+            seam: false,
         });
         let out = build_graph(&facts, "u", Some("rust"));
         let edge = out.edges.iter().find(|e| e.to == "<indirect>").unwrap();

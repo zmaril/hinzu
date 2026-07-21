@@ -481,6 +481,7 @@ allow = ["fs", "net", "process", "env"]
             file: file.to_string(),
             line_start: 1,
             line_end: 5,
+            is_component: false,
         }
     }
 
@@ -672,6 +673,7 @@ allow = ["fs", "net", "process", "env"]
             resolution: crate::facts::EdgeResolution::Unresolved,
             evidence_file: "crates/hinzu-core/src/core.rs".to_string(),
             evidence_line: 3,
+            seam: false,
         });
         facts.add_root(EffectRoot {
             symbol: "<indirect>".to_string(),
