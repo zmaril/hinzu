@@ -15,7 +15,8 @@ contract that package offers the outside world.
 Two consumers drive the shape (see [Consumers](#consumers) below):
 
 1. **Porting** — the source package's `ApiReport` is the contract a port must
-   match. It is the natural input to a future **api-diff**.
+   match. It is the input to [`hinzu api-diff`](./api-diff.md), which grades a
+   target package's public surface against it.
 2. **Binding and agent tooling** (fluessig) — functions become candidate ops and
    aggregates become candidate DTOs; the rendered types tell a generator what to
    expose.
@@ -204,7 +205,7 @@ use today:
 
 Types are **rendered strings** (`Vec<String>`, `Option<Bar>`, `dict[str, str]`) —
 honest and portable for v1. Structured, cross-referenced type references are a
-documented follow-up (see [api-diff](#porting-the-contract-a-port-must-match)).
+documented follow-up (see [the porting consumer](#porting-the-contract-a-port-must-match)).
 
 ### Annotated examples
 
@@ -299,13 +300,14 @@ A port's job is to reproduce a source package's public interface in another
 language. The source `ApiReport` **is** that contract: every exported function
 signature, every type shape, every field the port must offer.
 
-The natural follow-up is an **api-diff**: compare two `ApiReport`s (source
-language vs target language) by module and item name plus shape, and report
+The follow-up is [`hinzu api-diff`](./api-diff.md): it compares two `ApiReport`s
+(source language vs target language) by item name plus shape, and reports
 
 - **missing** — in the source surface, absent from the target;
 - **extra** — in the target, with no source counterpart;
-- **signature-mismatched** — present in both, but the parameter or return shape
-  differs.
+- **signatureMismatch** — present in both, but the parameter or shape differs;
+- **matched** — present in both with a compatible shape, yielding a conformance
+  grade.
 
 This composes with `port-diff` rather than replacing it. `port-diff` bands files
 by graph structure — how much of the source's *internal* dependency graph has a
