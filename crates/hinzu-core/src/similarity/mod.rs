@@ -212,6 +212,20 @@ pub struct Member {
     pub line_end: u32,
 }
 
+/// A [`Member`] view of a signature — where its implementation lives. Shared by
+/// the explanation layer and the curated-library tier so the projection lives in
+/// exactly one place.
+pub(crate) fn to_member(s: &StructuralSignature) -> Member {
+    Member {
+        symbol_id: s.symbol_id.clone(),
+        display: s.display.clone(),
+        language: s.language.clone(),
+        file: s.file.clone(),
+        line_start: s.line_start,
+        line_end: s.line_end,
+    }
+}
+
 /// The shared structural pattern of a cluster: a human summary, the concrete
 /// features the members share, the aggregate similarity, and its breakdown.
 #[derive(Clone, Debug, Serialize, Deserialize)]

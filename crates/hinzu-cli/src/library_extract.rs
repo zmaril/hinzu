@@ -9,9 +9,9 @@
 //! and the honesty of that is carried by the `curated-pattern` source profile.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hinzu_core::similarity::{TraitImpl, TypeImplFacts};
 use syn::spanned::Spanned;
 
@@ -19,30 +19,10 @@ use syn::spanned::Spanned;
 /// (skipping `target/`). One entry per `(file, type name)` seen. A file that
 /// fails to parse is skipped with a warning rather than sinking the run.
 pub fn extract(project: &Path) -> Result<Vec<TypeImplFacts>> {
-    let files = rust_files(project)?;
     // Keyed by (file-rel, type-name) so impls attach to their type's declaration.
     let mut by_type: BTreeMap<(String, String), TypeImplFacts> = BTreeMap::new();
 
-    for file in &files {
-        let rel = file
-            .strip_prefix(project)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .to_string();
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("warning: skipping {} (unreadable: {e})", file.display());
-                continue;
-            }
-        };
-        let parsed = match syn::parse_file(&src) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("warning: skipping {rel} (parse error: {e})");
-                continue;
-            }
-        };
+    for (rel, parsed) in crate::rust_source::parsed_rust_files(project)? {
         walk_items(&parsed.items, &rel, &mut by_type);
     }
 
@@ -52,30 +32,6 @@ pub fn extract(project: &Path) -> Result<Vec<TypeImplFacts>> {
         .into_values()
         .filter(|f| !f.traits.is_empty())
         .collect())
-}
-
-/// Every `.rs` file under `root`, skipping `target/` and hidden directories.
-fn rust_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("reading directory {}", dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
-                if name == "target" || name.starts_with('.') {
-                    continue;
-                }
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 /// Recursively walk items, recording enum/struct declarations and trait impls.

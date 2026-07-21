@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use super::profile::{curated_pattern_profile, rustdoc_source_profile};
 use super::{
-    call_sequence_similarity, cfg_similarity, type_shape_similarity, Arity, FindingProfile,
-    LanguageProfile, LikelyAbstraction, Member, StructuralSignature,
+    call_sequence_similarity, cfg_similarity, to_member, type_shape_similarity, Arity,
+    FindingProfile, LanguageProfile, LikelyAbstraction, Member, StructuralSignature,
 };
 
 // ---------------------------------------------------------------------------
@@ -602,18 +602,6 @@ fn arity_similarity(a: &Arity, b: &Arity) -> f64 {
     (1.0 - (pd + gd) / 6.0).max(0.0)
 }
 
-/// A [`Member`] view of a signature.
-fn to_member(s: &StructuralSignature) -> Member {
-    Member {
-        symbol_id: s.symbol_id.clone(),
-        display: s.display.clone(),
-        language: s.language.clone(),
-        file: s.file.clone(),
-        line_start: s.line_start,
-        line_end: s.line_end,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tier B: curated derive predicates over impl/enum facts.
 // ---------------------------------------------------------------------------
@@ -624,14 +612,40 @@ struct DerivePattern {
     external: ExternalRef,
     /// The mechanism line for the finding (`"#[derive(thiserror::Error)]"`).
     mechanism: String,
-    /// The predicate + evidence builder. Returns `(match_basis, differences,
-    /// members)` on a match, `None` otherwise. `structural` is fixed per pattern
-    /// (a predicate match is a strong-but-not-perfect structural signal).
-    check: fn(&TypeImplFacts) -> Option<DeriveMatch>,
+    /// Which curated predicate recognizes this pattern. A closed enum rather than
+    /// a stored `fn` pointer, so every call the engine makes stays statically
+    /// resolvable — the functional-core self-check rejects an unresolved indirect
+    /// call, and an indirect `fn`-pointer dispatch reads as exactly that.
+    kind: DeriveKind,
     /// The structural-similarity value a match scores (predicate matches are
     /// near-certain structurally; behavioural doubt lives in source_fidelity +
     /// counter-evidence).
     structural: f64,
+}
+
+/// The closed set of curated derive predicates. [`DerivePattern::match_type`]
+/// dispatches on this by `match` (a direct call per arm) instead of an indirect
+/// `fn`-pointer call, keeping the whole call graph resolvable for the self-check.
+#[derive(Clone, Copy)]
+enum DeriveKind {
+    ThiserrorError,
+    DeriveMoreFrom,
+    DeriveMoreDisplay,
+    StrumDisplay,
+    StrumEnumString,
+}
+
+impl DeriveKind {
+    /// Run the predicate: `Some(DeriveMatch)` on a match, `None` otherwise.
+    fn check(self, facts: &TypeImplFacts) -> Option<DeriveMatch> {
+        match self {
+            DeriveKind::ThiserrorError => thiserror_error_check(facts),
+            DeriveKind::DeriveMoreFrom => derive_more_from_check(facts),
+            DeriveKind::DeriveMoreDisplay => derive_more_display_check(facts),
+            DeriveKind::StrumDisplay => strum_display_check(facts),
+            DeriveKind::StrumEnumString => strum_enum_string_check(facts),
+        }
+    }
 }
 
 /// The result of a derive predicate matching: the evidence and the concrete
@@ -644,7 +658,7 @@ struct DeriveMatch {
 
 impl DerivePattern {
     fn match_type(&self, facts: &TypeImplFacts, trust: f64) -> Option<LibraryFinding> {
-        let m = (self.check)(facts)?;
+        let m = self.kind.check(facts)?;
         Some(make_finding(
             m.members,
             self.external.clone(),
@@ -722,52 +736,56 @@ fn thiserror_error_pattern() -> DerivePattern {
         external: ext("thiserror", "Error", ExternalKind::Derive),
         mechanism: "#[derive(thiserror::Error)] with #[error(\"…\")] per variant/field".to_string(),
         structural: 0.9,
-        check: |facts| {
-            let display = facts.trait_by("Display")?;
-            let error = facts.trait_by("Error")?;
-            let mut basis = vec![format!(
-                "hand-written `impl {}` at {}:{}-{} and `impl {}` at {}:{}-{} — exactly the \
+        kind: DeriveKind::ThiserrorError,
+    }
+}
+
+/// The `thiserror::Error` predicate body: a type with BOTH a hand-written
+/// `Display` impl and an `Error` impl.
+fn thiserror_error_check(facts: &TypeImplFacts) -> Option<DeriveMatch> {
+    let display = facts.trait_by("Display")?;
+    let error = facts.trait_by("Error")?;
+    let mut basis = vec![format!(
+        "hand-written `impl {}` at {}:{}-{} and `impl {}` at {}:{}-{} — exactly the \
                      boilerplate `#[derive(thiserror::Error)]` generates",
-                display.trait_full,
-                facts.file,
-                display.line_start,
-                display.line_end,
-                error.trait_full,
-                facts.file,
-                error.line_start,
-                error.line_end,
-            )];
-            if facts.is_enum {
-                basis.push(format!(
-                    "on an enum ({} variant(s)) whose `Display` dispatches on `self` — thiserror's \
+        display.trait_full,
+        facts.file,
+        display.line_start,
+        display.line_end,
+        error.trait_full,
+        facts.file,
+        error.line_start,
+        error.line_end,
+    )];
+    if facts.is_enum {
+        basis.push(format!(
+            "on an enum ({} variant(s)) whose `Display` dispatches on `self` — thiserror's \
                      per-variant `#[error]` is the idiomatic replacement",
-                    facts.variant_count
-                ));
-            }
-            let mut differences = vec![
-                "thiserror derives a single `#[error(\"…\")]` format per variant; a hand-written \
+            facts.variant_count
+        ));
+    }
+    let mut differences = vec![
+        "thiserror derives a single `#[error(\"…\")]` format per variant; a hand-written \
                  `Display` with conditionals (e.g. an optional appended `cause`) may not reduce to \
                  one format string without behaviour change."
-                    .to_string(),
-            ];
-            if facts.trait_by("From").is_some() {
-                differences.push(
-                    "the type also has a `From` impl — thiserror's `#[from]` can subsume it, but \
+            .to_string(),
+    ];
+    if facts.trait_by("From").is_some() {
+        differences.push(
+            "the type also has a `From` impl — thiserror's `#[from]` can subsume it, but \
                      only for a single-field source variant."
-                        .to_string(),
-                );
-            }
-            Some(DeriveMatch {
-                members: vec![
-                    type_member(facts, ""),
-                    impl_member(facts, display),
-                    impl_member(facts, error),
-                ],
-                match_basis: basis,
-                differences,
-            })
-        },
+                .to_string(),
+        );
     }
+    Some(DeriveMatch {
+        members: vec![
+            type_member(facts, ""),
+            impl_member(facts, display),
+            impl_member(facts, error),
+        ],
+        match_basis: basis,
+        differences,
+    })
 }
 
 /// `derive_more::From`: an `impl From<T> for E` whose body wraps `T` into a
@@ -777,31 +795,34 @@ fn derive_more_from_pattern() -> DerivePattern {
         external: ext("derive_more", "From", ExternalKind::Derive),
         mechanism: "#[derive(derive_more::From)] on the wrapping variant/newtype".to_string(),
         structural: 0.85,
-        check: |facts| {
-            let from = facts
-                .traits
-                .iter()
-                .find(|t| t.trait_name == "From" && t.is_wrapping)?;
-            let arg = from
-                .from_arg_shape
-                .clone()
-                .unwrap_or_else(|| "_".to_string());
-            Some(DeriveMatch {
-                members: vec![type_member(facts, ""), impl_member(facts, from)],
-                match_basis: vec![format!(
-                    "`impl From<{}> for {}` at {}:{}-{} that just wraps its argument into a \
+        kind: DeriveKind::DeriveMoreFrom,
+    }
+}
+
+/// The `derive_more::From` predicate body.
+fn derive_more_from_check(facts: &TypeImplFacts) -> Option<DeriveMatch> {
+    let from = facts
+        .traits
+        .iter()
+        .find(|t| t.trait_name == "From" && t.is_wrapping)?;
+    let arg = from
+        .from_arg_shape
+        .clone()
+        .unwrap_or_else(|| "_".to_string());
+    Some(DeriveMatch {
+        members: vec![type_member(facts, ""), impl_member(facts, from)],
+        match_basis: vec![format!(
+            "`impl From<{}> for {}` at {}:{}-{} that just wraps its argument into a \
                      single-field variant/newtype — the shape `#[derive(derive_more::From)]` \
                      generates",
-                    arg, facts.type_name, facts.file, from.line_start, from.line_end
-                )],
-                differences: vec![
-                    "derive_more generates one `From` per single-field variant; a hand-written \
+            arg, facts.type_name, facts.file, from.line_start, from.line_end
+        )],
+        differences: vec![
+            "derive_more generates one `From` per single-field variant; a hand-written \
                      `From` that transforms its argument (not a plain wrap) is NOT equivalent."
-                        .to_string(),
-                ],
-            })
-        },
-    }
+                .to_string(),
+        ],
+    })
 }
 
 /// `derive_more::Display`: an `impl Display` whose body is a `match self` with a
@@ -812,27 +833,30 @@ fn derive_more_display_pattern() -> DerivePattern {
         external: ext("derive_more", "Display", ExternalKind::Derive),
         mechanism: "#[derive(derive_more::Display)] with #[display(\"…\")] per variant".to_string(),
         structural: 0.8,
-        check: |facts| {
-            if facts.trait_by("Error").is_some() {
-                return None; // thiserror covers Display+Error together
-            }
-            let display = find_display_match(facts)?;
-            Some(DeriveMatch {
-                members: vec![type_member(facts, ""), impl_member(facts, display)],
-                match_basis: vec![format!(
-                    "`impl {}` at {}:{}-{} whose body is a `match self` with a formatting arm per \
+        kind: DeriveKind::DeriveMoreDisplay,
+    }
+}
+
+/// The `derive_more::Display` predicate body.
+fn derive_more_display_check(facts: &TypeImplFacts) -> Option<DeriveMatch> {
+    if facts.trait_by("Error").is_some() {
+        return None; // thiserror covers Display+Error together
+    }
+    let display = find_display_match(facts)?;
+    Some(DeriveMatch {
+        members: vec![type_member(facts, ""), impl_member(facts, display)],
+        match_basis: vec![format!(
+            "`impl {}` at {}:{}-{} whose body is a `match self` with a formatting arm per \
                      variant — the shape `#[derive(derive_more::Display)]` generates",
-                    display.trait_full, facts.file, display.line_start, display.line_end
-                )],
-                differences: vec![
-                    "derive_more::Display expresses each arm as a `#[display(\"…\")]` format; arms \
+            display.trait_full, facts.file, display.line_start, display.line_end
+        )],
+        differences: vec![
+            "derive_more::Display expresses each arm as a `#[display(\"…\")]` format; arms \
                      with non-trivial logic (loops, branches, computed values) do not reduce to a \
                      format attribute."
-                        .to_string(),
-                ],
-            })
-        },
-    }
+                .to_string(),
+        ],
+    })
 }
 
 /// `strum::Display`: same enum `Display`-via-`match self` shape, offered when the
@@ -843,33 +867,36 @@ fn strum_display_pattern() -> DerivePattern {
         mechanism: "#[derive(strum::Display)] (+ #[strum(serialize = \"…\")] where names differ)"
             .to_string(),
         structural: 0.75,
-        check: |facts| {
-            if !facts.is_enum {
-                return None;
-            }
-            // An enum that also implements `Error` is a thiserror candidate, not a
-            // strum::Display one — defer so an error enum gets the better-fitting
-            // suggestion rather than a redundant second one.
-            if facts.trait_by("Error").is_some() {
-                return None;
-            }
-            let display = find_display_match(facts)?;
-            Some(DeriveMatch {
-                members: vec![type_member(facts, ""), impl_member(facts, display)],
-                match_basis: vec![format!(
-                    "enum `{}` with a `Display` at {}:{}-{} that maps each variant to a string via \
+        kind: DeriveKind::StrumDisplay,
+    }
+}
+
+/// The `strum::Display` predicate body.
+fn strum_display_check(facts: &TypeImplFacts) -> Option<DeriveMatch> {
+    if !facts.is_enum {
+        return None;
+    }
+    // An enum that also implements `Error` is a thiserror candidate, not a
+    // strum::Display one — defer so an error enum gets the better-fitting
+    // suggestion rather than a redundant second one.
+    if facts.trait_by("Error").is_some() {
+        return None;
+    }
+    let display = find_display_match(facts)?;
+    Some(DeriveMatch {
+        members: vec![type_member(facts, ""), impl_member(facts, display)],
+        match_basis: vec![format!(
+            "enum `{}` with a `Display` at {}:{}-{} that maps each variant to a string via \
                      `match self` — `#[derive(strum::Display)]` generates exactly this",
-                    facts.type_name, facts.file, display.line_start, display.line_end
-                )],
-                differences: vec![
-                    "strum::Display maps a variant to a fixed string (its name or a \
+            facts.type_name, facts.file, display.line_start, display.line_end
+        )],
+        differences: vec![
+            "strum::Display maps a variant to a fixed string (its name or a \
                      `#[strum(serialize)]`); an arm that formats fields or computes the string is \
                      not expressible as a strum attribute."
-                        .to_string(),
-                ],
-            })
-        },
-    }
+                .to_string(),
+        ],
+    })
 }
 
 /// `strum::EnumString`: an `impl FromStr` on an enum whose body matches string
@@ -879,27 +906,30 @@ fn strum_enum_string_pattern() -> DerivePattern {
         external: ext("strum", "EnumString", ExternalKind::Derive),
         mechanism: "#[derive(strum::EnumString)]".to_string(),
         structural: 0.75,
-        check: |facts| {
-            if !facts.is_enum {
-                return None;
-            }
-            let fromstr = facts.trait_by("FromStr")?;
-            Some(DeriveMatch {
-                members: vec![type_member(facts, ""), impl_member(facts, fromstr)],
-                match_basis: vec![format!(
-                    "enum `{}` with a hand-written `FromStr` at {}:{}-{} mapping strings to \
+        kind: DeriveKind::StrumEnumString,
+    }
+}
+
+/// The `strum::EnumString` predicate body.
+fn strum_enum_string_check(facts: &TypeImplFacts) -> Option<DeriveMatch> {
+    if !facts.is_enum {
+        return None;
+    }
+    let fromstr = facts.trait_by("FromStr")?;
+    Some(DeriveMatch {
+        members: vec![type_member(facts, ""), impl_member(facts, fromstr)],
+        match_basis: vec![format!(
+            "enum `{}` with a hand-written `FromStr` at {}:{}-{} mapping strings to \
                      variants — `#[derive(strum::EnumString)]` generates this parser",
-                    facts.type_name, facts.file, fromstr.line_start, fromstr.line_end
-                )],
-                differences: vec![
-                    "strum::EnumString derives an exact/serialize-keyed parser; a hand-written \
+            facts.type_name, facts.file, fromstr.line_start, fromstr.line_end
+        )],
+        differences: vec![
+            "strum::EnumString derives an exact/serialize-keyed parser; a hand-written \
                      `FromStr` with fuzzy matching, aliases, or normalization needs \
                      `#[strum(...)]` attributes or does not map cleanly."
-                        .to_string(),
-                ],
-            })
-        },
-    }
+                .to_string(),
+        ],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -917,12 +947,31 @@ struct BodyPattern {
     external: ExternalRef,
     mechanism: String,
     structural: f64,
-    check: fn(&StructuralSignature) -> Option<BodyMatch>,
+    /// Which curated body predicate this is. A closed enum rather than a stored
+    /// `fn` pointer, so the engine's dispatch stays statically resolvable for the
+    /// functional-core self-check (see [`DeriveKind`]).
+    kind: BodyKind,
+}
+
+/// The closed set of curated body predicates. [`BodyPattern::match_body`]
+/// dispatches on this by `match` (a direct call) rather than an indirect
+/// `fn`-pointer call.
+#[derive(Clone, Copy)]
+enum BodyKind {
+    ItertoolsProcessResults,
+}
+
+impl BodyKind {
+    fn check(self, sig: &StructuralSignature) -> Option<BodyMatch> {
+        match self {
+            BodyKind::ItertoolsProcessResults => itertools_process_results_check(sig),
+        }
+    }
 }
 
 impl BodyPattern {
     fn match_body(&self, sig: &StructuralSignature, trust: f64) -> Option<LibraryFinding> {
-        let (basis, differences) = (self.check)(sig)?;
+        let (basis, differences) = self.kind.check(sig)?;
         Some(make_finding(
             vec![to_member(sig)],
             self.external.clone(),
@@ -966,36 +1015,39 @@ fn itertools_process_results_pattern() -> BodyPattern {
                     for a fallible reduction"
             .to_string(),
         structural: 0.7,
-        check: |sig| {
-            if sig.cfg.loop_count == 0 || sig.cfg.try_count == 0 {
-                return None;
-            }
-            let accum: Vec<&str> = sig
-                .call_sequence
-                .iter()
-                .map(String::as_str)
-                .filter(|c| matches!(*c, "push" | "insert" | "extend" | "push_str"))
-                .collect();
-            if accum.is_empty() {
-                return None;
-            }
-            let basis = vec![format!(
-                "a loop that accumulates with `?` into a container ({} loop(s), {} `?`/try, \
+        kind: BodyKind::ItertoolsProcessResults,
+    }
+}
+
+/// The `itertools::process_results` predicate body.
+fn itertools_process_results_check(sig: &StructuralSignature) -> Option<BodyMatch> {
+    if sig.cfg.loop_count == 0 || sig.cfg.try_count == 0 {
+        return None;
+    }
+    let accum: Vec<&str> = sig
+        .call_sequence
+        .iter()
+        .map(String::as_str)
+        .filter(|c| matches!(*c, "push" | "insert" | "extend" | "push_str"))
+        .collect();
+    if accum.is_empty() {
+        return None;
+    }
+    let basis = vec![format!(
+        "a loop that accumulates with `?` into a container ({} loop(s), {} `?`/try, \
                  accumulator call(s): {}) — the manual shape `collect::<Result<_,_>>()` / \
                  `itertools::process_results` replaces",
-                sig.cfg.loop_count,
-                sig.cfg.try_count,
-                accum.join(", "),
-            )];
-            let differences = vec![
+        sig.cfg.loop_count,
+        sig.cfg.try_count,
+        accum.join(", "),
+    )];
+    let differences = vec![
                 "`collect::<Result<_,_>>()` short-circuits on the first `Err` and needs the item \
                  to be a `Result`; a loop doing extra work per item (side effects, multiple pushes, \
                  filtering) is not a one-liner."
                     .to_string(),
             ];
-            Some((basis, differences))
-        },
-    }
+    Some((basis, differences))
 }
 
 #[cfg(test)]

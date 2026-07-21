@@ -15,6 +15,7 @@ mod portdiff_config;
 mod portdiff_html;
 mod py_adapter;
 mod rust_adapter;
+mod rust_source;
 mod similar_cmd;
 mod structural_rust;
 mod ts_adapter;
