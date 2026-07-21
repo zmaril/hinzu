@@ -217,6 +217,20 @@ fn target_file_to_module(file: &str, rules: &NamingRules) -> String {
     m
 }
 
+/// Whether a target file lives in the package's PRIMARY target crate — the first
+/// entry of [`NamingRules::target_src_prefix`]. A source package may map to
+/// several target crates (PR1); the primary is the config's first, and a match
+/// landing outside it drives the RELOCATED band. When no target crate prefix is
+/// configured, everything counts as primary (no relocation is possible), and for
+/// a single-crate package the sole prefix *is* the primary, so every match is
+/// primary and RELOCATED never fires.
+fn target_file_in_primary_crate(file: &str, rules: &NamingRules) -> bool {
+    match rules.target_src_prefix.first() {
+        Some(primary) => file.starts_with(&format!("{primary}/")),
+        None => true,
+    }
+}
+
 /// The generic `crates/<one-segment>/src/<rest>` shape → `<rest>`.
 fn strip_generic_crate_src(file: &str) -> Option<&str> {
     let rest = file.strip_prefix("crates/")?;
@@ -320,6 +334,11 @@ struct AtSym {
     module: String,
     leaf_norm: String,
     is_impl: bool,
+    /// Whether this target symbol's defining file lives in the package's PRIMARY
+    /// target crate (the first entry of `target_src_prefix`). Matches that land
+    /// in a non-primary crate drive the RELOCATED band. Always `true` for
+    /// single-crate packages, so they never produce RELOCATED.
+    in_primary_crate: bool,
 }
 
 /// A normalized, matched source symbol.
@@ -407,6 +426,7 @@ pub fn port_diff(
             module: target_file_to_module(file, rules),
             leaf_norm: norm_leaf(&leaf_raw, rules),
             is_impl: s.id.starts_with('<'),
+            in_primary_crate: target_file_in_primary_crate(file, rules),
             id: s.id.clone(),
         });
     }
@@ -702,6 +722,33 @@ pub fn port_diff(
             matched >= 1 || has_mapped,
             config.ported_threshold,
         );
+        // RELOCATED override: of this file's matched symbols that resolved to a
+        // target symbol, tally how many landed in the PRIMARY target crate vs a
+        // secondary one. If the port moved predominantly (> 50%) into a secondary
+        // crate, relabel PORTED/STARTED as RELOCATED. Only these two bands are
+        // overridden — DONE and NOT-STARTED keep their meaning. Single-crate
+        // packages have no secondary crate, so `secondary` stays 0 and the band
+        // is untouched.
+        let (mut resolved, mut secondary) = (0usize, 0usize);
+        for s in syms {
+            if !s.tier.matched() {
+                continue;
+            }
+            if let Some(idx) = s.at_id.as_deref().and_then(|id| at_id_to_idx.get(id)) {
+                resolved += 1;
+                if !at_syms[*idx].in_primary_crate {
+                    secondary += 1;
+                }
+            }
+        }
+        let band = if matches!(band, Band::Ported | Band::Started)
+            && resolved > 0
+            && secondary * 2 > resolved
+        {
+            Band::Relocated
+        } else {
+            band
+        };
         band_counts.bump(band);
         band_of.insert(f.as_str(), band);
 

@@ -307,3 +307,80 @@ fn ready_frontier_needs_all_deps_ported() {
     // orphan.ts depends on an unported file -> NOT on the frontier.
     assert!(!frontier.contains(&"src/orphan.ts"));
 }
+
+/// A two-target-crate config: `crates/primary/src` is the PRIMARY crate (index 0),
+/// `crates/secondary/src` the secondary. Reuses the prototype naming rules, only
+/// swapping the crate prefixes so the primary/secondary distinction is real.
+fn cfg_two_crates() -> PortDiffConfig {
+    let mut cfg = cfg_no_conformance();
+    cfg.naming.target_src_prefix = vec![
+        "crates/primary/src".to_string(),
+        "crates/secondary/src".to_string(),
+    ];
+    cfg.naming.strip_crate_prefix = vec!["primary".to_string(), "secondary".to_string()];
+    cfg
+}
+
+#[test]
+fn relocated_band_flags_a_port_in_a_secondary_crate() {
+    // Two source files, each with one matchable symbol. `kept.ts#stays` ports
+    // in place into the PRIMARY crate; `moved.ts#gone` ports into the SECONDARY
+    // crate. Both would otherwise band PORTED (coverage 1.0), but the moved file
+    // is relabeled RELOCATED because its match landed outside the primary crate.
+    let source = graph_of(
+        &[
+            ("src/kept.ts#stays", "src/kept.ts"),
+            ("src/moved.ts#gone", "src/moved.ts"),
+        ],
+        &[],
+    );
+    let target = graph_of(
+        &[
+            ("primary::kept::stays", "crates/primary/src/kept.rs"),
+            ("secondary::moved::gone", "crates/secondary/src/moved.rs"),
+        ],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_two_crates(), None);
+
+    let find = |path: &str| {
+        report
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("missing {path}"))
+    };
+    // Control: matched in the primary crate → normal PORTED band.
+    let kept = find("src/kept.ts");
+    assert_eq!(kept.matched_symbols, 1);
+    assert_eq!(kept.band, Band::Ported);
+    // Subject: matched predominantly in a secondary crate → RELOCATED.
+    let moved = find("src/moved.ts");
+    assert_eq!(moved.matched_symbols, 1);
+    assert_eq!(moved.band, Band::Relocated);
+    // The band count reflects exactly one relocated file.
+    assert_eq!(report.overall.bands.relocated, 1);
+    assert_eq!(report.overall.bands.ported, 1);
+}
+
+#[test]
+fn single_crate_package_never_relocates() {
+    // Backward-compat: with one configured target crate, every match is in the
+    // primary crate, so RELOCATED can never fire even for a decomposed port.
+    let source = graph_of(&[("src/only.ts#thing", "src/only.ts")], &[]);
+    let target = graph_of(
+        &[("atilla_ai::only::thing", "crates/atilla-ai/src/only.rs")],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+    let only = report
+        .files
+        .iter()
+        .find(|f| f.path == "src/only.ts")
+        .unwrap();
+    assert_eq!(only.band, Band::Ported);
+    assert_eq!(report.overall.bands.relocated, 0);
+}
