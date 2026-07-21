@@ -156,6 +156,21 @@ struct PlanArgs {
     /// Disable small-file coalescing: group by dependency cycles only.
     #[arg(long)]
     no_coalesce: bool,
+    /// A port-diff config TOML (see `hinzu port-diff --config`). When given with
+    /// `--merge-package`, the plan additionally runs the split-not-merge invariant
+    /// check against the package's current Rust target and attaches the resulting
+    /// `merges` section — the same [`MergeReport`] port-diff surfaces — so a plan
+    /// shows which target files ≥ 2 of this package's source files already merged
+    /// into.
+    #[arg(long)]
+    merge_config: Option<PathBuf>,
+    /// The package (in `--merge-config`) whose target the merge check runs against.
+    #[arg(long)]
+    merge_package: Option<String>,
+    /// Override: a pre-extracted TARGET graph JSON for the merge check, skipping the
+    /// live Rust extraction. Used only with `--merge-config` / `--merge-package`.
+    #[arg(long)]
+    merge_target_graph: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -232,6 +247,17 @@ struct PortDiffArgs {
     /// Also write a self-contained HTML dashboard to this file.
     #[arg(long)]
     html: Option<PathBuf>,
+    /// Run the **split-not-merge** invariant check across every package against the
+    /// UNION of all target crates (only with `--all`). Each package's source files
+    /// are matched against the merged target graph of every crate, so a source file
+    /// that landed in *another* package's crate is visible — the combined
+    /// `merges` then flags both file-merges (a target file drawing substantial
+    /// content from ≥ 2 source files, cross-package when they span packages) and
+    /// misplacements (a source file ported into a crate owned by another package).
+    /// Heavier than a plain `--all` (every package sees every crate's symbols), so
+    /// it is opt-in.
+    #[arg(long)]
+    merge_check: bool,
 }
 
 #[derive(Parser)]
@@ -461,13 +487,37 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
     };
     let graph = scope_to_closure(graph, &args.from)?;
 
-    let plan = hinzu_core::plan::build_plan(
+    let mut plan = hinzu_core::plan::build_plan(
         &graph,
         hinzu_core::plan::PlanOpts {
             max_group_loc: args.group_max_loc,
             coalesce_small: !args.no_coalesce,
         },
     );
+
+    // Optional split-not-merge check: match this source graph + plan against the
+    // package's Rust target and attach the same MergeReport port-diff produces, so
+    // the plan carries the invariant it is scheduling against.
+    if let Some(merge_cfg) = &args.merge_config {
+        let package = args.merge_package.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--merge-config needs --merge-package <name> to pick the target")
+        })?;
+        let cfg = portdiff_config::MultiPackageConfig::load(merge_cfg)?;
+        let resolved = cfg.resolve(package)?;
+        let target_graph = match &args.merge_target_graph {
+            Some(p) => load_graph(p)?,
+            None => extract_target_graph_live(&resolved)?,
+        };
+        let report = hinzu_core::portdiff::port_diff(
+            &graph,
+            &plan,
+            &target_graph,
+            &resolved.config,
+            read_conformance_manifest(&resolved.manifest_path).as_deref(),
+        );
+        plan.merges = Some(report.merges);
+    }
+
     let json = serde_json::to_string_pretty(&plan).context("serializing the plan to JSON")?;
     write_json(args.out.as_deref(), &json, "plan")
 }
@@ -481,6 +531,12 @@ fn plan(args: PlanArgs) -> Result<ExitCode> {
 /// `--html` — a self-contained dashboard.
 fn port_diff_cmd(args: PortDiffArgs) -> Result<ExitCode> {
     let cfg = portdiff_config::MultiPackageConfig::load(&args.config)?;
+    if args.merge_check && !args.all {
+        anyhow::bail!(
+            "--merge-check runs the cross-package split-not-merge check over every package \
+             against the union of all target crates; it requires --all"
+        );
+    }
     if args.all {
         return if args.from.is_empty() {
             port_diff_all(&cfg, &args)
@@ -602,10 +658,19 @@ fn port_diff_all(
         );
     }
 
-    let mut reports: Vec<(String, hinzu_core::portdiff::PortDiffReport)> = Vec::new();
+    // Pass 1: gather each package's source graph + plan and target graph (cached
+    // under --cache-dir when set). Held so the merge-check can build the UNION of
+    // every target crate before any package is diffed.
+    struct Gathered {
+        resolved: portdiff_config::ResolvedPackage,
+        source_graph: hinzu_core::graph::GraphOutput,
+        source_plan: hinzu_core::plan::PlanOutput,
+        target_graph: hinzu_core::graph::GraphOutput,
+    }
+    let mut gathered: Vec<Gathered> = Vec::new();
     for name in cfg.package_names() {
         let resolved = cfg.resolve(&name)?;
-        eprintln!("=== port-diff {name} ===");
+        eprintln!("=== extract {name} ===");
 
         // Source graph + plan, then target graph — each cached under --cache-dir
         // when set, else extracted live exactly like the single-package path.
@@ -622,22 +687,71 @@ fn port_diff_all(
             cached_or_extract(args.cache_dir.as_deref(), &name, "target-graph", || {
                 extract_target_graph_live(&resolved)
             })?;
+        gathered.push(Gathered {
+            resolved,
+            source_graph,
+            source_plan,
+            target_graph,
+        });
+    }
 
-        let manifest_json = read_conformance_manifest(&resolved.manifest_path);
+    // With --merge-check, build the UNION of every package's target crates once, so
+    // each package is matched against every crate and a source file ported into
+    // another package's crate stays visible for the cross-package merge detector.
+    let union_target = if args.merge_check {
+        let crates: Vec<hinzu_core::graph::GraphOutput> =
+            gathered.iter().map(|g| g.target_graph.clone()).collect();
+        eprintln!(
+            "merge-check: matching every package against the union of {} target-crate graph(s)",
+            crates.len()
+        );
+        Some(merge_target_graphs(crates))
+    } else {
+        None
+    };
+
+    // Pass 2: diff each package. Against the union target (merge-check) or its own
+    // target crate (plain --all).
+    let mut reports: Vec<(String, hinzu_core::portdiff::PortDiffReport)> = Vec::new();
+    for g in &gathered {
+        let name = g.resolved.name.clone();
+        eprintln!("=== port-diff {name} ===");
+        let target_graph = union_target.as_ref().unwrap_or(&g.target_graph);
+        let manifest_json = read_conformance_manifest(&g.resolved.manifest_path);
         let report = hinzu_core::portdiff::port_diff(
-            &source_graph,
-            &source_plan,
-            &target_graph,
-            &resolved.config,
+            &g.source_graph,
+            &g.source_plan,
+            target_graph,
+            &g.resolved.config,
             manifest_json.as_deref(),
         );
         reports.push((name, report));
     }
 
+    // Map each target crate to the package that owns it (config's per-package
+    // primary/secondary crates), so the misplacement detector uses the declared
+    // ownership rather than plurality. Crate name = the segment after `crates/`
+    // in the package's `target_src_prefix` (`crates/pidgin-ai/src` → `pidgin-ai`).
+    let mut owning_override: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for g in &gathered {
+        let pkg = g.resolved.name.clone();
+        for prefix in &g.resolved.config.naming.target_src_prefix {
+            if let Some(cr) = prefix
+                .strip_prefix("crates/")
+                .and_then(|rest| rest.split('/').next())
+            {
+                if !cr.is_empty() {
+                    owning_override.insert(cr.to_string(), pkg.clone());
+                }
+            }
+        }
+    }
     let multi = hinzu_core::portdiff::MultiPackageReport::aggregate(
         &cfg.source_kind,
         &cfg.target_kind,
         reports,
+        &owning_override,
     );
 
     if let Some(html_path) = &args.html {

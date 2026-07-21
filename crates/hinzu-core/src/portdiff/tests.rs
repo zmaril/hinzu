@@ -384,3 +384,328 @@ fn single_crate_package_never_relocates() {
     assert_eq!(only.band, Band::Ported);
     assert_eq!(report.overall.bands.relocated, 0);
 }
+
+// ---- 6. Split-not-merge detector --------------------------------------
+
+#[test]
+fn slice_merge_two_substantial_contributors_neither_dominant_is_flagged() {
+    // The signature v1 miss: a target file `content.rs` folds a *slice* of two
+    // source files, and NEITHER slice is that file's plurality home. Each source
+    // file decomposes across the `api/anthropic` subtree — a 3-symbol home, a
+    // 2-symbol slice into the shared `content.rs`, and a 2-symbol extra — so no
+    // single target module holds ≥ 60% of its leaves and it clusters to the
+    // `api/anthropic` parent, making every match STRONG (subtree tier). Both files
+    // then land 2 STRONG symbols in `content.rs` (a substantial contribution each),
+    // yet each file's DOMINANT target is its own 3-symbol home — so v1's
+    // plurality-of-dominant scheme never flags content.rs. The substantial-
+    // contributor detector does.
+    let source = graph_of(
+        &[
+            ("src/msg-a.ts#a_home1", "src/msg-a.ts"),
+            ("src/msg-a.ts#a_home2", "src/msg-a.ts"),
+            ("src/msg-a.ts#a_home3", "src/msg-a.ts"),
+            ("src/msg-a.ts#a_content1", "src/msg-a.ts"),
+            ("src/msg-a.ts#a_content2", "src/msg-a.ts"),
+            ("src/msg-a.ts#a_extra1", "src/msg-a.ts"),
+            ("src/msg-a.ts#a_extra2", "src/msg-a.ts"),
+            ("src/msg-b.ts#b_home1", "src/msg-b.ts"),
+            ("src/msg-b.ts#b_home2", "src/msg-b.ts"),
+            ("src/msg-b.ts#b_home3", "src/msg-b.ts"),
+            ("src/msg-b.ts#b_content1", "src/msg-b.ts"),
+            ("src/msg-b.ts#b_content2", "src/msg-b.ts"),
+            ("src/msg-b.ts#b_extra1", "src/msg-b.ts"),
+            ("src/msg-b.ts#b_extra2", "src/msg-b.ts"),
+        ],
+        &[],
+    );
+    let target = graph_of(
+        &[
+            // msg-a's home (3), its content slice (2), its extra (2).
+            (
+                "atilla_ai::api::anthropic::a_home::a_home1",
+                "crates/atilla-ai/src/api/anthropic/a_home.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::a_home::a_home2",
+                "crates/atilla-ai/src/api/anthropic/a_home.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::a_home::a_home3",
+                "crates/atilla-ai/src/api/anthropic/a_home.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::content::a_content1",
+                "crates/atilla-ai/src/api/anthropic/content.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::content::a_content2",
+                "crates/atilla-ai/src/api/anthropic/content.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::a_extra::a_extra1",
+                "crates/atilla-ai/src/api/anthropic/a_extra.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::a_extra::a_extra2",
+                "crates/atilla-ai/src/api/anthropic/a_extra.rs",
+            ),
+            // msg-b's home (3), its content slice (2), its extra (2).
+            (
+                "atilla_ai::api::anthropic::b_home::b_home1",
+                "crates/atilla-ai/src/api/anthropic/b_home.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::b_home::b_home2",
+                "crates/atilla-ai/src/api/anthropic/b_home.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::b_home::b_home3",
+                "crates/atilla-ai/src/api/anthropic/b_home.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::content::b_content1",
+                "crates/atilla-ai/src/api/anthropic/content.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::content::b_content2",
+                "crates/atilla-ai/src/api/anthropic/content.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::b_extra::b_extra1",
+                "crates/atilla-ai/src/api/anthropic/b_extra.rs",
+            ),
+            (
+                "atilla_ai::api::anthropic::b_extra::b_extra2",
+                "crates/atilla-ai/src/api/anthropic/b_extra.rs",
+            ),
+        ],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+    // Neither source file's DOMINANT target is content.rs (v1 would miss it).
+    let dom = |p: &str| {
+        report
+            .files
+            .iter()
+            .find(|f| f.path == p)
+            .unwrap()
+            .dominant_target_file
+            .clone()
+    };
+    assert_eq!(
+        dom("src/msg-a.ts").as_deref(),
+        Some("crates/atilla-ai/src/api/anthropic/a_home.rs")
+    );
+    assert_eq!(
+        dom("src/msg-b.ts").as_deref(),
+        Some("crates/atilla-ai/src/api/anthropic/b_home.rs")
+    );
+
+    // content.rs is flagged as a file-merge of the two slices.
+    let m = report
+        .merges
+        .file_merges
+        .iter()
+        .find(|e| e.target_file == "crates/atilla-ai/src/api/anthropic/content.rs")
+        .expect("content.rs should be flagged as a slice-merge");
+    let mut srcs: Vec<&str> = m
+        .contributors
+        .iter()
+        .map(|c| c.source_file.as_str())
+        .collect();
+    srcs.sort();
+    assert_eq!(srcs, vec!["src/msg-a.ts", "src/msg-b.ts"]);
+    assert!(!m.cross_package);
+    // The home files, each fed by a single source file, are NOT flagged.
+    assert!(!report
+        .merges
+        .file_merges
+        .iter()
+        .any(|e| e.target_file.ends_with("a_home.rs") || e.target_file.ends_with("b_home.rs")));
+}
+
+#[test]
+fn single_source_misplacement_into_another_packages_crate_is_flagged() {
+    // A single source file of the `coding-agent` package ports substantially into
+    // the `pidgin-ai` crate — no multi-source "merge" at all, so v1's ≥ 2-source
+    // rule could never see it. The misplacement detector flags it because the
+    // owning package of `pidgin-ai` (ai) differs from the source's package.
+    let target = graph_of(
+        &[
+            // The ai package's own file, establishing ai as pidgin-ai's owner.
+            ("pidgin_ai::types::AiThing", "crates/pidgin-ai/src/types.rs"),
+            ("pidgin_ai::types::AiOther", "crates/pidgin-ai/src/types.rs"),
+            ("pidgin_ai::types::AiMore", "crates/pidgin-ai/src/types.rs"),
+            // The misplaced destination: a coding-agent file's symbols landed here.
+            (
+                "pidgin_ai::providers::composer::make",
+                "crates/pidgin-ai/src/providers/composer.rs",
+            ),
+            (
+                "pidgin_ai::providers::composer::wire",
+                "crates/pidgin-ai/src/providers/composer.rs",
+            ),
+        ],
+        &[],
+    );
+    // ai package: types.ts ports 1:1 into pidgin-ai/src/types.rs.
+    let src_ai = graph_of(
+        &[
+            ("src/types.ts#AiThing", "src/types.ts"),
+            ("src/types.ts#AiOther", "src/types.ts"),
+            ("src/types.ts#AiMore", "src/types.ts"),
+        ],
+        &[],
+    );
+    // coding-agent package: composer.ts's symbols landed in the pidgin-ai crate.
+    let src_ca = graph_of(
+        &[
+            ("src/composer.ts#make", "src/composer.ts"),
+            ("src/composer.ts#wire", "src/composer.ts"),
+        ],
+        &[],
+    );
+    let cfg = cfg_no_conformance();
+    let mk = |src: &GraphOutput| {
+        port_diff(
+            src,
+            &build_plan(src, PlanOpts::default()),
+            &target,
+            &cfg,
+            None,
+        )
+    };
+    // Owning override from config: pidgin-ai is owned by the ai package.
+    let mut owning = std::collections::BTreeMap::new();
+    owning.insert("pidgin-ai".to_string(), "ai".to_string());
+    let multi = MultiPackageReport::aggregate(
+        "ts",
+        "rust",
+        vec![
+            ("ai".to_string(), mk(&src_ai)),
+            ("coding-agent".to_string(), mk(&src_ca)),
+        ],
+        &owning,
+    );
+
+    // composer.ts (coding-agent) is flagged as misplaced into the pidgin-ai crate.
+    let mp = multi
+        .merges
+        .misplacements
+        .iter()
+        .find(|m| m.source_file == "src/composer.ts")
+        .expect("composer.ts should be flagged as a misplacement");
+    assert_eq!(mp.source_package, "coding-agent");
+    assert_eq!(mp.target_crate, "pidgin-ai");
+    assert_eq!(mp.owning_package, "ai");
+    assert_eq!(mp.target_file, "crates/pidgin-ai/src/providers/composer.rs");
+    // It is a single-source destination, so it is NOT a file-merge.
+    assert!(!multi
+        .merges
+        .file_merges
+        .iter()
+        .any(|e| e.target_file.ends_with("providers/composer.rs")));
+    // The ai package's own 1:1 port is not a misplacement.
+    assert!(!multi
+        .merges
+        .misplacements
+        .iter()
+        .any(|m| m.source_file == "src/types.ts"));
+}
+
+#[test]
+fn one_global_name_coincidence_is_not_flagged() {
+    // `settings_list.rs` is `settings.ts`'s real 1:1 home (3 strong symbols).
+    // `other.ts` shares a SINGLE leaf name (`render`) that resolves there by
+    // global-name only — a 1-symbol coincidence. It is not a substantial
+    // contributor, so `settings_list.rs` is NOT flagged as a merge.
+    let source = graph_of(
+        &[
+            ("src/settings.ts#build", "src/settings.ts"),
+            ("src/settings.ts#apply", "src/settings.ts"),
+            ("src/settings.ts#reset", "src/settings.ts"),
+            ("src/other.ts#render", "src/other.ts"),
+            ("src/other.ts#unrelated", "src/other.ts"),
+        ],
+        &[],
+    );
+    let target = graph_of(
+        &[
+            (
+                "atilla_ai::settings_list::build",
+                "crates/atilla-ai/src/settings_list.rs",
+            ),
+            (
+                "atilla_ai::settings_list::apply",
+                "crates/atilla-ai/src/settings_list.rs",
+            ),
+            (
+                "atilla_ai::settings_list::reset",
+                "crates/atilla-ai/src/settings_list.rs",
+            ),
+            // `render` exists here too — the coincidental global-name leaf.
+            (
+                "atilla_ai::settings_list::render",
+                "crates/atilla-ai/src/settings_list.rs",
+            ),
+            // other.ts's real home, so its dominant is elsewhere.
+            (
+                "atilla_ai::other::unrelated",
+                "crates/atilla-ai/src/other.rs",
+            ),
+        ],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+    // other.ts contributes exactly one global-name symbol to settings_list.rs.
+    let other = report
+        .files
+        .iter()
+        .find(|f| f.path == "src/other.ts")
+        .unwrap();
+    let into_sl = other
+        .target_file_contributions
+        .iter()
+        .find(|tc| tc.file == "crates/atilla-ai/src/settings_list.rs");
+    if let Some(tc) = into_sl {
+        assert_eq!(tc.strong_matched, 0);
+        assert!(tc.total_matched <= 1);
+    }
+    // Not substantial → settings_list.rs is not flagged.
+    assert!(report.merges.file_merges.is_empty());
+    assert!(report.merges.misplacements.is_empty());
+}
+
+#[test]
+fn clean_one_to_one_same_package_port_is_not_flagged() {
+    // Two source files ported to two distinct target files, each a clean 1:1: no
+    // target file draws substantial content from ≥ 2 source files, and every file
+    // sits in its own package's crate, so nothing is flagged.
+    let source = graph_of(
+        &[
+            ("src/a.ts#foo", "src/a.ts"),
+            ("src/a.ts#foo2", "src/a.ts"),
+            ("src/b.ts#bar", "src/b.ts"),
+            ("src/b.ts#bar2", "src/b.ts"),
+        ],
+        &[],
+    );
+    let target = graph_of(
+        &[
+            ("atilla_ai::a::foo", "crates/atilla-ai/src/a.rs"),
+            ("atilla_ai::a::foo2", "crates/atilla-ai/src/a.rs"),
+            ("atilla_ai::b::bar", "crates/atilla-ai/src/b.rs"),
+            ("atilla_ai::b::bar2", "crates/atilla-ai/src/b.rs"),
+        ],
+        &[],
+    );
+    let plan = build_plan(&source, PlanOpts::default());
+    let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
+
+    assert!(report.merges.file_merges.is_empty());
+    assert!(report.merges.misplacements.is_empty());
+}

@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::GraphOutput;
+use crate::portdiff::MergeReport;
 
 /// The schema version embedded in every emitted plan.
 pub const HINZU_PLAN_VERSION: u32 = 1;
@@ -165,6 +166,14 @@ pub struct PlanOutput {
     pub groups: Vec<PlanGroup>,
     /// The waves, `0..wave_count`.
     pub waves: Vec<Wave>,
+    /// The split-not-merge invariant check against the current target, when one is
+    /// available. The plan is source-side, so [`build_plan`] leaves this `None`; the
+    /// CLI fills it in when a port-diff config, package, and target graph are given
+    /// (`hinzu plan --merge-config …`), reusing the same core [`MergeReport`] the
+    /// port-diff surfaces — so the plan flags target files that ≥ 2 source files of
+    /// this package already merged into as it is scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merges: Option<MergeReport>,
 }
 
 /// A group under construction: its member files and whether it carries a cycle.
@@ -507,6 +516,7 @@ pub fn build_plan(graph: &GraphOutput, opts: PlanOpts) -> PlanOutput {
         stats,
         groups: out_groups,
         waves,
+        merges: None,
     }
 }
 
