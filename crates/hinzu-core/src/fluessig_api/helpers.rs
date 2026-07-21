@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{FlEnumVariant, FlField, FlForeign, FlType, FlUnionVariant};
+use serde::Serialize;
+
+use super::{Converter, FlEnumVariant, FlField, FlForeign, FlType, FlUnionVariant, Parsed};
 
 // ─────────────────────────── string helpers ─────────────────────────────────
 
@@ -97,6 +99,10 @@ pub(super) fn normalize(s: &str) -> String {
 struct Brackets {
     depth: i32,
     in_str: Option<char>,
+    /// The previous non-consumed char, so `=>` is recognized: the `>` of an arrow
+    /// is NOT a generic close and must not decrement depth (otherwise a top-level
+    /// `|`/`,` after a nested `(x) => void` would be miscounted).
+    prev: Option<char>,
 }
 
 impl Brackets {
@@ -106,6 +112,7 @@ impl Brackets {
     /// i.e. the character stream a splitter/scanner reasons about. Brackets and
     /// quotes drive the state and return `false`.
     fn feed(&mut self, c: char) -> bool {
+        let prev = self.prev.replace(c);
         if let Some(q) = self.in_str {
             if c == q {
                 self.in_str = None;
@@ -121,6 +128,9 @@ impl Brackets {
                 self.depth += 1;
                 false
             }
+            // The `>` in an arrow `=>` is not a generic close — leave depth alone
+            // (it is ordinary top-level content when at depth 0).
+            '>' if prev == Some('=') => self.depth == 0,
             '>' | ')' | ']' | '}' => {
                 self.depth -= 1;
                 false
@@ -205,6 +215,10 @@ pub(super) fn fltype_key(t: &FlType) -> String {
         FlType::Nullable { nullable } => format!("n[{}]", fltype_key(nullable)),
         FlType::Union { union } => format!("u:{union}"),
         FlType::Foreign { foreign } => format!("f:{}", foreign.name),
+        FlType::Callback { callback } => {
+            let params: Vec<String> = callback.params.iter().map(fltype_key).collect();
+            format!("cb[{}]", params.join(","))
+        }
     }
 }
 
@@ -599,5 +613,170 @@ pub(super) fn camel(s: &str) -> String {
     match cs.next() {
         Some(f) => f.to_ascii_lowercase().to_string() + cs.as_str(),
         None => String::new(),
+    }
+}
+
+// ─────────────────────────── callbacks ──────────────────────────────────────
+
+/// The signature of an [`FlType::Callback`]. Byte-serde-identical to fluessig's
+/// `CallbackSig` (camelCase, `skip_serializing_if` on the optional tail), so a
+/// forward-only sync-void callback serializes to just `{"params":[…]}` — the
+/// `returns`/`isAsync`/`fallible` keys are omitted. The converter only ever
+/// mints the sync-void shape (`returns` = `void`, `is_async`/`fallible` false),
+/// the only callback any fluessig backend lowers today.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlCallbackSig {
+    pub params: Vec<FlType>,
+    #[serde(skip_serializing_if = "is_void_return")]
+    pub returns: Box<FlType>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_async: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fallible: bool,
+}
+
+impl FlCallbackSig {
+    /// A forward-only sync-void callback over `params` — the only shape emitted.
+    pub(super) fn sync_void(params: Vec<FlType>) -> Self {
+        FlCallbackSig {
+            params,
+            returns: Box::new(FlType::Scalar("void".to_string())),
+            is_async: false,
+            fallible: false,
+        }
+    }
+}
+
+/// Is a callback `returns` the `void` scalar? Drives `skip_serializing_if` so a
+/// sync-void callback omits the field — mirrors fluessig's `is_void_return`.
+#[allow(clippy::borrowed_box)]
+fn is_void_return(t: &Box<FlType>) -> bool {
+    matches!(t.as_ref(), FlType::Scalar(s) if s == "void")
+}
+
+/// Does a return type carry a callback (possibly under a `Nullable`)? Such a
+/// return is a register→unsubscribe idiom whose only fluessig home is
+/// `Shape::Subscription`; the caller degrades it when no stateful (ctor-bearing)
+/// interface is available.
+pub(super) fn returns_is_callback(t: &FlType) -> bool {
+    match t {
+        FlType::Callback { .. } => true,
+        FlType::Nullable { nullable } => returns_is_callback(nullable),
+        _ => false,
+    }
+}
+
+/// Split a normalized type on its FIRST top-level `=>` into `(head, ret)`
+/// (nesting- and string-aware), or `None` when there is no top-level arrow.
+pub(super) fn split_top_arrow(s: &str) -> Option<(&str, &str)> {
+    let mut b = Brackets::default();
+    for (i, c) in s.char_indices() {
+        if b.feed(c) && c == '=' && s[i + 1..].starts_with('>') {
+            return Some((s[..i].trim(), s[i + 2..].trim()));
+        }
+    }
+    None
+}
+
+/// If `s` is a single fully-parenthesized group — the first `(` matches the last
+/// char — return its trimmed interior. `(A | B)` → `A | B`; `((x) => void)` →
+/// `(x) => void`; but `(x: T) => void` (whose first `(` closes before the end)
+/// and `() => void` return `None`.
+///
+/// Tracks only grouping-bracket (`()`/`[]`/`{}`) depth and string state — it
+/// deliberately does NOT treat `<`/`>` as brackets, so the `>` in an inner arrow
+/// (`=>`) does not spuriously close the group. (The shared [`Brackets`] scanner
+/// counts `<>` for generics, which would misread a parenthesized callback here.)
+pub(super) fn strip_paren_group(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut byte = 0usize;
+    for c in s.chars() {
+        if let Some(q) = in_str {
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                '"' | '\'' | '`' => in_str = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // The paren matching the leading `(` — a full group only
+                        // when it is the final char.
+                        return (byte + c.len_utf8() == s.len() && c == ')')
+                            .then(|| s[1..byte].trim());
+                    }
+                }
+                _ => {}
+            }
+        }
+        byte += c.len_utf8();
+    }
+    None
+}
+
+/// Strip a `name:` / `name?:` / `readonly name:` prefix from one callback param,
+/// yielding just its type. A bare type param (no top-level colon) is returned
+/// unchanged. Reuses [`split_object_member`]'s top-level-colon split, so a colon
+/// nested in the param's own type (`cb: (e: E) => void`) is not mistaken for the
+/// name separator.
+pub(super) fn strip_param_name(raw: &str) -> String {
+    match split_object_member(raw) {
+        Some((_, ty)) => ty,
+        None => raw.trim().to_string(),
+    }
+}
+
+/// Is a callback return string the void return (`void`/`undefined`/`never`/
+/// empty)? A non-void or `Promise<…>` (async) return is outside the lowered shape.
+fn is_void_ret(ret: &str) -> bool {
+    let r = normalize(ret);
+    r.is_empty() || matches!(r.as_str(), "void" | "undefined" | "never")
+}
+
+impl Converter {
+    /// Parse a top-level function type `(params) => Ret` (known to carry a
+    /// top-level `=>`). A forward-only sync-void callback (`Ret` is `void`/empty,
+    /// not async) becomes a clean [`FlType::Callback`]; a non-void or async
+    /// (`Promise<…>`) return, or an unparenthesized head, degrades honestly with a
+    /// distinct counted reason. Each param's `name:`/`name?:` prefix is stripped
+    /// and its type recursed through [`Converter::parse_type`] — so a param
+    /// referencing an unresolved cross-package type degrades exactly as elsewhere
+    /// (via `--context`), while the `Callback` wrapper itself stays clean.
+    pub(super) fn parse_function_type(&mut self, s: &str) -> Parsed {
+        let Some((head, ret)) = split_top_arrow(s) else {
+            return self.degrade("function type");
+        };
+        // An async arrow renders its return as `Promise<…>`.
+        if strip_generic(&normalize(ret), "Promise").is_some() {
+            return self.degrade("async callback");
+        }
+        if !is_void_ret(ret) {
+            return self.degrade("non-void callback");
+        }
+        // The head must be a parenthesized param list `( … )` (possibly empty).
+        let Some(params_src) = strip_paren_group(head) else {
+            return self.degrade("function type");
+        };
+        let mut params = Vec::new();
+        let mut degraded = false;
+        for raw in split_top(params_src, ',') {
+            let p = self.parse_type(&strip_param_name(&raw));
+            degraded |= p.degraded;
+            params.push(p.ty);
+        }
+        Parsed {
+            ty: FlType::Callback {
+                callback: FlCallbackSig::sync_void(params),
+            },
+            degraded,
+        }
     }
 }

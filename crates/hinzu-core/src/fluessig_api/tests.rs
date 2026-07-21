@@ -135,8 +135,13 @@ fn known_refs_resolve_else_degrade() {
 #[test]
 fn function_and_object_types_degrade() {
     let mut c = conv();
-    assert!(c.parse_type("(event: E) => void").degraded);
-    assert!(c.parse_type("() => void").degraded);
+    // A sync-void callback is now a typed `Callback` (see `callback_types_parse`),
+    // but a NON-void callback has no fluessig home — only sync-void lowers.
+    assert!(c.parse_type("(x: string) => number").degraded);
+    assert_eq!(c.reasons.get("non-void callback"), Some(&1));
+    // An async callback (a `Promise<…>` return) likewise degrades honestly.
+    assert!(c.parse_type("(x: string) => Promise<void>").degraded);
+    assert_eq!(c.reasons.get("async callback"), Some(&1));
     // An object with a call/method member is not a plain data record — it stays
     // a `Json` fallback (the callback lane), under a distinct reason.
     assert!(c.parse_type("{ handleRpc(x: string): void }").degraded);
@@ -146,6 +151,78 @@ fn function_and_object_types_degrade() {
     );
     assert!(c.parse_type("RequestMap[keyof RequestMap]").degraded);
     assert!(c.parse_type("Record<string, number>").degraded);
+}
+
+#[test]
+fn callback_types_parse() {
+    let mut c = conv();
+    // A sync-void callback with one param → a typed `Callback` (param recursed).
+    let p = c.parse_type("(x: string) => void");
+    assert_eq!(
+        p.ty,
+        FlType::Callback {
+            callback: FlCallbackSig::sync_void(vec![scalar("string")]),
+        }
+    );
+    assert!(!p.degraded);
+    // An empty-param sync-void callback → a `Callback` with no params, clean.
+    let p = c.parse_type("() => void");
+    assert_eq!(
+        p.ty,
+        FlType::Callback {
+            callback: FlCallbackSig::sync_void(vec![]),
+        }
+    );
+    assert!(!p.degraded);
+    // A parenthesized callback unioned with `undefined` composes to
+    // `Nullable<Callback>` (the `setUiRequestHandler` param shape).
+    let p = c.parse_type("((x: string) => void) | undefined");
+    assert_eq!(
+        p.ty,
+        FlType::Nullable {
+            nullable: Box::new(FlType::Callback {
+                callback: FlCallbackSig::sync_void(vec![scalar("string")]),
+            }),
+        }
+    );
+    assert!(!p.degraded);
+    // An optional param inside the callback (`error?: Error | undefined`) recurses
+    // through the union/nullable path; `Error` is an unresolved ref so the inner
+    // degrades, but the `Callback` wrapper itself is minted (the op counts it).
+    let p = c.parse_type("(error?: Error | undefined) => void");
+    assert!(matches!(p.ty, FlType::Callback { .. }));
+}
+
+#[test]
+fn callback_serializes_like_fluessig() {
+    // A sync-void callback with one scalar param → `{"callback":{"params":["string"]}}`:
+    // the scalar is a BARE string (untagged, matching fluessig), and the void
+    // `returns`/`isAsync`/`fallible` keys are omitted.
+    let cb = FlType::Callback {
+        callback: FlCallbackSig::sync_void(vec![scalar("string")]),
+    };
+    assert_eq!(
+        serde_json::to_value(&cb).unwrap(),
+        serde_json::json!({"callback": {"params": ["string"]}})
+    );
+    // A model param serializes as its single-key object.
+    let cb = FlType::Callback {
+        callback: FlCallbackSig::sync_void(vec![FlType::Model {
+            model: "AgentSessionEvent".to_string(),
+        }]),
+    };
+    assert_eq!(
+        serde_json::to_value(&cb).unwrap(),
+        serde_json::json!({"callback": {"params": [{"model": "AgentSessionEvent"}]}})
+    );
+    // An empty-param void callback still emits `params` and nothing else.
+    let cb = FlType::Callback {
+        callback: FlCallbackSig::sync_void(vec![]),
+    };
+    assert_eq!(
+        serde_json::to_value(&cb).unwrap(),
+        serde_json::json!({"callback": {"params": []}})
+    );
 }
 
 #[test]
@@ -1182,4 +1259,57 @@ fn no_const_report_serializes_without_consts_key() {
     assert!(out.api.consts.is_empty());
     let json = serde_json::to_string(&out.api).unwrap();
     assert!(!json.contains("\"consts\""));
+}
+
+/// Branch B (the register→unsubscribe idiom with NO extracted constructor): a
+/// class method `onEvent(listener: (x) => void): () => void` keeps its listener
+/// PARAM as a typed `Callback`, but its `() => void` RETURN has no fluessig home
+/// — a `Shape::Subscription` needs a stateful (ctor-bearing) interface, and none
+/// is extracted — so the return degrades honestly and the op is counted degraded.
+#[test]
+fn callback_return_degrades_without_ctor_branch_b() {
+    let class = ApiItem::new("class", "m#Emitter", "Emitter", "m");
+    let method = {
+        let mut it = ApiItem::new("method", "m#Emitter.onEvent", "onEvent", "m");
+        it.signature = Some(Signature {
+            params: vec![Param {
+                name: "listener".to_string(),
+                ty: "(x: string) => void".to_string(),
+                optional: false,
+                default: None,
+            }],
+            return_type: Some("() => void".to_string()),
+            is_async: false,
+            receiver: Some("Emitter".to_string()),
+            error_type: None,
+            generics: vec![],
+        });
+        it
+    };
+    let out = build_fluessig(&demo_report(vec![class, method]), &[]);
+    let iface = out
+        .api
+        .interfaces
+        .iter()
+        .find(|i| i.name == "Emitter")
+        .unwrap();
+    let op = iface.ops.iter().find(|o| o.name == "onEvent").unwrap();
+    // The listener param is a typed Callback, not an untyped Json.
+    assert_eq!(
+        op.params[0].ty,
+        FlType::Callback {
+            callback: FlCallbackSig::sync_void(vec![scalar("string")]),
+        }
+    );
+    // The `() => void` return degrades to Json under the subscription reason.
+    assert_eq!(op.returns, FlType::json());
+    assert_eq!(op.shape, "unary");
+    assert_eq!(
+        out.stats
+            .degradation_reasons
+            .get("subscription return: interface has no ctor op"),
+        Some(&1)
+    );
+    assert_eq!(out.stats.ops_clean, 0);
+    assert_eq!(out.stats.ops_degraded, 1);
 }

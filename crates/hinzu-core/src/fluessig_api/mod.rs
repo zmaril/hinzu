@@ -211,6 +211,15 @@ pub enum FlType {
     Foreign {
         foreign: FlForeign,
     },
+    /// A host-supplied callback `fn(params...) -> void`. Emitted for a
+    /// forward-only sync-void function type in PARAM position (`(x: T) => void`),
+    /// so a listener is a typed [`FlCallbackSig`] rather than an untyped `Json`.
+    /// Byte-serde-identical to fluessig's `ApiType::Callback`: an untagged variant
+    /// keyed on `"callback"`, serializing as `{"callback":{"params":[…]}}` (a
+    /// sync-void callback omits `returns`/`isAsync`/`fallible`).
+    Callback {
+        callback: FlCallbackSig,
+    },
 }
 
 /// The payload of an [`FlType::Foreign`]: the source type `name` (e.g.
@@ -514,9 +523,17 @@ impl Converter {
             return self.parse_union(&members);
         }
 
-        // A top-level `=>` is a function type — no fluessig home.
+        // A redundant fully-parenthesized group — `(T)`, `(A | B)`, or a
+        // parenthesized callback inside a union (`((x: T) => void) | undefined`
+        // recurses here on its `((x: T) => void)` member). Strip one layer and
+        // re-parse so the inner arrow/union is seen at top level.
+        if let Some(inner) = strip_paren_group(s) {
+            return self.parse_type(inner);
+        }
+        // A top-level `=>` is a function type. A forward-only sync-void callback
+        // becomes a typed `FlType::Callback`; anything else degrades honestly.
         if has_top_level_arrow(s) {
-            return self.degrade("function type");
+            return self.parse_function_type(s);
         }
         // An object literal `{ ... }`: mint a named model from its fields.
         if s.starts_with('{') {
@@ -1328,6 +1345,24 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
         }
     };
     conv.name_hint.pop();
+    // A callback in RETURN position is the register→unsubscribe idiom
+    // (`(listener) => () => void`). Its only fluessig home is `Shape::Subscription`,
+    // which `load_api` accepts only on a STATEFUL interface (one carrying a
+    // `Shape::Ctor` op). No public constructor is extracted from the ApiReport
+    // surface, so no interface here has a ctor op and a subscription would be
+    // rejected. Degrade the return honestly rather than emit a callback fluessig
+    // cannot lower in this position — the callback PARAM is still emitted typed.
+    let returns = if returns_is_callback(&returns) {
+        Stats::bump(
+            &mut conv.reasons,
+            "subscription return: interface has no ctor op",
+        );
+        stats.returns_degraded += 1;
+        degraded = true;
+        FlType::json()
+    } else {
+        returns
+    };
     if ret_degraded {
         stats.returns_degraded += 1;
         degraded = true;
@@ -1454,6 +1489,7 @@ fn const_value_for(ty: &FlType, raw: Option<&str>) -> Option<FlConstValue> {
 }
 
 mod helpers;
+pub use helpers::FlCallbackSig;
 use helpers::*;
 
 #[cfg(test)]
