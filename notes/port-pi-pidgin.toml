@@ -1,0 +1,63 @@
+# Port-diff / api-diff config for the `pi` TypeScript monorepo → the `pidgin`
+# Rust workspace (the port formerly named `atilla`). Selected with
+# `--config notes/port-pi-pidgin.toml --package <name>` by both `hinzu port-diff`
+# (graph progress) and `hinzu api-diff` (public-surface conformance); the shared
+# [naming] block feeds both. Relative paths resolve against `base_dir`;
+# `target_src_prefix` is a graph prefix, left verbatim. See notes/port-diff.md for
+# the field reference and notes/api-diff.md for how api-diff reuses the rules.
+
+source_kind = "ts"
+target_kind = "rust"
+ported_threshold = 0.6
+cluster_vote_retain = 0.6
+
+base_dir = "/workspace/pidgin"
+conformance_manifest = "conformance/manifest.json"
+native_status = "native"
+
+# Shared TS→Rust naming rules (see notes/port-diff.md § [naming] for each key).
+[naming]
+file_segment_case = "kebab_to_snake"
+fn_case = "camel_to_snake"
+keep_pascal_types = true
+keep_screaming_consts = true
+strip_suffixes = [".lazy"]
+source_src_prefix = "src"
+
+# Per-package source dir → target crate. Each pi package maps to its pidgin-<pkg>
+# crate; the crate prefixes are what differ from the atilla layout.
+
+[packages.ai]
+source_dir = "vendor/pi/packages/ai"
+target_dir = "crates/pidgin-ai"
+strip_crate_prefix = "pidgin_ai"
+target_src_prefix = "crates/pidgin-ai/src"
+conformance_package = "ai"
+
+[packages.agent]
+source_dir = "vendor/pi/packages/agent"
+target_dir = "crates/pidgin-agent"
+strip_crate_prefix = "pidgin_agent"
+target_src_prefix = "crates/pidgin-agent/src"
+conformance_package = "agent"
+
+[packages.coding-agent]
+source_dir = "vendor/pi/packages/coding-agent"
+target_dir = "crates/pidgin-coding"
+strip_crate_prefix = "pidgin_coding"
+target_src_prefix = "crates/pidgin-coding/src"
+conformance_package = "coding-agent"
+
+[packages.tui]
+source_dir = "vendor/pi/packages/tui"
+target_dir = "crates/pidgin-tui"
+strip_crate_prefix = "pidgin_tui"
+target_src_prefix = "crates/pidgin-tui/src"
+conformance_package = "tui"
+
+[packages.orchestrator]
+source_dir = "vendor/pi/packages/orchestrator"
+target_dir = "crates/pidgin-orchestrator"
+strip_crate_prefix = "pidgin_orchestrator"
+target_src_prefix = "crates/pidgin-orchestrator/src"
+conformance_package = "orchestrator"
