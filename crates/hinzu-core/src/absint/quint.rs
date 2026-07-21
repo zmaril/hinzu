@@ -20,8 +20,9 @@
 //! functions are visited in `facts.functions` order, locals by index, blocks by
 //! index; there are no timestamps or randomness.
 
-use super::body::{
-    BinOp, Block, BodyFacts, ConstVal, FunctionBody, NumKind, Operand, Rvalue, Terminator, UnOp,
+use super::body::{Block, BodyFacts, FunctionBody, NumKind, Operand, Rvalue, UnOp};
+use super::emit_common::{
+    binop_symbol, describe_terminator, fn_key, is_straight_line, local_role, lower_const, var_name,
 };
 
 /// Lower a whole body-fact set into a single Quint `module derived { ... }`
@@ -183,7 +184,7 @@ fn lower_block_stmts(key: &str, block: &Block, lines: &mut Vec<Line>) {
                 expr: format!("{place}' = {}", lower_operand(key, operand)),
                 note: None,
             }),
-            Rvalue::Binary { kind, left, right } => match quint_binop(*kind) {
+            Rvalue::Binary { kind, left, right } => match binop_symbol(*kind) {
                 Some(op) => lines.push(Line::Expr {
                     expr: format!(
                         "{place}' = {l} {op} {r}",
@@ -237,21 +238,11 @@ fn push_nondet_hole(lines: &mut Vec<Line>, place: &str, reason: String) {
 }
 
 /// Lower an operand to a Quint expression: a local read to its var name, a
-/// modelable constant to its literal, an unmodelable constant to a placeholder.
+/// constant to its shared literal rendering.
 fn lower_operand(key: &str, operand: &Operand) -> String {
     match operand {
         Operand::Local { local } => var_name(key, *local as usize),
-        Operand::Const { value } => match value {
-            ConstVal::Int(v) => v.to_string(),
-            ConstVal::Uint(v) => v.to_string(),
-            ConstVal::Bool(v) => v.to_string(),
-            ConstVal::Float(_) => {
-                "0 /* AGENT-TODO: float constant — choose an abstraction */".to_string()
-            }
-            ConstVal::Unknown => {
-                "0 /* AGENT-TODO: unknown constant — choose a value */".to_string()
-            }
-        },
+        Operand::Const { value } => lower_const(value),
     }
 }
 
@@ -310,19 +301,6 @@ fn emit_invariants(out: &mut String) {
 
 // ---- helpers -------------------------------------------------------------
 
-/// A sanitized, collision-free variable-name stem for a function: every
-/// non-alphanumeric character of its symbol id becomes `_`.
-fn fn_key(id: &str) -> String {
-    id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-/// The module-level var name for local `idx` of the function keyed `key`.
-fn var_name(key: &str, idx: usize) -> String {
-    format!("{key}_l{idx}")
-}
-
 /// The Quint type for a numeric kind, plus any trailing `// AGENT-TODO` the
 /// abstraction choice needs. Int/Uint map to `int`; Bool to `bool`; Float to
 /// `int` with a float-abstraction hole; Other to `int` with an unknown-type
@@ -339,85 +317,12 @@ fn quint_type(kind: NumKind) -> (&'static str, &'static str) {
     }
 }
 
-/// How local `idx` is used: the return place (0), a parameter (`1..=arg_count`),
-/// or a temporary.
-fn local_role(idx: usize, arg_count: usize) -> &'static str {
-    if idx == 0 {
-        "return place"
-    } else if idx <= arg_count {
-        "param"
-    } else {
-        "temp"
-    }
-}
-
-/// The Quint operator for a modeled binary op, or `None` for `Other` (which
-/// becomes a hole).
-fn quint_binop(kind: BinOp) -> Option<&'static str> {
-    Some(match kind {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::Rem => "%",
-        BinOp::Eq => "==",
-        BinOp::Ne => "!=",
-        BinOp::Lt => "<",
-        BinOp::Le => "<=",
-        BinOp::Gt => ">",
-        BinOp::Ge => ">=",
-        BinOp::Other => return None,
-    })
-}
-
-/// Whether a function is a single block ending in `Return` — the case that
-/// lowers directly, with no CFG hole.
-fn is_straight_line(func: &FunctionBody) -> bool {
-    func.blocks.len() == 1 && matches!(func.blocks[0].terminator, Terminator::Return)
-}
-
-/// A one-line human description of a terminator for the CFG summary comment.
-fn describe_terminator(term: &Terminator) -> String {
-    match term {
-        Terminator::Goto { block } => format!("Goto -> block {block}"),
-        Terminator::Return => "Return".to_string(),
-        Terminator::Unreachable => "Unreachable".to_string(),
-        Terminator::SwitchInt {
-            targets, otherwise, ..
-        } => {
-            let mut cases: Vec<String> = targets
-                .iter()
-                .map(|t| format!("{}=>{}", t.value, t.block))
-                .collect();
-            if let Some(o) = otherwise {
-                cases.push(format!("else=>{o}"));
-            }
-            format!("SwitchInt [{}]", cases.join(", "))
-        }
-        Terminator::Assert { target } => format!("Assert -> block {target}"),
-        Terminator::Call {
-            destination,
-            target,
-        } => {
-            let dest = destination
-                .map(|d| format!("dest _{d}"))
-                .unwrap_or_else(|| "no dest".to_string());
-            let tgt = target
-                .map(|t| format!("-> block {t}"))
-                .unwrap_or_else(|| "diverging".to_string());
-            format!("Call ({dest}) {tgt}")
-        }
-        Terminator::Other { successors } => {
-            let succ: Vec<String> = successors.iter().map(|s| s.to_string()).collect();
-            format!("Other -> [{}]", succ.join(", "))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::body::*;
-    use super::super::test_support::{binop_fn, guarded_divide_fn};
+    use super::super::test_support::{
+        assert_guarded_cfg_summary, binop_fn, guarded_divide_fn, single_local_fn, unknown_rvalue_fn,
+    };
     use super::*;
 
     #[test]
@@ -477,23 +382,9 @@ mod tests {
 
     #[test]
     fn unknown_rvalue_becomes_an_agent_todo_hole() {
-        let f = FunctionBody {
-            id: "app::env".into(),
-            display: "env".into(),
-            file: "demo.rs".into(),
-            line: 1,
-            arg_count: 0,
-            locals: vec![Local { kind: NumKind::Int }],
-            blocks: vec![Block {
-                stmts: vec![Stmt {
-                    place: 0,
-                    rvalue: Rvalue::Unknown,
-                    loc: Loc::default(),
-                }],
-                terminator: Terminator::Return,
-            }],
-        };
-        let out = emit_quint(&BodyFacts { functions: vec![f] });
+        let out = emit_quint(&BodyFacts {
+            functions: vec![unknown_rvalue_fn()],
+        });
         assert!(
             out.contains("AGENT-TODO: environment nondeterminism"),
             "Unknown rvalue should surface an AGENT-TODO hole;\n{out}"
@@ -502,21 +393,9 @@ mod tests {
 
     #[test]
     fn a_float_local_gets_a_float_abstraction_hole() {
-        let f = FunctionBody {
-            id: "app::f".into(),
-            display: "f".into(),
-            file: "demo.rs".into(),
-            line: 1,
-            arg_count: 0,
-            locals: vec![Local {
-                kind: NumKind::Float,
-            }],
-            blocks: vec![Block {
-                stmts: vec![],
-                terminator: Terminator::Return,
-            }],
-        };
-        let out = emit_quint(&BodyFacts { functions: vec![f] });
+        let out = emit_quint(&BodyFacts {
+            functions: vec![single_local_fn(NumKind::Float)],
+        });
         assert!(
             out.contains("Quint has no floats"),
             "float local should carry a float-abstraction hole;\n{out}"
@@ -531,18 +410,7 @@ mod tests {
         let out = emit_quint(&BodyFacts {
             functions: vec![guarded_divide_fn()],
         });
-        assert!(
-            out.contains("// ---- CFG (4 blocks) ----"),
-            "multi-block body should surface a CFG summary;\n{out}"
-        );
-        assert!(
-            out.contains("AGENT-TODO: encode control flow"),
-            "CFG should carry a control-flow hole;\n{out}"
-        );
-        assert!(
-            out.contains("SwitchInt"),
-            "the SwitchInt terminator should appear in the CFG summary;\n{out}"
-        );
+        assert_guarded_cfg_summary(&out);
         // Block 0's `_3 = Ne(_2, 0)` comparison still lowers to real Quint.
         assert!(
             out.contains("app__safe_l3' = app__safe_l2 != 0"),

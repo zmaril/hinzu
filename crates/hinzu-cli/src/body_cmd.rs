@@ -18,7 +18,8 @@ use crate::{rust_adapter, write_json};
 enum EmitTarget {
     /// A Quint (`.qnt`) module skeleton.
     Quint,
-    // phase D: Stateright
+    /// A Rust Stateright (`.rs`) `Model` skeleton.
+    Stateright,
 }
 
 #[derive(Parser)]
@@ -78,10 +79,14 @@ pub fn ranges(args: RangesArgs) -> Result<ExitCode> {
 /// output is a skeleton to finish, so it always exits zero on success.
 pub fn model(args: ModelArgs) -> Result<ExitCode> {
     let bodies = load_bodies(&args.path, args.bodies.as_deref(), "model")?;
-    let text = match args.emit {
-        EmitTarget::Quint => hinzu_core::absint::emit_quint(&bodies),
+    let (text, what) = match args.emit {
+        EmitTarget::Quint => (hinzu_core::absint::emit_quint(&bodies), "quint model"),
+        EmitTarget::Stateright => (
+            hinzu_core::absint::emit_stateright(&bodies),
+            "stateright model",
+        ),
     };
-    write_text(args.out.as_deref(), &text, "quint model")
+    write_text(args.out.as_deref(), &text, what)
 }
 
 /// Load body facts for the body-IR commands: from a `--bodies` JSON file (no
