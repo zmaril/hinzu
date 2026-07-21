@@ -272,6 +272,14 @@ mod tests {
             "src/wire.rs",
             44,
         ));
+        // A signature-type dependency edge, to exercise the `type` kind across
+        // the store round trip.
+        facts.add_edge(Edge::type_dep(
+            "pkg::app::outer",
+            "pkg::model::Config",
+            "src/app.rs",
+            3,
+        ));
         facts.add_root(EffectRoot {
             symbol: "tokio::net::TcpStream::connect".to_string(),
             effect: Effect::Net,
@@ -296,6 +304,14 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Reference)
             .unwrap();
         assert_eq!(ref_edge.resolution, EdgeResolution::Reference);
+        // The type edge round-trips as a `type` kind with reference resolution.
+        let type_edge = loaded
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Type)
+            .unwrap();
+        assert_eq!(type_edge.callee, "pkg::model::Config");
+        assert_eq!(type_edge.resolution, EdgeResolution::Reference);
     }
 
     #[test]

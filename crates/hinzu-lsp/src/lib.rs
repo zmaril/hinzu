@@ -19,11 +19,13 @@ use std::path::Path;
 use anyhow::Result;
 use hinzu_core::facts::FactSet;
 
+pub mod api;
 pub mod client;
 pub mod config;
 pub mod extract;
 pub mod treesitter;
 
+pub use api::{extract_python_api, PythonApi};
 pub use config::LanguageConfig;
 pub use extract::Extractor;
 

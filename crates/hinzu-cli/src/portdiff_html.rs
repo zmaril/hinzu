@@ -6,7 +6,8 @@
 //! inline and no asset is fetched, so the file renders offline.
 
 use hinzu_core::portdiff::{
-    Band, BandCounts, FileEntry, MultiPackageReport, PackageRollup, PortDiffReport, RollupTotals,
+    Band, BandCounts, FileEntry, MergeEntry, MergeReport, Misplacement, MultiPackageReport,
+    PackageRollup, PortDiffReport, RollupTotals,
 };
 
 /// Presentation metadata that is not in the report itself.
@@ -28,9 +29,30 @@ fn band_color(band: Band) -> &'static str {
     match band {
         Band::Done => "#3fb950",
         Band::Ported => "#58a6ff",
+        Band::Relocated => "#a371f7",
         Band::Started => "#d29922",
         Band::NotStarted => "#6e7681",
     }
+}
+
+/// The five band header colors in report order: DONE, PORTED, RELOCATED,
+/// STARTED, NOT-STARTED. Shared by every band-column table header so the color
+/// legend is spelled once and inline-captured by the header templates.
+#[allow(clippy::type_complexity)]
+fn band_header_colors() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    (
+        band_color(Band::Done),
+        band_color(Band::Ported),
+        band_color(Band::Relocated),
+        band_color(Band::Started),
+        band_color(Band::NotStarted),
+    )
 }
 
 /// The band's display label (matches the JSON `serde` rename).
@@ -38,6 +60,7 @@ fn band_name(band: Band) -> &'static str {
     match band {
         Band::Done => "DONE",
         Band::Ported => "PORTED",
+        Band::Relocated => "RELOCATED",
         Band::Started => "STARTED",
         Band::NotStarted => "NOT-STARTED",
     }
@@ -76,6 +99,7 @@ fn band_bar(bands: &BandCounts, total: usize) -> String {
     let segs = [
         (Band::Done, bands.done),
         (Band::Ported, bands.ported),
+        (Band::Relocated, bands.relocated),
         (Band::Started, bands.started),
         (Band::NotStarted, bands.not_started),
     ];
@@ -120,11 +144,117 @@ pub fn render_html(report: &PortDiffReport, meta: &HtmlMeta) -> String {
     h.push_str(&naive_panel(report, &by_path));
     h.push_str(&conformance_panel(report));
     h.push_str("</div>");
+    h.push_str(&merges_panel(&report.merges));
     h.push_str(&waves_panel(report));
     h.push_str(&frontier_panel(report));
     h.push_str(&graph_confirm_panel(report));
     h.push_str("</body></html>");
     h
+}
+
+/// The split-not-merge panel. Two violation types, high-severity first:
+/// **misplacements** (a source file ported into a crate owned by another package)
+/// and **cross-package file-merges** (a target file drawing substantial content
+/// from source files of ≥ 2 packages), then the lower-severity same-package
+/// file-merges. Renders nothing when the report is clean.
+fn merges_panel(merges: &MergeReport) -> String {
+    if merges.file_merges.is_empty() && merges.misplacements.is_empty() {
+        return String::new();
+    }
+    let cross: Vec<&MergeEntry> = merges
+        .file_merges
+        .iter()
+        .filter(|e| e.cross_package)
+        .collect();
+    let same: Vec<&MergeEntry> = merges
+        .file_merges
+        .iter()
+        .filter(|e| !e.cross_package)
+        .collect();
+
+    let misplace_rows: String = merges.misplacements.iter().map(misplacement_row).collect();
+    let cross_rows: String = cross.iter().copied().map(merge_row).collect();
+    let same_rows: String = same.iter().copied().map(merge_row).collect();
+
+    let misplace_section = if merges.misplacements.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim sm" style="margin:6px 0 4px">MISPLACEMENTS <span class="q">high severity — a source file ported into a crate owned by another package</span></div>
+    <table><thead><tr><th>source file → target file</th><th>package → owning package</th><th>strong / total</th></tr></thead><tbody>{misplace_rows}</tbody></table>"#,
+        )
+    };
+    let cross_section = if cross.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim sm" style="margin:14px 0 4px">CROSS-PACKAGE FILE-MERGES <span class="q">high severity — a target file drew substantial content from source files of ≥ 2 packages</span></div>
+    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → strong / total</th></tr></thead><tbody>{cross_rows}</tbody></table>"#,
+        )
+    };
+    let same_section = if same.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="dim sm" style="margin:14px 0 4px">FILE-MERGES <span class="q">≥ 2 source files of one package merged into one target file</span></div>
+    <table><thead><tr><th>target file</th><th>packages</th><th>contributing source files → strong / total</th></tr></thead><tbody>{same_rows}</tbody></table>"#,
+        )
+    };
+    format!(
+        r#"<div class="panel">
+    <h2>Split-not-merge violations <span class="q">graph-derived: substantial-contributor file-merges + package misplacements</span></h2>
+    <div class="callout">A faithful port keeps each source file's identity and each package's boundary. {nm} misplacement(s) and {nf} file-merge(s) ({nc} cross-package) collapse a boundary — a source file landed in another package's crate, or ≥ 2 source files were merged into one target file. Misplacements and cross-package file-merges are the high-severity ones.</div>
+    {misplace_section}
+    {cross_section}
+    {same_section}
+  </div>
+"#,
+        nm = merges.misplacements.len(),
+        nf = merges.file_merges.len(),
+        nc = cross.len(),
+    )
+}
+
+/// One file-merge table row: the merged target file, the packages it spans, and
+/// each contributing source file with its strong / total matched-symbol counts.
+fn merge_row(e: &MergeEntry) -> String {
+    let contribs: String = e
+        .contributors
+        .iter()
+        .map(|c| {
+            let pkg = if c.package.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<span class="dim">[{}]</span> "#, esc(&c.package))
+            };
+            format!(
+                r#"<div class="mono sm">{pkg}{sf} <span class="dim">→ {s} / {t}</span></div>"#,
+                sf = esc(short_path(&c.source_file)),
+                s = c.strong_matched,
+                t = c.total_matched,
+            )
+        })
+        .collect();
+    format!(
+        r#"<tr><td class="mono sm">{tf}</td><td class="sm">{pkgs}</td><td>{contribs}</td></tr>"#,
+        tf = esc(&e.target_file),
+        pkgs = esc(&e.packages.join(", ")),
+    )
+}
+
+/// One misplacement table row: the misplaced source file → target file, the
+/// source package → the crate's owning package, and the strong / total weight.
+fn misplacement_row(m: &Misplacement) -> String {
+    format!(
+        r#"<tr><td class="mono sm">{sf} <span class="dim">→</span> {tf}</td><td class="sm">{sp} <span class="dim">→</span> {op} <span class="dim">({cr})</span></td><td class="sm">{s} / {t}</td></tr>"#,
+        sf = esc(short_path(&m.source_file)),
+        tf = esc(&m.target_file),
+        sp = esc(&m.source_package),
+        op = esc(&m.owning_package),
+        cr = esc(&m.target_crate),
+        s = m.strong_matched,
+        t = m.total_matched,
+    )
 }
 
 // ===========================================================================
@@ -161,6 +291,7 @@ pub fn render_multi_html(report: &MultiPackageReport, meta: &MultiHtmlMeta) -> S
     h.push_str(&multi_overall_bar(t));
     h.push_str(&multi_pkg_bars(&report.packages));
     h.push_str(&multi_summary_table(report));
+    h.push_str(&merges_panel(&report.merges));
     for pkg in &report.packages {
         h.push_str(&multi_pkg_section(pkg));
     }
@@ -216,7 +347,7 @@ fn multi_hero(report: &MultiPackageReport) -> String {
 /// The overall completion bar panel.
 fn multi_overall_bar(t: &RollupTotals) -> String {
     bar_legend_panel(
-        r#"Overall port completion <span class="q">DONE test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span>"#,
+        r#"Overall port completion <span class="q">DONE test-verified · PORTED ≥ threshold symbols · RELOCATED moved to secondary crate · STARTED some match · NOT-STARTED none</span>"#,
         &t.bands,
         t.source_files_total,
         true,
@@ -271,20 +402,17 @@ fn multi_summary_table(report: &MultiPackageReport) -> String {
         t.conformance_native,
         "—",
     );
+    let (dc, pc, rc, sc, nc) = band_header_colors();
     format!(
         r#"<div class="panel">
   <h2>Summary table</h2>
   <table>
-    <thead><tr><th>package</th><th class="num">files</th><th class="num" style="color:{dc}">DONE</th><th class="num" style="color:{pc}">PORTED</th><th class="num" style="color:{sc}">STARTED</th><th class="num" style="color:{nc}">NOT-STARTED</th><th class="num">symbols matched</th><th class="num">conf. native</th><th class="num">waves</th></tr></thead>
+    <thead><tr><th>package</th><th class="num">files</th><th class="num" style="color:{dc}">DONE</th><th class="num" style="color:{pc}">PORTED</th><th class="num" style="color:{rc}">RELOCATED</th><th class="num" style="color:{sc}">STARTED</th><th class="num" style="color:{nc}">NOT-STARTED</th><th class="num">symbols matched</th><th class="num">conf. native</th><th class="num">waves</th></tr></thead>
     <tbody>{rows}{total_row}</tbody>
   </table>
-  <div class="callout">DONE band == conformance native modules per package — the structural matcher and the test manifest agree on the test-verified floor. STARTED / PORTED are structural (graph-derived) and under-count by design.</div>
+  <div class="callout">DONE band == conformance native modules per package — the structural matcher and the test manifest agree on the test-verified floor. STARTED / PORTED / RELOCATED are structural (graph-derived) and under-count by design; RELOCATED marks a port that moved to a secondary target crate.</div>
 </div>
 "#,
-        dc = band_color(Band::Done),
-        pc = band_color(Band::Ported),
-        sc = band_color(Band::Started),
-        nc = band_color(Band::NotStarted),
     )
 }
 
@@ -308,6 +436,7 @@ fn summary_row(
     <td class="num">{files}</td>
     <td class="num" style="color:{dc}">{d}</td>
     <td class="num" style="color:{pc}">{p}</td>
+    <td class="num" style="color:{rc}">{r}</td>
     <td class="num" style="color:{sc}">{s}</td>
     <td class="num dim">{ns}</td>
     <td class="num {cls}">{sm}/{st} ({smp})</td>
@@ -318,6 +447,8 @@ fn summary_row(
         d = bands.done,
         pc = band_color(Band::Ported),
         p = bands.ported,
+        rc = band_color(Band::Relocated),
+        r = bands.relocated,
         sc = band_color(Band::Started),
         s = bands.started,
         ns = bands.not_started,
@@ -344,11 +475,12 @@ fn multi_pkg_section(pkg: &PackageRollup) -> String {
     )
 }
 
-/// The four-band legend row.
+/// The five-band legend row.
 fn band_legend(b: &BandCounts) -> String {
     [
         (Band::Done, b.done),
         (Band::Ported, b.ported),
+        (Band::Relocated, b.relocated),
         (Band::Started, b.started),
         (Band::NotStarted, b.not_started),
     ]
@@ -449,7 +581,7 @@ fn cards(report: &PortDiffReport) -> String {
 /// The file-band bar + legend panel.
 fn bands_panel(b: &BandCounts, total: usize) -> String {
     bar_legend_panel(
-        r#"File bands <span class="q">DONE = test-verified · PORTED ≥ threshold symbols · STARTED some match · NOT-STARTED none</span>"#,
+        r#"File bands <span class="q">DONE = test-verified · PORTED ≥ threshold symbols · RELOCATED moved to secondary crate · STARTED some match · NOT-STARTED none</span>"#,
         b,
         total,
         false,
@@ -557,7 +689,7 @@ fn waves_panel(report: &PortDiffReport) -> String {
     <td class="mono">wave {wave}</td>
     <td class="num">{files}</td>
     <td style="min-width:180px">{bar}</td>
-    <td class="num">{d}</td><td class="num">{p}</td>
+    <td class="num">{d}</td><td class="num">{p}</td><td class="num">{r}</td>
     <td class="num">{s}</td><td class="num">{n}</td>
     <td class="num">{sym}</td>
   </tr>"#,
@@ -566,24 +698,22 @@ fn waves_panel(report: &PortDiffReport) -> String {
             bar = band_bar(&w.bands, w.files),
             d = w.bands.done,
             p = w.bands.ported,
+            r = w.bands.relocated,
             s = w.bands.started,
             n = w.bands.not_started,
             sym = pct(w.symbols_pct),
         ));
     }
+    let (dc, pc, rc, sc, nc) = band_header_colors();
     format!(
         r#"<div class="panel">
   <h2>Waves <span class="q">from the source port plan — band mix + symbol coverage per wave</span></h2>
   <table>
-    <thead><tr><th>wave</th><th class="num">files</th><th>band mix</th><th class="num" style="color:{dc}">D</th><th class="num" style="color:{pc}">P</th><th class="num" style="color:{sc}">S</th><th class="num" style="color:{nc}">N</th><th class="num">sym%</th></tr></thead>
+    <thead><tr><th>wave</th><th class="num">files</th><th>band mix</th><th class="num" style="color:{dc}">D</th><th class="num" style="color:{pc}">P</th><th class="num" style="color:{rc}">R</th><th class="num" style="color:{sc}">S</th><th class="num" style="color:{nc}">N</th><th class="num">sym%</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
 </div>
 "#,
-        dc = band_color(Band::Done),
-        pc = band_color(Band::Ported),
-        sc = band_color(Band::Started),
-        nc = band_color(Band::NotStarted),
     )
 }
 

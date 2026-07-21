@@ -65,20 +65,40 @@ pub struct SharedNaming {
     pub source_src_prefix: String,
 }
 
-/// One package's port mapping.
+/// One package's port mapping. A package targets either a single crate (the
+/// singular `target_dir`/`strip_crate_prefix`/`target_src_prefix` keys, the
+/// backward-compatible form) OR several crates (the `[[packages.X.targets]]`
+/// array). Exactly one form must be given; [`MultiPackageConfig::resolve`]
+/// normalizes both to a `Vec<TargetCrate>`.
 #[derive(Debug, Deserialize)]
 pub struct PackageConfig {
     /// The source package directory, relative to `base_dir` (extraction root).
     pub source_dir: String,
-    /// The target crate directory, relative to `base_dir` (extraction root).
-    pub target_dir: String,
-    /// The target crate prefix on target ids (`"atilla_ai"`).
-    pub strip_crate_prefix: String,
-    /// The workspace-relative source dir a target file carries in the graph
-    /// (`"crates/atilla-ai/src"`). Not resolved against `base_dir`.
-    pub target_src_prefix: String,
+    /// The target crate directory, relative to `base_dir` (single-crate form).
+    pub target_dir: Option<String>,
+    /// The target crate prefix on target ids, `"atilla_ai"` (single-crate form).
+    pub strip_crate_prefix: Option<String>,
+    /// The workspace-relative source dir a target file carries in the graph,
+    /// `"crates/atilla-ai/src"` (single-crate form). Not resolved against `base_dir`.
+    pub target_src_prefix: Option<String>,
+    /// The target crates a source package was ported across (multi-crate form).
+    /// Mutually exclusive with the singular keys above.
+    #[serde(default)]
+    pub targets: Vec<TargetCrate>,
     /// The manifest `package` this crate's conformance modules are filed under.
     pub conformance_package: String,
+}
+
+/// One target crate in the multi-crate form (`[[packages.X.targets]]`).
+#[derive(Debug, Deserialize)]
+pub struct TargetCrate {
+    /// The target crate directory, relative to `base_dir` (extraction root).
+    pub dir: String,
+    /// The target crate prefix on target ids (`"pidgin_cli"`).
+    pub strip_crate_prefix: String,
+    /// The workspace-relative source dir a target file carries in the graph
+    /// (`"crates/pidgin-cli/src"`). Not resolved against `base_dir`.
+    pub src_prefix: String,
 }
 
 /// One resolved package: the absolute extraction paths + a ready [`PortDiffConfig`].
@@ -87,8 +107,14 @@ pub struct ResolvedPackage {
     pub name: String,
     /// Absolute path to the source package (extraction root for the source graph).
     pub source_path: PathBuf,
-    /// Absolute path to the target crate (extraction root for the target graph).
+    /// Absolute path to the primary target crate (the first `target_paths` entry).
+    /// Used for labels/logging; extraction merges every `target_paths` crate.
     pub target_path: PathBuf,
+    /// Absolute paths to every target crate this package was ported across. The
+    /// CLI extracts each and merges the graphs into one target index, so a source
+    /// package ported across crates stays visible to the matcher. One entry in the
+    /// single-crate form; several in the multi-crate (`targets`) form.
+    pub target_paths: Vec<PathBuf>,
     /// Absolute path to the conformance manifest (read by the CLI, never by core).
     pub manifest_path: PathBuf,
     /// The per-package config the matcher keys on.
@@ -122,8 +148,16 @@ impl MultiPackageConfig {
         })?;
         let base = PathBuf::from(&self.base_dir);
         let source_path = resolve_path(&base, &pkg.source_dir);
-        let target_path = resolve_path(&base, &pkg.target_dir);
         let manifest_path = resolve_path(&base, &self.conformance_manifest);
+
+        // Normalize the single-crate keys and the multi-crate `targets` array into
+        // one ordered list of target crates. Exactly one form must be given.
+        let targets = pkg.normalized_targets(name)?;
+        let target_paths: Vec<PathBuf> = targets
+            .iter()
+            .map(|t| resolve_path(&base, &t.dir))
+            .collect();
+        let target_path = target_paths[0].clone();
 
         let config = PortDiffConfig {
             source_kind: self.source_kind.clone(),
@@ -134,8 +168,11 @@ impl MultiPackageConfig {
                 fn_case: self.naming.fn_case.clone(),
                 keep_pascal_types: self.naming.keep_pascal_types,
                 keep_screaming_consts: self.naming.keep_screaming_consts,
-                strip_crate_prefix: pkg.strip_crate_prefix.clone(),
-                target_src_prefix: pkg.target_src_prefix.clone(),
+                strip_crate_prefix: targets
+                    .iter()
+                    .map(|t| t.strip_crate_prefix.clone())
+                    .collect(),
+                target_src_prefix: targets.iter().map(|t| t.src_prefix.clone()).collect(),
                 source_src_prefix: self.naming.source_src_prefix.clone(),
             },
             ported_threshold: self.ported_threshold,
@@ -146,15 +183,65 @@ impl MultiPackageConfig {
                 package: pkg.conformance_package.clone(),
                 src_prefix_strip: format!("packages/{}/", pkg.conformance_package),
             }),
+            package: Some(name.to_string()),
         };
 
         Ok(ResolvedPackage {
             name: name.to_string(),
             source_path,
             target_path,
+            target_paths,
             manifest_path,
             config,
         })
+    }
+}
+
+impl PackageConfig {
+    /// Normalize this package's target mapping into one ordered `Vec<TargetCrate>`.
+    /// Accepts either the singular `target_dir`/`strip_crate_prefix`/
+    /// `target_src_prefix` keys (yields a 1-element vec) or the `targets` array,
+    /// but not both and not neither.
+    fn normalized_targets(&self, name: &str) -> Result<Vec<TargetCrate>> {
+        let has_single = self.target_dir.is_some()
+            || self.strip_crate_prefix.is_some()
+            || self.target_src_prefix.is_some();
+        let has_multi = !self.targets.is_empty();
+        match (has_single, has_multi) {
+            (true, true) => anyhow::bail!(
+                "package '{name}' sets both the singular target_dir keys and a \
+                 [[packages.{name}.targets]] array; use exactly one form"
+            ),
+            (false, false) => anyhow::bail!(
+                "package '{name}' has no target: set target_dir/strip_crate_prefix/\
+                 target_src_prefix, or one or more [[packages.{name}.targets]] tables"
+            ),
+            (false, true) => Ok(self
+                .targets
+                .iter()
+                .map(|t| TargetCrate {
+                    dir: t.dir.clone(),
+                    strip_crate_prefix: t.strip_crate_prefix.clone(),
+                    src_prefix: t.src_prefix.clone(),
+                })
+                .collect()),
+            (true, false) => {
+                let missing = self.target_dir.is_none()
+                    || self.strip_crate_prefix.is_none()
+                    || self.target_src_prefix.is_none();
+                if missing {
+                    anyhow::bail!(
+                        "package '{name}' single-crate form needs all of target_dir, \
+                         strip_crate_prefix, and target_src_prefix"
+                    );
+                }
+                Ok(vec![TargetCrate {
+                    dir: self.target_dir.clone().unwrap(),
+                    strip_crate_prefix: self.strip_crate_prefix.clone().unwrap(),
+                    src_prefix: self.target_src_prefix.clone().unwrap(),
+                }])
+            }
+        }
     }
 }
 
@@ -165,5 +252,146 @@ fn resolve_path(base: &Path, rel: &str) -> PathBuf {
         p
     } else {
         base.join(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse `packages_toml` (one or more `[packages.X]` sections) atop the shared
+    /// header and resolve package `pkg`. The base_dir is absolute so `target_paths`
+    /// come back predictable.
+    fn resolve_pkg(packages_toml: &str, pkg: &str) -> Result<ResolvedPackage> {
+        let text = format!(
+            r#"
+source_kind = "ts"
+target_kind = "rust"
+ported_threshold = 0.6
+cluster_vote_retain = 0.6
+base_dir = "/ws"
+conformance_manifest = "conformance/manifest.json"
+native_status = "native"
+
+[naming]
+file_segment_case = "kebab_to_snake"
+fn_case = "camel_to_snake"
+keep_pascal_types = true
+keep_screaming_consts = true
+strip_suffixes = [".lazy"]
+source_src_prefix = "src"
+
+{packages_toml}
+"#
+        );
+        let cfg: MultiPackageConfig = toml::from_str(&text).expect("parse config");
+        cfg.resolve(pkg)
+    }
+
+    #[test]
+    fn resolve_single_crate_form() {
+        let resolved = resolve_pkg(
+            r#"
+[packages.ai]
+source_dir = "vendor/pi/packages/ai"
+target_dir = "crates/pidgin-ai"
+strip_crate_prefix = "pidgin_ai"
+target_src_prefix = "crates/pidgin-ai/src"
+conformance_package = "ai"
+"#,
+            "ai",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.target_paths,
+            vec![PathBuf::from("/ws/crates/pidgin-ai")]
+        );
+        assert_eq!(resolved.target_path, PathBuf::from("/ws/crates/pidgin-ai"));
+        assert_eq!(
+            resolved.config.naming.strip_crate_prefix,
+            vec!["pidgin_ai".to_string()]
+        );
+        assert_eq!(
+            resolved.config.naming.target_src_prefix,
+            vec!["crates/pidgin-ai/src".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_multi_crate_form() {
+        let resolved = resolve_pkg(
+            r#"
+[packages.coding-agent]
+source_dir = "vendor/pi/packages/coding-agent"
+conformance_package = "coding-agent"
+
+[[packages.coding-agent.targets]]
+dir = "crates/pidgin-coding"
+strip_crate_prefix = "pidgin_coding"
+src_prefix = "crates/pidgin-coding/src"
+
+[[packages.coding-agent.targets]]
+dir = "crates/pidgin-cli"
+strip_crate_prefix = "pidgin_cli"
+src_prefix = "crates/pidgin-cli/src"
+"#,
+            "coding-agent",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.target_paths,
+            vec![
+                PathBuf::from("/ws/crates/pidgin-coding"),
+                PathBuf::from("/ws/crates/pidgin-cli"),
+            ]
+        );
+        // The primary target (labels/logging) is the first crate.
+        assert_eq!(
+            resolved.target_path,
+            PathBuf::from("/ws/crates/pidgin-coding")
+        );
+        assert_eq!(
+            resolved.config.naming.strip_crate_prefix,
+            vec!["pidgin_coding".to_string(), "pidgin_cli".to_string()]
+        );
+        assert_eq!(
+            resolved.config.naming.target_src_prefix,
+            vec![
+                "crates/pidgin-coding/src".to_string(),
+                "crates/pidgin-cli/src".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_both_and_neither_forms() {
+        // Both singular keys and a targets array: rejected.
+        let both = resolve_pkg(
+            r#"
+[packages.x]
+source_dir = "s"
+target_dir = "crates/x"
+strip_crate_prefix = "x"
+target_src_prefix = "crates/x/src"
+conformance_package = "x"
+
+[[packages.x.targets]]
+dir = "crates/y"
+strip_crate_prefix = "y"
+src_prefix = "crates/y/src"
+"#,
+            "x",
+        );
+        assert!(both.is_err());
+        // Neither form: rejected.
+        let neither = resolve_pkg(
+            r#"
+[packages.x]
+source_dir = "s"
+conformance_package = "x"
+"#,
+            "x",
+        );
+        assert!(neither.is_err());
     }
 }

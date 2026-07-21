@@ -1,0 +1,735 @@
+{
+  "functions": [
+    {
+      "id": "ranges_demo::ratio",
+      "display": "ranges_demo::ratio",
+      "file": "src/lib.rs",
+      "line": 4,
+      "arg_count": 2,
+      "locals": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        }
+      ],
+      "blocks": [
+        {
+          "stmts": [
+            {
+              "place": 3,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 0
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 5,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 1
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 4,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 5,
+                "col": 5
+              }
+            },
+            {
+              "place": 5,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 5,
+                "col": 5
+              }
+            },
+            {
+              "place": 6,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "other",
+                "left": {
+                  "kind": "Local",
+                  "local": 4
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 5
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 5,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 2
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 0,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "div",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 2
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 5,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Return"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ranges_demo::modulo",
+      "display": "ranges_demo::modulo",
+      "file": "src/lib.rs",
+      "line": 9,
+      "arg_count": 2,
+      "locals": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        }
+      ],
+      "blocks": [
+        {
+          "stmts": [
+            {
+              "place": 3,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 0
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 10,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 1
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 4,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 10,
+                "col": 5
+              }
+            },
+            {
+              "place": 5,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 10,
+                "col": 5
+              }
+            },
+            {
+              "place": 6,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "other",
+                "left": {
+                  "kind": "Local",
+                  "local": 4
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 5
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 10,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 2
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 0,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "rem",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 2
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 10,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Return"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ranges_demo::ratio_guarded",
+      "display": "ranges_demo::ratio_guarded",
+      "file": "src/lib.rs",
+      "line": 14,
+      "arg_count": 2,
+      "locals": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        }
+      ],
+      "blocks": [
+        {
+          "stmts": [
+            {
+              "place": 3,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "ne",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 0
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 15,
+                "col": 8
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "SwitchInt",
+            "discr": {
+              "kind": "Local",
+              "local": 3
+            },
+            "targets": [
+              {
+                "value": 0,
+                "block": 4
+              }
+            ],
+            "otherwise": 1
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 4,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 0
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 16,
+                "col": 9
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 2
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 5,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 2
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 16,
+                "col": 9
+              }
+            },
+            {
+              "place": 6,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 16,
+                "col": 9
+              }
+            },
+            {
+              "place": 7,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "other",
+                "left": {
+                  "kind": "Local",
+                  "local": 5
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 6
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 16,
+                "col": 9
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 3
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 0,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "div",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 2
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 16,
+                "col": 9
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Goto",
+            "block": 5
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 0,
+              "rvalue": {
+                "op": "Use",
+                "operand": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 0
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 18,
+                "col": 9
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Goto",
+            "block": 5
+          }
+        },
+        {
+          "stmts": [],
+          "terminator": {
+            "kind": "Return"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ranges_demo::div_by_const",
+      "display": "ranges_demo::div_by_const",
+      "file": "src/lib.rs",
+      "line": 23,
+      "arg_count": 1,
+      "locals": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        },
+        {
+          "kind": "bool"
+        }
+      ],
+      "blocks": [
+        {
+          "stmts": [
+            {
+              "place": 2,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 2
+                  }
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 0
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 24,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 1
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 3,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 2
+                  }
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 24,
+                "col": 5
+              }
+            },
+            {
+              "place": 4,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "eq",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Unknown"
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 24,
+                "col": 5
+              }
+            },
+            {
+              "place": 5,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "other",
+                "left": {
+                  "kind": "Local",
+                  "local": 3
+                },
+                "right": {
+                  "kind": "Local",
+                  "local": 4
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 24,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Assert",
+            "target": 2
+          }
+        },
+        {
+          "stmts": [
+            {
+              "place": 0,
+              "rvalue": {
+                "op": "Binary",
+                "kind": "div",
+                "left": {
+                  "kind": "Local",
+                  "local": 1
+                },
+                "right": {
+                  "kind": "Const",
+                  "value": {
+                    "ty": "Int",
+                    "v": 2
+                  }
+                }
+              },
+              "loc": {
+                "file": "src/lib.rs",
+                "line": 24,
+                "col": 5
+              }
+            }
+          ],
+          "terminator": {
+            "kind": "Return"
+          }
+        }
+      ]
+    }
+  ]
+}

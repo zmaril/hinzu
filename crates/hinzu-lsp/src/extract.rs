@@ -247,26 +247,16 @@ impl<'c> Extractor<'c> {
     }
 
     fn initialize(&self, lsp: &mut LspClient) -> Result<()> {
-        let root_uri = path_to_uri(&self.root);
-        let params = serde_json::json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "initializationOptions": self.cfg.init_options,
-            "capabilities": {
-                "textDocument": {
-                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
-                    "callHierarchy": {"dynamicRegistration": false},
-                    "definition": {"linkSupport": true},
-                },
-                "window": {"workDoneProgress": true},
-            },
-            "workspaceFolders": [{"uri": root_uri, "name": self.root.file_name()
-                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into())}],
-        });
-        lsp.request("initialize", params, Duration::from_secs(30))
-            .context("LSP initialize")?;
-        lsp.notify("initialized", serde_json::json!({}))?;
-        Ok(())
+        crate::client::initialize(
+            lsp,
+            &self.root,
+            &self.cfg.init_options,
+            serde_json::json!({
+                "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                "callHierarchy": {"dynamicRegistration": false},
+                "definition": {"linkSupport": true},
+            }),
+        )
     }
 
     /// Open a throwaway in-memory probe doc and poll `textDocument/definition`

@@ -8,7 +8,7 @@
 # Path resolution: every relative path here (`source_dir`, `target_dir`,
 # `conformance_manifest`) is resolved against `base_dir`. `target_src_prefix` is
 # NOT a filesystem path — it is the workspace-relative prefix a target file
-# carries in the emitted graph (`crates/atilla-ai/src/...`), so it stays verbatim.
+# carries in the emitted graph (`crates/pidgin-ai/src/...`), so it stays verbatim.
 
 source_kind = "ts"
 target_kind = "rust"
@@ -16,7 +16,7 @@ ported_threshold = 0.6
 cluster_vote_retain = 0.6
 
 # Everything below is relative to this directory (the atilla workspace root).
-base_dir = "/workspace/atilla"
+base_dir = "/workspace/pidgin"
 # The conformance manifest, relative to base_dir. The CLI reads it and hands the
 # text to the pure core; `conformance_package` (per package) filters it.
 conformance_manifest = "conformance/manifest.json"
@@ -36,35 +36,46 @@ source_src_prefix = "src"              # a source file's leading dir
 
 [packages.ai]
 source_dir = "vendor/pi/packages/ai"
-target_dir = "crates/atilla-ai"
-strip_crate_prefix = "atilla_ai"
-target_src_prefix = "crates/atilla-ai/src"
+target_dir = "crates/pidgin-ai"
+strip_crate_prefix = "pidgin_ai"
+target_src_prefix = "crates/pidgin-ai/src"
 conformance_package = "ai"
 
 [packages.agent]
 source_dir = "vendor/pi/packages/agent"
-target_dir = "crates/atilla-agent"
-strip_crate_prefix = "atilla_agent"
-target_src_prefix = "crates/atilla-agent/src"
+target_dir = "crates/pidgin-agent"
+strip_crate_prefix = "pidgin_agent"
+target_src_prefix = "crates/pidgin-agent/src"
 conformance_package = "agent"
 
 [packages.coding-agent]
+# coding-agent was ported across TWO crates: most of it into pidgin-coding, but
+# the CLI surface (cli/args.ts -> parse_args, is_valid_thinking_level, Args, and
+# the pidgin-cli portion of core/exec.ts) into pidgin-cli. Both crates' graphs
+# are extracted and merged so those cross-crate ports are visible to the matcher.
 source_dir = "vendor/pi/packages/coding-agent"
-target_dir = "crates/atilla-coding"
-strip_crate_prefix = "atilla_coding"
-target_src_prefix = "crates/atilla-coding/src"
 conformance_package = "coding-agent"
+
+[[packages.coding-agent.targets]]
+dir = "crates/pidgin-coding"
+strip_crate_prefix = "pidgin_coding"
+src_prefix = "crates/pidgin-coding/src"
+
+[[packages.coding-agent.targets]]
+dir = "crates/pidgin-cli"
+strip_crate_prefix = "pidgin_cli"
+src_prefix = "crates/pidgin-cli/src"
 
 [packages.tui]
 source_dir = "vendor/pi/packages/tui"
-target_dir = "crates/atilla-tui"
-strip_crate_prefix = "atilla_tui"
-target_src_prefix = "crates/atilla-tui/src"
+target_dir = "crates/pidgin-tui"
+strip_crate_prefix = "pidgin_tui"
+target_src_prefix = "crates/pidgin-tui/src"
 conformance_package = "tui"
 
 [packages.orchestrator]
 source_dir = "vendor/pi/packages/orchestrator"
-target_dir = "crates/atilla-orchestrator"
-strip_crate_prefix = "atilla_orchestrator"
-target_src_prefix = "crates/atilla-orchestrator/src"
+target_dir = "crates/pidgin-orchestrator"
+strip_crate_prefix = "pidgin_orchestrator"
+target_src_prefix = "crates/pidgin-orchestrator/src"
 conformance_package = "orchestrator"

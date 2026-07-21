@@ -57,12 +57,20 @@ use crate::graph::GraphOutput;
 use crate::plan::PlanOutput;
 
 mod config;
+mod delta;
+mod merge;
 mod report;
 pub use config::{ConformanceConfig, NamingRules, PortDiffConfig};
+pub use delta::{
+    band_rank, diff_cross_reports, diff_multi_reports, diff_reports, BandNetMovement,
+    BandTransition, DeltaTotals, Direction, FileDelta, PortDiffDelta, Verdict,
+};
+pub use merge::{MergeContributor, MergeEntry, MergeReport, Misplacement};
 pub use report::{
     Band, BandCounts, ConformanceCrosscheck, Fidelity, FileEntry, FileMapSummary,
     FileTierBreakdown, FrontierEntry, GraphConfirmSummary, MultiPackageReport, NaiveVsGraph,
-    Overall, PackageRollup, PortDiffReport, RollupTotals, TierCounts, WaveBand,
+    Overall, PackageClosureRollup, PackageRollup, PortDiffReport, RollupTotals,
+    RootedCrossPackageReport, TargetFileContribution, TierCounts, WaveBand,
 };
 
 // ===========================================================================
@@ -192,8 +200,14 @@ fn source_file_to_module(file: &str, rules: &NamingRules) -> String {
 /// trailing `/mod`.
 fn target_file_to_module(file: &str, rules: &NamingRules) -> String {
     let mut f = file;
-    let pref = format!("{}/", rules.target_src_prefix);
-    if let Some(rest) = f.strip_prefix(&pref) {
+    // Try each configured target crate's src prefix (a package may map to several
+    // crates); the first that matches wins. Fall back to the generic
+    // `crates/<x>/src/` shape for any crate not spelled out in the config.
+    let stripped = rules.target_src_prefix.iter().find_map(|p| {
+        let pref = format!("{p}/");
+        f.strip_prefix(&pref)
+    });
+    if let Some(rest) = stripped {
         f = rest;
     } else if let Some(rest) = strip_generic_crate_src(f) {
         f = rest;
@@ -203,6 +217,20 @@ fn target_file_to_module(file: &str, rules: &NamingRules) -> String {
         m = base.to_string();
     }
     m
+}
+
+/// Whether a target file lives in the package's PRIMARY target crate — the first
+/// entry of [`NamingRules::target_src_prefix`]. A source package may map to
+/// several target crates (PR1); the primary is the config's first, and a match
+/// landing outside it drives the RELOCATED band. When no target crate prefix is
+/// configured, everything counts as primary (no relocation is possible), and for
+/// a single-crate package the sole prefix *is* the primary, so every match is
+/// primary and RELOCATED never fires.
+fn target_file_in_primary_crate(file: &str, rules: &NamingRules) -> bool {
+    match rules.target_src_prefix.first() {
+        Some(primary) => file.starts_with(&format!("{primary}/")),
+        None => true,
+    }
 }
 
 /// The generic `crates/<one-segment>/src/<rest>` shape → `<rest>`.
@@ -308,6 +336,16 @@ struct AtSym {
     module: String,
     leaf_norm: String,
     is_impl: bool,
+    /// Whether this target symbol's defining file lives in the package's PRIMARY
+    /// target crate (the first entry of `target_src_prefix`). Matches that land
+    /// in a non-primary crate drive the RELOCATED band. Always `true` for
+    /// single-crate packages, so they never produce RELOCATED.
+    in_primary_crate: bool,
+    /// The target symbol's defining file, workspace-relative
+    /// (`crates/<crate>/src/x.rs`) — the concrete destination the split-not-merge
+    /// detector inverts (a source file's dominant target file is the plurality of
+    /// its matched symbols' `file`s).
+    file: String,
 }
 
 /// A normalized, matched source symbol.
@@ -395,6 +433,8 @@ pub fn port_diff(
             module: target_file_to_module(file, rules),
             leaf_norm: norm_leaf(&leaf_raw, rules),
             is_impl: s.id.starts_with('<'),
+            in_primary_crate: target_file_in_primary_crate(file, rules),
+            file: file.to_string(),
             id: s.id.clone(),
         });
     }
@@ -690,6 +730,70 @@ pub fn port_diff(
             matched >= 1 || has_mapped,
             config.ported_threshold,
         );
+        // RELOCATED override: of this file's matched symbols that resolved to a
+        // target symbol, tally how many landed in the PRIMARY target crate vs a
+        // secondary one. If the port moved predominantly (> 50%) into a secondary
+        // crate, relabel PORTED/STARTED as RELOCATED. Only these two bands are
+        // overridden — DONE and NOT-STARTED keep their meaning. Single-crate
+        // packages have no secondary crate, so `secondary` stays 0 and the band
+        // is untouched.
+        let (mut resolved, mut secondary) = (0usize, 0usize);
+        // Tally which target FILE each matched symbol resolved to, so the file's
+        // dominant target file (the plurality) can anchor the split-not-merge
+        // detector. Keyed by target file path, insertion order irrelevant (the
+        // winner is chosen by count with a deterministic path tie-break).
+        let mut tf_counts: HashMap<&str, usize> = HashMap::new();
+        // Of those, how many landed via a STRONG tier (exact-module / subtree) —
+        // the structural, non-coincidental matches the split-not-merge detector
+        // keys on to tell a real merge from a shared-leaf name coincidence.
+        let mut tf_strong: HashMap<&str, usize> = HashMap::new();
+        for s in syms {
+            if !s.tier.matched() {
+                continue;
+            }
+            if let Some(idx) = s.at_id.as_deref().and_then(|id| at_id_to_idx.get(id)) {
+                resolved += 1;
+                if !at_syms[*idx].in_primary_crate {
+                    secondary += 1;
+                }
+                let file = at_syms[*idx].file.as_str();
+                *tf_counts.entry(file).or_default() += 1;
+                if matches!(s.tier, Tier::ExactModule | Tier::Subtree) {
+                    *tf_strong.entry(file).or_default() += 1;
+                }
+            }
+        }
+        // Per-destination contribution rows: one per target file this source file's
+        // symbols landed in, split into strong / total. Sorted by descending total
+        // then path for a stable, reviewable order.
+        let mut target_file_contributions: Vec<TargetFileContribution> = tf_counts
+            .iter()
+            .map(|(file, &total)| TargetFileContribution {
+                file: (*file).to_string(),
+                strong_matched: tf_strong.get(file).copied().unwrap_or(0),
+                total_matched: total,
+            })
+            .collect();
+        target_file_contributions.sort_by(|a, b| {
+            b.total_matched
+                .cmp(&a.total_matched)
+                .then_with(|| a.file.cmp(&b.file))
+        });
+        // Plurality target file; ties broken by the lexicographically smallest
+        // path so the choice is deterministic.
+        let dominant = tf_counts
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)));
+        let dominant_target_file = dominant.map(|(f, _)| f.to_string());
+        let dominant_target_symbols = dominant.map(|(_, &c)| c).unwrap_or(0);
+        let band = if matches!(band, Band::Ported | Band::Started)
+            && resolved > 0
+            && secondary * 2 > resolved
+        {
+            Band::Relocated
+        } else {
+            band
+        };
         band_counts.bump(band);
         band_of.insert(f.as_str(), band);
 
@@ -720,6 +824,9 @@ pub fn port_diff(
             mapped_target: fm.and_then(|m| m.subtree.clone()),
             map_method,
             map_votes: fm.and_then(|m| m.votes),
+            dominant_target_file,
+            dominant_target_symbols,
+            target_file_contributions,
             total_symbols: total,
             matched_symbols: matched,
             tier_breakdown: tb,
@@ -858,6 +965,28 @@ pub fn port_diff(
             .to_string(),
     };
 
+    // ---- Split-not-merge detector -----------------------------------------
+    // Feed this package's per-target-file contributions to the detector. Every
+    // contributor shares the package label, so only same-package file-merges can
+    // surface here; the cross-package rollup (`MultiPackageReport::merges`) tags
+    // each package and matches against the union of target crates. The owning
+    // override maps this package's own target crates to itself, so a file landing
+    // in one of its crates is never a self-misplacement.
+    let mut owning_override: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    if let Some(pkg) = config.package.as_deref() {
+        for prefix in &rules.target_src_prefix {
+            let cr = merge::crate_of(prefix);
+            if !cr.is_empty() {
+                owning_override.insert(cr.to_string(), pkg.to_string());
+            }
+        }
+    }
+    let merges = merge::MergeReport::from_contributions(
+        merge::contributions_from_files(&file_entries, config.package.as_deref().unwrap_or("")),
+        &owning_override,
+    );
+
     PortDiffReport {
         source_kind: config.source_kind.clone(),
         target_kind: config.target_kind.clone(),
@@ -894,6 +1023,7 @@ pub fn port_diff(
             recovered_files,
         },
         conformance_crosscheck,
+        merges,
         fidelity: Fidelity {
             structural_not_correctness: true,
             matchable_denominator:
@@ -1207,281 +1337,4 @@ fn load_native_files(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::facts::{make_def, Edge, FactSet};
-    use crate::graph::build_graph;
-    use crate::plan::{build_plan, PlanOpts};
-
-    /// The prototype's TS→Rust naming rules, minus the conformance oracle (so the
-    /// synthetic tests never touch the filesystem).
-    fn rules() -> NamingRules {
-        PortDiffConfig::default_ts_rust().naming
-    }
-
-    /// A config with no conformance oracle — DONE never fires, so band tests key
-    /// on the structural bands only.
-    fn cfg_no_conformance() -> PortDiffConfig {
-        PortDiffConfig {
-            conformance: None,
-            ..PortDiffConfig::default_ts_rust()
-        }
-    }
-
-    /// Build a `GraphOutput` from `(id, file)` defs and `(from, to)` call edges.
-    fn graph_of(defs: &[(&str, &str)], edges: &[(&str, &str)]) -> GraphOutput {
-        let mut facts = FactSet::default();
-        for (id, file) in defs {
-            facts.add_def(make_def(id, file, 1, 5));
-        }
-        for (from, to) in edges {
-            facts.add_edge(Edge::call(from, to, "x", 1));
-        }
-        build_graph(&facts, "test", None)
-    }
-
-    // ---- 1. Normalization -------------------------------------------------
-
-    #[test]
-    fn normalization_camel_pascal_screaming() {
-        let r = rules();
-        assert_eq!(camel_to_snake("convertMessages"), "convert_messages");
-        assert_eq!(camel_to_snake("toClaudeCodeName"), "to_claude_code_name");
-        assert_eq!(camel_to_snake("isOAuthToken"), "is_o_auth_token");
-        // PascalCase types and SCREAMING consts are kept verbatim.
-        assert_eq!(norm_leaf("AnthropicModel", &r), "AnthropicModel");
-        assert_eq!(norm_leaf("MAX_TOKENS", &r), "MAX_TOKENS");
-        assert_eq!(norm_leaf("convertMessages", &r), "convert_messages");
-    }
-
-    #[test]
-    fn normalization_trait_impl_and_synthetic_leaves() {
-        // Trait-impl method is the tail after the last `>::`.
-        assert_eq!(
-            target_leaf_raw(
-                "<atilla_ai::api::anthropic::AnthropicModel as std::clone::Clone>::clone"
-            )
-            .as_deref(),
-            Some("clone")
-        );
-        assert_eq!(
-            target_leaf_raw("atilla_ai::api::google_shared::short_hash").as_deref(),
-            Some("short_hash")
-        );
-        // Synthetic tails are rejected.
-        assert!(target_leaf_raw(
-            "<atilla_ai::auth::context::DefaultAuthContext<E> as atilla_ai::auth::types::AuthContext>::env::{closure#0}"
-        )
-        .is_none());
-        assert!(target_leaf_raw("atilla_ai::api::a::FIELDS").is_none());
-        assert!(target_leaf_raw("atilla_ai::api::a::{constant#1}").is_none());
-    }
-
-    #[test]
-    fn normalization_module_anchoring() {
-        let r = rules();
-        // mod.rs anchors to the directory; a plain file to itself; a sibling .rs
-        // beside a same-named directory to itself.
-        assert_eq!(
-            target_file_to_module("crates/atilla-ai/src/api/anthropic/mod.rs", &r),
-            "api/anthropic"
-        );
-        assert_eq!(
-            target_file_to_module("crates/atilla-ai/src/api/anthropic/boundary.rs", &r),
-            "api/anthropic/boundary"
-        );
-        assert_eq!(
-            target_file_to_module("crates/atilla-ai/src/api/anthropic.rs", &r),
-            "api/anthropic"
-        );
-        // Source files: kebab→snake, `.lazy` folded, extension stripped.
-        assert_eq!(
-            source_file_to_module("src/api/anthropic-messages.lazy.ts", &r),
-            "api/anthropic_messages"
-        );
-        assert_eq!(
-            source_file_to_module("src/utils/event-stream.ts", &r),
-            "utils/event_stream"
-        );
-    }
-
-    // ---- 2. Decomposition-aware clustering --------------------------------
-
-    #[test]
-    fn clustering_recovers_a_relocated_file() {
-        // Source file `src/api/simple-options.ts` holds three distinctive leaves.
-        // The target relocated them into the subtree `api/anthropic/simple_options`
-        // (there is NO target module `api/simple_options`), plus an unrelated
-        // module so the cluster has to concentrate.
-        let source = graph_of(
-            &[
-                (
-                    "src/api/simple-options.ts#convertOptions",
-                    "src/api/simple-options.ts",
-                ),
-                (
-                    "src/api/simple-options.ts#buildParams",
-                    "src/api/simple-options.ts",
-                ),
-                (
-                    "src/api/simple-options.ts#mapModel",
-                    "src/api/simple-options.ts",
-                ),
-            ],
-            &[],
-        );
-        let target = graph_of(
-            &[
-                (
-                    "atilla_ai::api::anthropic::simple_options::convert_options",
-                    "crates/atilla-ai/src/api/anthropic/simple_options.rs",
-                ),
-                (
-                    "atilla_ai::api::anthropic::simple_options::build_params",
-                    "crates/atilla-ai/src/api/anthropic/simple_options.rs",
-                ),
-                (
-                    "atilla_ai::api::anthropic::simple_options::map_model",
-                    "crates/atilla-ai/src/api/anthropic/simple_options.rs",
-                ),
-                (
-                    "atilla_ai::util::unrelated::helper",
-                    "crates/atilla-ai/src/util/unrelated.rs",
-                ),
-            ],
-            &[],
-        );
-        let plan = build_plan(&source, PlanOpts::default());
-        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
-
-        let fe = report
-            .files
-            .iter()
-            .find(|f| f.path == "src/api/simple-options.ts")
-            .unwrap();
-        assert_eq!(fe.map_method.as_deref(), Some("graph-cluster"));
-        assert_eq!(
-            fe.mapped_target.as_deref(),
-            Some("api/anthropic/simple_options")
-        );
-        // All three symbols matched into the recovered subtree.
-        assert_eq!(fe.matched_symbols, 3);
-        assert_eq!(fe.total_symbols, 3);
-        assert_eq!(fe.tier_breakdown.subtree, 3);
-        assert_eq!(fe.band, Band::Ported);
-        // And it shows up as a recovered file the naive path pass would miss.
-        assert!(report
-            .naive_vs_graph
-            .recovered_files
-            .contains(&"src/api/simple-options.ts".to_string()));
-    }
-
-    // ---- 3. Graph-confirm -------------------------------------------------
-
-    #[test]
-    fn graph_confirm_rewards_edge_overlap_not_name_coincidence() {
-        // File A: `alpha` calls `beta`; the target `a_mod` has `alpha`->`beta` too,
-        // so the match is edge-confirmed (overlap 1.0).
-        // File C: `gamma` calls `delta`; both names exist in target `c_mod`, but
-        // `gamma` does NOT call `delta` there — a name coincidence, overlap 0.
-        let source = graph_of(
-            &[
-                ("src/a.ts#alpha", "src/a.ts"),
-                ("src/a.ts#beta", "src/a.ts"),
-                ("src/c.ts#gamma", "src/c.ts"),
-                ("src/c.ts#delta", "src/c.ts"),
-            ],
-            &[
-                ("src/a.ts#alpha", "src/a.ts#beta"),
-                ("src/c.ts#gamma", "src/c.ts#delta"),
-            ],
-        );
-        let target = graph_of(
-            &[
-                ("atilla_ai::a::alpha", "crates/atilla-ai/src/a.rs"),
-                ("atilla_ai::a::beta", "crates/atilla-ai/src/a.rs"),
-                ("atilla_ai::c::gamma", "crates/atilla-ai/src/c.rs"),
-                ("atilla_ai::c::delta", "crates/atilla-ai/src/c.rs"),
-                // A distractor so `gamma` has an out-edge that isn't `delta`.
-                ("atilla_ai::c::other", "crates/atilla-ai/src/c.rs"),
-            ],
-            &[
-                ("atilla_ai::a::alpha", "atilla_ai::a::beta"),
-                ("atilla_ai::c::gamma", "atilla_ai::c::other"),
-            ],
-        );
-        let plan = build_plan(&source, PlanOpts::default());
-        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
-
-        // Two evaluable matched symbols (alpha, gamma), exactly one confirmed.
-        assert_eq!(report.overall.graph.evaluable, 2);
-        assert_eq!(report.overall.graph.confirmed, 1);
-
-        let fa = report.files.iter().find(|f| f.path == "src/a.ts").unwrap();
-        let fc = report.files.iter().find(|f| f.path == "src/c.ts").unwrap();
-        assert_eq!(fa.graph_confirmed_coverage, Some(1.0));
-        assert_eq!(fc.graph_confirmed_coverage, Some(0.0));
-    }
-
-    // ---- 4. Band classification ------------------------------------------
-
-    #[test]
-    fn band_thresholds() {
-        // Native short-circuits to DONE regardless of coverage.
-        assert_eq!(classify_band(true, 0, None, false, 0.6), Band::Done);
-        // >= threshold, not native -> PORTED.
-        assert_eq!(classify_band(false, 5, Some(0.6), true, 0.6), Band::Ported);
-        assert_eq!(classify_band(false, 5, Some(0.8), true, 0.6), Band::Ported);
-        // Below threshold but with a match/map -> STARTED.
-        assert_eq!(classify_band(false, 5, Some(0.4), true, 0.6), Band::Started);
-        // A mapped target with zero matched symbols still counts as STARTED.
-        assert_eq!(classify_band(false, 3, Some(0.0), true, 0.6), Band::Started);
-        // Nothing matched and nothing mapped -> NOT-STARTED.
-        assert_eq!(
-            classify_band(false, 3, Some(0.0), false, 0.6),
-            Band::NotStarted
-        );
-        assert_eq!(classify_band(false, 0, None, false, 0.6), Band::NotStarted);
-    }
-
-    // ---- 5. Ready frontier ------------------------------------------------
-
-    #[test]
-    fn ready_frontier_needs_all_deps_ported() {
-        // `hi.ts` depends on `lo.ts`; `lo.ts` is fully ported, `hi.ts` is not.
-        // `orphan.ts` depends on `unported.ts` which is NOT-STARTED, so it is held
-        // off the frontier.
-        let source = graph_of(
-            &[
-                ("src/hi.ts#useLow", "src/hi.ts"),
-                ("src/lo.ts#lowHelper", "src/lo.ts"),
-                ("src/orphan.ts#useUnported", "src/orphan.ts"),
-                ("src/unported.ts#nope", "src/unported.ts"),
-            ],
-            &[
-                ("src/hi.ts#useLow", "src/lo.ts#lowHelper"),
-                ("src/orphan.ts#useUnported", "src/unported.ts#nope"),
-            ],
-        );
-        // Target ports `lo` (so lo.ts is PORTED) but NOT hi/orphan/unported.
-        let target = graph_of(
-            &[("atilla_ai::lo::low_helper", "crates/atilla-ai/src/lo.rs")],
-            &[],
-        );
-        let plan = build_plan(&source, PlanOpts::default());
-        let report = port_diff(&source, &plan, &target, &cfg_no_conformance(), None);
-
-        let lo = report.files.iter().find(|f| f.path == "src/lo.ts").unwrap();
-        assert_eq!(lo.band, Band::Ported);
-
-        let frontier: Vec<&str> = report
-            .ready_frontier
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect();
-        // hi.ts is unported but its only dep (lo.ts) is ported -> on the frontier.
-        assert!(frontier.contains(&"src/hi.ts"));
-        // orphan.ts depends on an unported file -> NOT on the frontier.
-        assert!(!frontier.contains(&"src/orphan.ts"));
-    }
-}
+mod tests;

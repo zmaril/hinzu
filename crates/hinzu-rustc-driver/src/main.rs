@@ -41,13 +41,15 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_public;
 
+mod bodies;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::ControlFlow;
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::mir::{AggregateKind, MirVisitor, Operand, Rvalue, TerminatorKind};
-use rustc_public::ty::{FnDef, GenericArgs, RigidTy, TyKind};
+use rustc_public::ty::{AdtDef, FnDef, GenericArgKind, GenericArgs, RigidTy, Ty, TyKind};
 use rustc_public::{CrateDef, ItemKind};
 use serde::Serialize;
 
@@ -73,8 +75,12 @@ struct Def {
 
 /// A "caller uses callee" edge. `kind` is `call` for a MIR `Call` terminator
 /// (`resolution` = `call` when statically resolved, `unresolved` for an indirect
-/// fn-pointer / dyn call), or `reference` for a function/closure *used as a
-/// value* rather than called (`resolution` = `reference`). Both carry effects.
+/// fn-pointer / dyn call), `reference` for a function/closure *used as a value*
+/// rather than called (`resolution` = `reference`), or `type` for a
+/// signature-type dependency — a function → an ADT named in its parameters or
+/// return, resolved statically to the ADT's declaration (`resolution` =
+/// `reference`). Call and reference edges carry effects; a `type` edge never
+/// does (a signature dependency is not a call).
 #[derive(Serialize)]
 struct Edge {
     caller: String,
@@ -141,11 +147,34 @@ fn effect_category(name: &str) -> Option<&'static str> {
 /// statically-known trait-method name). Shared by the call path
 /// ([`CallCollector::visit_terminator`]) and the reference path
 /// ([`CallCollector::reference_operand`]) so both resolve a callee identically.
-fn fndef_name(def: FnDef, args: &GenericArgs) -> String {
-    match Instance::resolve(def, args) {
-        Ok(inst) => inst.name(),
-        Err(_) => def.name(),
-    }
+fn fndef_name(def: FnDef, _args: &GenericArgs) -> String {
+    // Derive the callee name from its polymorphic def path rather than resolving a
+    // monomorphic `Instance`.
+    //
+    // `Instance::resolve(def, args)` monomorphizes the callee, which forces
+    // codegen-mode normalization of its generic arguments. For some instances
+    // (observed with an `impl IntoIterator<Item = …>` argument in
+    // `pidgin-agent`) rustc's `normalize_erasing_regions` cannot normalize an
+    // opaque projection and raises `bug!` — a fatal *diagnostic* plus a panic.
+    // Catching the panic is not enough: the emitted `bug!` diagnostic poisons the
+    // whole crate's compilation, so cargo never writes the crate's `.rmeta`, and
+    // every dependent crate then fails to build ("extern location … does not
+    // exist"), taking its own extraction down with it. The only reliable fix is
+    // to never trigger that normalization.
+    //
+    // The def-path name is also the correct granularity for a *dependency* graph:
+    //   * a local generic fn is only ever represented by its polymorphic def name
+    //     (it comes back from `all_local_items` un-monomorphized and is keyed by
+    //     `item.name()`), so a callee keyed by `def.name()` matches its definition
+    //     node, where a `foo::<Concrete>` mono name would miss it;
+    //   * a local concrete fn has `inst.name() == def.name()`, so nothing changes;
+    //   * an external mono call (`Vec::<T>::new`) is a foreign leaf either way, and
+    //     effect classification strips generics before matching, so it is
+    //     unaffected.
+    // This mirrors the pre-existing `Err(_) => def.name()` fallback, now taken
+    // unconditionally so a single unnormalizable instance can never abort — nor
+    // silently corrupt — an extraction.
+    def.name()
 }
 
 /// A span's file and 1-based start line.
@@ -378,10 +407,104 @@ fn walk_body(
     facts.effect_roots.append(&mut c.roots);
 }
 
+/// Collect the local ADTs (struct/enum/union) named in a type, peeling through
+/// references, raw pointers, slices, arrays, patterns, tuples, and generic
+/// arguments so `&Widget`, `&[Widget]`, `Vec<Widget>`, and `Option<Widget>` all
+/// reach `Widget`. Only ADTs whose def is in the local crate are collected — a
+/// foreign type (a dependency's type, or a std type like `String`) is an
+/// assumed-available boundary, not a port target. Recursion is bounded by the
+/// (finite, monomorphized) type structure and a depth guard.
+fn collect_local_adts(ty: Ty, depth: u32, out: &mut Vec<AdtDef>) {
+    if depth > 16 {
+        return;
+    }
+    let TyKind::RigidTy(rigid) = ty.kind() else {
+        return;
+    };
+    match rigid {
+        RigidTy::Adt(adt, args) => {
+            if adt.krate().is_local {
+                out.push(adt);
+            }
+            // Peel generic arguments (Vec<Widget>, Option<Widget>, …).
+            for arg in args.0 {
+                if let GenericArgKind::Type(inner) = arg {
+                    collect_local_adts(inner, depth + 1, out);
+                }
+            }
+        }
+        RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _) => {
+            collect_local_adts(inner, depth + 1, out)
+        }
+        RigidTy::Slice(inner) | RigidTy::Array(inner, _) | RigidTy::Pat(inner, _) => {
+            collect_local_adts(inner, depth + 1, out)
+        }
+        RigidTy::Tuple(inners) => {
+            for inner in inners {
+                collect_local_adts(inner, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit signature-type dependency edges for a callable: one `type` edge from
+/// `caller` to every local ADT named in its parameters or return. Registers each
+/// ADT as a definition (so the edge resolves to a local port target, not an
+/// external leaf) and dedups edges per callee. `sig_ty` is the callable's type
+/// (`FnDef`); a non-fn type has no signature and no-ops. Type edges do not seed
+/// effect roots — a signature dependency is not a call, so it must never carry a
+/// runtime effect (`hinzu_core` also excludes `type` edges from propagation).
+fn emit_signature_type_edges(
+    caller: &str,
+    caller_file: &str,
+    caller_line: u32,
+    sig_ty: Ty,
+    facts: &mut Facts,
+    def_ids: &mut HashMap<String, ()>,
+) {
+    let Some(sig) = sig_ty.kind().fn_sig() else {
+        return;
+    };
+    let sig = sig.skip_binder();
+    let mut adts: Vec<AdtDef> = Vec::new();
+    for ty in &sig.inputs_and_output {
+        collect_local_adts(*ty, 0, &mut adts);
+    }
+    let mut emitted: HashSet<String> = HashSet::new();
+    for adt in adts {
+        let name = adt.name();
+        if name == caller {
+            continue;
+        }
+        // Register the ADT as a local definition, so the type edge resolves to a
+        // local node (a real port dependency), not an external leaf.
+        if def_ids.insert(name.clone(), ()).is_none() {
+            let (file, start, end) = item_location(adt.span());
+            facts.definitions.push(make_def(name.clone(), file, start, end));
+        }
+        if !emitted.insert(name.clone()) {
+            continue;
+        }
+        facts.edges.push(Edge {
+            caller: caller.to_string(),
+            callee: name,
+            kind: "type".to_string(),
+            resolution: "reference".to_string(),
+            evidence_file: caller_file.to_string(),
+            evidence_line: caller_line,
+        });
+    }
+}
+
 fn analyze() -> ControlFlow<()> {
     let mut facts = Facts::default();
     let mut seen_root: HashSet<String> = HashSet::new();
     let mut def_ids: HashMap<String, ()> = HashMap::new();
+    // Body-fact extraction (the range-analysis input) is opt-in so the default
+    // effect-fact path and every stable CI job are untouched.
+    let emit_bodies = std::env::var("HINZU_EMIT_BODIES").is_ok();
+    let mut body_facts = bodies::BodyFacts::default();
 
     for item in rustc_public::all_local_items() {
         let name = item.name();
@@ -402,10 +525,13 @@ fn analyze() -> ControlFlow<()> {
                 //     `static X = read_config()`), so walk it directly, keyed by
                 //     the item's own name — the Rust analogue of Python's
                 //     module-scope import-time effects.
+                // Either way its signature-type dependencies come from the item
+                // type (the ADTs are concrete named types, monomorphization or
+                // not) and are emitted below.
                 if def_ids.insert(name.clone(), ()).is_none() {
                     facts
                         .definitions
-                        .push(make_def(name.clone(), file, line_start, line_end));
+                        .push(make_def(name.clone(), file.clone(), line_start, line_end));
                 }
                 // A closure reports `requires_monomorphization` like a generic
                 // fn, but its body is concrete and is NOT re-walked via any
@@ -425,6 +551,14 @@ fn analyze() -> ControlFlow<()> {
                         walk_body(&name, &body, &mut facts, &mut seen_root);
                     }
                 }
+                emit_signature_type_edges(
+                    &name,
+                    &file,
+                    line_start,
+                    item.ty(),
+                    &mut facts,
+                    &mut def_ids,
+                );
                 continue;
             }
         };
@@ -435,11 +569,28 @@ fn analyze() -> ControlFlow<()> {
         if def_ids.insert(disp.clone(), ()).is_none() {
             facts
                 .definitions
-                .push(make_def(disp.clone(), file, line_start, line_end));
+                .push(make_def(disp.clone(), file.clone(), line_start, line_end));
         }
+
+        // Signature-type dependency edges: the callable's monomorphized type
+        // gives its parameter and return types; each local ADT among them is a
+        // port dependency of this function.
+        emit_signature_type_edges(
+            &disp,
+            &file,
+            line_start,
+            inst.ty(),
+            &mut facts,
+            &mut def_ids,
+        );
 
         let Some(body) = inst.body() else { continue };
         walk_body(&disp, &body, &mut facts, &mut seen_root);
+        if emit_bodies {
+            if let Some(fb) = bodies::lower_body(&disp, &file, line_start, &body) {
+                body_facts.functions.push(fb);
+            }
+        }
     }
 
     let dir = std::env::var("HINZU_FACTS_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -454,6 +605,17 @@ fn analyze() -> ControlFlow<()> {
         facts.edges.len(),
         facts.effect_roots.len(),
     );
+
+    if emit_bodies {
+        let bout = format!("{dir}/bodies-{crate_name}-{}.json", std::process::id());
+        let bjson = serde_json::to_string_pretty(&body_facts).unwrap();
+        let mut bf = std::fs::File::create(&bout).unwrap();
+        bf.write_all(bjson.as_bytes()).unwrap();
+        eprintln!(
+            "[hinzu-rustc-driver] crate={crate_name} bodies={} -> {bout}",
+            body_facts.functions.len(),
+        );
+    }
     ControlFlow::Continue(())
 }
 
