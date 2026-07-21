@@ -417,37 +417,8 @@ fn describe_terminator(term: &Terminator) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::body::*;
+    use super::super::test_support::{binop_fn, guarded_divide_fn};
     use super::*;
-
-    /// A one-block `id(a, b) { _0 = a <op> b; return }` over two integer params
-    /// plus the return place — the straight-line shape the emitter lowers
-    /// directly.
-    fn binop_fn(id: &str, op: BinOp) -> FunctionBody {
-        FunctionBody {
-            id: id.into(),
-            display: id.into(),
-            file: "demo.rs".into(),
-            line: 1,
-            arg_count: 2,
-            locals: vec![
-                Local { kind: NumKind::Int },
-                Local { kind: NumKind::Int },
-                Local { kind: NumKind::Int },
-            ],
-            blocks: vec![Block {
-                stmts: vec![Stmt {
-                    place: 0,
-                    rvalue: Rvalue::Binary {
-                        kind: op,
-                        left: Operand::Local { local: 1 },
-                        right: Operand::Local { local: 2 },
-                    },
-                    loc: Loc::default(),
-                }],
-                terminator: Terminator::Return,
-            }],
-        }
-    }
 
     #[test]
     fn emits_module_header_and_generated_markers() {
@@ -554,49 +525,14 @@ mod tests {
 
     #[test]
     fn a_multi_block_switchint_surfaces_a_cfg_hole() {
-        // Two blocks, entry ends in a SwitchInt — not straight-line, so a CFG
-        // summary + hole is emitted while block 0's stmts still lower.
-        let f = FunctionBody {
-            id: "app::guarded".into(),
-            display: "guarded".into(),
-            file: "demo.rs".into(),
-            line: 1,
-            arg_count: 1,
-            locals: vec![
-                Local { kind: NumKind::Int },
-                Local { kind: NumKind::Int },
-                Local {
-                    kind: NumKind::Bool,
-                },
-            ],
-            blocks: vec![
-                Block {
-                    stmts: vec![Stmt {
-                        place: 2,
-                        rvalue: Rvalue::Binary {
-                            kind: BinOp::Ne,
-                            left: Operand::Local { local: 1 },
-                            right: Operand::Const {
-                                value: ConstVal::Int(0),
-                            },
-                        },
-                        loc: Loc::default(),
-                    }],
-                    terminator: Terminator::SwitchInt {
-                        discr: Operand::Local { local: 2 },
-                        targets: vec![SwitchTarget { value: 0, block: 1 }],
-                        otherwise: None,
-                    },
-                },
-                Block {
-                    stmts: vec![],
-                    terminator: Terminator::Return,
-                },
-            ],
-        };
-        let out = emit_quint(&BodyFacts { functions: vec![f] });
+        // A guarded divide: four blocks, entry ends in a SwitchInt. Not
+        // straight-line, so a CFG summary + hole is emitted while block 0's stmt
+        // still lowers to real derived content.
+        let out = emit_quint(&BodyFacts {
+            functions: vec![guarded_divide_fn()],
+        });
         assert!(
-            out.contains("// ---- CFG (2 blocks) ----"),
+            out.contains("// ---- CFG (4 blocks) ----"),
             "multi-block body should surface a CFG summary;\n{out}"
         );
         assert!(
@@ -607,9 +543,9 @@ mod tests {
             out.contains("SwitchInt"),
             "the SwitchInt terminator should appear in the CFG summary;\n{out}"
         );
-        // Block 0's comparison still lowers to real derived content.
+        // Block 0's `_3 = Ne(_2, 0)` comparison still lowers to real Quint.
         assert!(
-            out.contains("app__guarded_l2' = app__guarded_l1 != 0"),
+            out.contains("app__safe_l3' = app__safe_l2 != 0"),
             "block 0's straight-line stmt should still lower;\n{out}"
         );
     }
