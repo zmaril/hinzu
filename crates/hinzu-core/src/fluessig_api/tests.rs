@@ -354,7 +354,7 @@ fn build_fluessig_end_to_end() {
 
     let report = demo_report(vec![iface, alias, func, class, method, dropped_const]);
 
-    let out = build_fluessig(&report);
+    let out = build_fluessig(&report, &[]);
 
     // One model, one enum, two interfaces (Session + the free-function group).
     assert_eq!(out.api.models.len(), 1);
@@ -618,7 +618,7 @@ fn build_fluessig_lifts_indexed_access_alias_end_to_end() {
         func,
     ]);
 
-    let out = build_fluessig(&report);
+    let out = build_fluessig(&report, &[]);
 
     // The indexed-access alias lifted into a named union over the value types.
     let u = out
@@ -660,6 +660,368 @@ fn build_fluessig_lifts_indexed_access_alias_end_to_end() {
             .get("typeAlias (non-string-union) dropped"),
         Some(&1)
     );
+}
+
+// ─────────────────── cross-package (multi-report) resolution ─────────────────
+
+/// A sibling-package report named `@x/sibling` over `items` — the context input
+/// to the multi-report `build_fluessig` tests.
+fn sibling_report(items: Vec<ApiItem>) -> crate::api::ApiReport {
+    let mut r = demo_report(items);
+    r.package.name = "@x/sibling".to_string();
+    r
+}
+
+fn iface_item(name: &str, fields: Vec<(&str, &str)>) -> ApiItem {
+    let mut it = ApiItem::new("interface", &format!("m#{name}"), name, "m");
+    it.fields = fields
+        .into_iter()
+        .map(|(n, t)| Field {
+            name: n.to_string(),
+            ty: t.to_string(),
+            visibility: "public".to_string(),
+            doc: None,
+            optional: false,
+        })
+        .collect();
+    it
+}
+
+fn union_alias_item(name: &str, target: &str) -> ApiItem {
+    let mut it = ApiItem::new("typeAlias", &format!("m#{name}"), name, "m");
+    it.alias_target = Some(target.to_string());
+    it
+}
+
+fn field_ref_model(name: &str, field_ty: &str) -> ApiItem {
+    iface_item(name, vec![("v", field_ty)])
+}
+
+/// A primary field typed as a sibling-package model resolves to a real `Model`
+/// (not Json), and the sibling model is pulled into `models[]` — while the
+/// sibling's *unreferenced* types stay out (scoped emission).
+#[test]
+fn primary_ref_resolves_to_context_model() {
+    // Primary references `RpcReadyResponse` (a sibling interface) but not
+    // `UnusedSibling`.
+    let primary = demo_report(vec![field_ref_model("Envelope", "RpcReadyResponse")]);
+    let context = sibling_report(vec![
+        iface_item(
+            "RpcReadyResponse",
+            vec![("id", "string"), ("ready", "boolean")],
+        ),
+        iface_item("UnusedSibling", vec![("x", "string")]),
+    ]);
+
+    let out = build_fluessig(&primary, &[context]);
+
+    // The primary field resolved to the sibling model.
+    let env = out
+        .api
+        .models
+        .iter()
+        .find(|m| m.name == "Envelope")
+        .unwrap();
+    assert_eq!(
+        env.fields[0].ty,
+        FlType::Model {
+            model: "RpcReadyResponse".to_string()
+        }
+    );
+    // The referenced sibling model was pulled in; the unreferenced one was not.
+    let names: Vec<&str> = out.api.models.iter().map(|m| m.name.as_str()).collect();
+    assert!(names.contains(&"RpcReadyResponse"));
+    assert!(!names.contains(&"UnusedSibling"));
+    assert_eq!(out.stats.context_reports, 1);
+    assert_eq!(out.stats.context_types_pulled, 1);
+    assert_eq!(
+        out.stats
+            .degradation_reasons
+            .get("unresolved type reference"),
+        None
+    );
+}
+
+/// A primary lifted union whose members are sibling types resolves each member
+/// via context (the `RpcClientMessage = RpcCommand | …` shape), and the sibling
+/// union alias is itself pulled in and lifted.
+#[test]
+fn lifted_union_resolves_sibling_members_via_context() {
+    let primary = demo_report(vec![union_alias_item(
+        "RpcClientMessage",
+        "RpcCommand | RpcExtensionUIResponse",
+    )]);
+    let context = sibling_report(vec![
+        union_alias_item("RpcCommand", "PromptCommand | AbortCommand"),
+        union_alias_item(
+            "RpcExtensionUIResponse",
+            "UiValueResponse | UiCancelResponse",
+        ),
+        iface_item("PromptCommand", vec![("message", "string")]),
+        iface_item("AbortCommand", vec![("id", "string")]),
+        iface_item("UiValueResponse", vec![("value", "string")]),
+        iface_item("UiCancelResponse", vec![("cancelled", "boolean")]),
+    ]);
+
+    let out = build_fluessig(&primary, &[context]);
+
+    // The primary union's members resolve to real sibling unions, not Json.
+    let client = out
+        .api
+        .unions
+        .iter()
+        .find(|u| u.name == "RpcClientMessage")
+        .unwrap();
+    let member_types: Vec<&FlType> = client.variants.iter().map(|v| &v.ty).collect();
+    assert!(member_types.contains(&&FlType::Union {
+        union: "RpcCommand".to_string()
+    }));
+    assert!(member_types.contains(&&FlType::Union {
+        union: "RpcExtensionUIResponse".to_string()
+    }));
+    // Both sibling unions were pulled in and lifted (as real unions).
+    let union_names: Vec<&str> = out.api.unions.iter().map(|u| u.name.as_str()).collect();
+    assert!(union_names.contains(&"RpcCommand"));
+    assert!(union_names.contains(&"RpcExtensionUIResponse"));
+    // Their members were pulled in transitively as models.
+    let model_names: Vec<&str> = out.api.models.iter().map(|m| m.name.as_str()).collect();
+    for m in [
+        "PromptCommand",
+        "AbortCommand",
+        "UiValueResponse",
+        "UiCancelResponse",
+    ] {
+        assert!(model_names.contains(&m), "{m} pulled in transitively");
+    }
+    // No sibling member degraded to Json.
+    assert_eq!(
+        out.stats
+            .degradation_reasons
+            .get("unresolved type reference"),
+        None
+    );
+}
+
+/// Scoped emission: the transitive closure pulls in only the sibling types the
+/// primary reaches, never the context package's whole op/type surface.
+#[test]
+fn scoped_emission_pulls_only_referenced_sibling_types() {
+    // A → B (referenced chain); C, D are unrelated sibling types.
+    let primary = demo_report(vec![field_ref_model("Root", "A")]);
+    let context = sibling_report(vec![
+        field_ref_model("A", "B"),
+        iface_item("B", vec![("leaf", "string")]),
+        iface_item("C", vec![("unrelated", "string")]),
+        union_alias_item("D", "C | B"),
+        // A sibling class + function: an op surface that must NOT be emitted.
+        ApiItem::new("class", "m#SiblingService", "SiblingService", "m"),
+    ]);
+
+    let out = build_fluessig(&primary, &[context]);
+
+    let model_names: Vec<&str> = out.api.models.iter().map(|m| m.name.as_str()).collect();
+    // Transitively referenced A and B are pulled in.
+    assert!(model_names.contains(&"A"));
+    assert!(model_names.contains(&"B"));
+    // Unreferenced C, D and the sibling service/op surface are NOT emitted.
+    assert!(!model_names.contains(&"C"));
+    assert!(!out.api.unions.iter().any(|u| u.name == "D"));
+    assert!(!out
+        .api
+        .interfaces
+        .iter()
+        .any(|i| i.name == "SiblingService"));
+    assert_eq!(out.stats.context_types_pulled, 2); // A + B only
+}
+
+/// Backward-compat: passing no context is byte-identical to the pre-context
+/// single-report path (an empty context slice never perturbs the output).
+#[test]
+fn no_context_is_backward_compatible() {
+    let items = vec![
+        field_ref_model("Holder", "InstanceStatus"),
+        union_alias_item("InstanceStatus", "\"online\" | \"offline\""),
+    ];
+    let report = demo_report(items.clone());
+    let out_no_ctx = build_fluessig(&report, &[]);
+    // An empty context slice must produce identical documents and stats.
+    let out_empty = build_fluessig(&report, &[]);
+    assert_eq!(
+        serde_json::to_string(&out_no_ctx.api).unwrap(),
+        serde_json::to_string(&out_empty.api).unwrap(),
+    );
+    assert_eq!(out_no_ctx.stats.context_reports, 0);
+    assert_eq!(out_no_ctx.stats.context_types_pulled, 0);
+    // And a passed-but-irrelevant context leaves the primary output unchanged
+    // when nothing references it.
+    let irrelevant = sibling_report(vec![iface_item("Nobody", vec![("x", "string")])]);
+    let out_irrelevant = build_fluessig(&report, &[irrelevant]);
+    assert_eq!(
+        serde_json::to_string(&out_no_ctx.api).unwrap(),
+        serde_json::to_string(&out_irrelevant.api).unwrap(),
+    );
+    assert_eq!(out_irrelevant.stats.context_types_pulled, 0);
+}
+
+// ───────────────────── foreign opaque-handle policy ─────────────────────────
+
+/// The `Foreign` variant serializes to fluessig's EXACT wire shape — a single
+/// `foreign` key over `{name, rustPath}` — so the converter's output round-trips
+/// through fluessig's `ApiType::Foreign` serde.
+#[test]
+fn foreign_serializes_to_exact_wire_shape() {
+    let ty = FlType::Foreign {
+        foreign: FlForeign {
+            name: "http.Server".to_string(),
+            rust_path: "http::Server".to_string(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&ty).unwrap(),
+        r#"{"foreign":{"name":"http.Server","rustPath":"http::Server"}}"#
+    );
+}
+
+/// A truly-external DOTTED builtin path (`http.Server`) → `Foreign`, with the
+/// `rust_path` mapping `.` → `::`. Not a degradation.
+#[test]
+fn dotted_builtin_ref_emits_foreign_with_colon_path() {
+    let mut c = conv();
+    let p = c.parse_type("http.Server");
+    assert_eq!(
+        p.ty,
+        FlType::Foreign {
+            foreign: FlForeign {
+                name: "http.Server".to_string(),
+                rust_path: "http::Server".to_string(),
+            }
+        }
+    );
+    assert!(
+        !p.degraded,
+        "a Foreign handle is faithful, not a Json fallback"
+    );
+    assert_eq!(c.foreign_types.get("http.Server"), Some(&1));
+    // It is NOT counted as an unresolved reference.
+    assert_eq!(c.reasons.get("unresolved type reference"), None);
+    assert_eq!(c.reasons.get("unparsable type expression"), None);
+}
+
+/// A bare truly-external builtin name on the allowlist (`Server`, imported from
+/// `node:net`) → `Foreign`, mapped to its canonical dotted source name/path.
+#[test]
+fn bare_builtin_ref_emits_foreign() {
+    let mut c = conv();
+    let p = c.parse_type("Server");
+    assert_eq!(
+        p.ty,
+        FlType::Foreign {
+            foreign: FlForeign {
+                name: "net.Server".to_string(),
+                rust_path: "net::Server".to_string(),
+            }
+        }
+    );
+    assert!(!p.degraded);
+    assert_eq!(c.foreign_types.get("Server"), Some(&1));
+}
+
+/// A generic type parameter (`T`, or a declared generic of the owning item) is
+/// NEVER opaqued — it stays the honest `Json` fallback and is recorded under
+/// `generic_params`, not `foreign_types`.
+#[test]
+fn generic_type_param_stays_non_foreign() {
+    // A single-letter param.
+    let mut c = conv();
+    let p = c.parse_type("T");
+    assert_eq!(p.ty, FlType::json());
+    assert!(p.degraded);
+    assert_eq!(c.generic_params.get("T"), Some(&1));
+    assert!(c.foreign_types.is_empty());
+
+    // A multi-letter declared generic of the owning item (`TSchema`).
+    let mut c2 = conv();
+    c2.current_generics.insert("TSchema".to_string());
+    let p2 = c2.parse_type("TSchema");
+    assert_eq!(p2.ty, FlType::json());
+    assert_eq!(c2.generic_params.get("TSchema"), Some(&1));
+    assert!(c2.foreign_types.is_empty());
+}
+
+/// A pi-internal type merely absent from the current `--context` set is kept as
+/// honest `Json` and recorded under `context_expandable` — NOT opaqued as
+/// external (never misrepresented) and NOT a generic.
+#[test]
+fn pi_internal_not_in_context_stays_json_not_foreign() {
+    let mut c = conv();
+    let p = c.parse_type("ImageContent");
+    assert_eq!(p.ty, FlType::json());
+    assert!(p.degraded);
+    assert_eq!(c.context_expandable.get("ImageContent"), Some(&1));
+    assert!(c.foreign_types.is_empty());
+    assert!(c.generic_params.is_empty());
+}
+
+/// End-to-end: an op returning a truly-external type emits a `Foreign` return
+/// (the `startIpcServer` → `Server` case), the op counts as CLEAN, and the stats
+/// carry `foreign_emitted` while `Server` no longer counts as unresolved.
+#[test]
+fn foreign_return_flips_op_clean_end_to_end() {
+    let func = {
+        let mut it = ApiItem::new("function", "m#startIpcServer", "startIpcServer", "m");
+        it.signature = Some(Signature {
+            params: vec![],
+            return_type: Some("Promise<Server>".to_string()),
+            is_async: true,
+            receiver: None,
+            error_type: None,
+            generics: vec![],
+        });
+        it
+    };
+    let out = build_fluessig(&demo_report(vec![func]), &[]);
+
+    let iface = &out.api.interfaces[0];
+    let op = iface
+        .ops
+        .iter()
+        .find(|o| o.name == "startIpcServer")
+        .unwrap();
+    assert_eq!(
+        op.returns,
+        FlType::Foreign {
+            foreign: FlForeign {
+                name: "net.Server".to_string(),
+                rust_path: "net::Server".to_string(),
+            }
+        }
+    );
+    assert_eq!(out.stats.foreign_emitted, 1);
+    assert_eq!(out.stats.foreign_types.get("Server"), Some(&1));
+    assert_eq!(out.stats.ops_clean, 1);
+    assert_eq!(out.stats.ops_degraded, 0);
+    assert_eq!(
+        out.stats
+            .degradation_reasons
+            .get("unresolved type reference"),
+        None
+    );
+}
+
+/// An in-scope `class` used as a value type has no DTO form: it stays honest
+/// `Json` under `unmodeled_refs`, NOT `context_expandable` (adding a package
+/// cannot help) and NOT `Foreign` (it is pi-internal, not external).
+#[test]
+fn in_scope_class_ref_is_unmodeled_not_context_gap() {
+    let holder = field_ref_model("Holder", "RpcProcessInstance");
+    let class = ApiItem::new("class", "m#RpcProcessInstance", "RpcProcessInstance", "m");
+    let out = build_fluessig(&demo_report(vec![holder, class]), &[]);
+
+    let h = out.api.models.iter().find(|m| m.name == "Holder").unwrap();
+    assert_eq!(h.fields[0].ty, FlType::json());
+    assert_eq!(out.stats.unmodeled_refs.get("RpcProcessInstance"), Some(&1));
+    assert_eq!(out.stats.context_expandable.get("RpcProcessInstance"), None);
+    assert!(out.stats.foreign_types.is_empty());
 }
 
 #[test]
