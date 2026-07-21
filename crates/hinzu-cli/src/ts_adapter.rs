@@ -22,11 +22,11 @@ pub fn is_ts_project(path: &Path) -> bool {
     path.join("tsconfig.json").is_file() || path.join("package.json").is_file()
 }
 
-/// Extract effect facts from a TypeScript project by running the compiler-API
-/// adapter over it. Returns the parsed `FactSet`, or an honest error when Node
-/// or the adapter is missing. `HINZU_NODE` overrides the interpreter (default
-/// `node`); `HINZU_TS_ADAPTER` overrides the script.
-pub fn extract_facts(project: &Path) -> Result<FactSet> {
+/// Locate the TypeScript adapter and build the [`ScriptAdapter`] that drives it.
+/// `HINZU_NODE` overrides the interpreter (default `node`); `HINZU_TS_ADAPTER`
+/// overrides the script. Shared by the fact path ([`extract_facts`]) and the
+/// public-API path (`api_ts`), so both spawn the same Node adapter identically.
+pub fn ts_script_adapter() -> Result<ScriptAdapter> {
     let script = locate_script(
         "HINZU_TS_ADAPTER",
         "typescript",
@@ -34,7 +34,7 @@ pub fn extract_facts(project: &Path) -> Result<FactSet> {
         "set HINZU_TS_ADAPTER to analyze.mjs, and run `npm install` in adapters/typescript so its \
          `typescript` dependency is present",
     )?;
-    ScriptAdapter {
+    Ok(ScriptAdapter {
         language: "TypeScript",
         binary: std::env::var("HINZU_NODE").unwrap_or_else(|_| "node".to_string()),
         script,
@@ -42,6 +42,12 @@ pub fn extract_facts(project: &Path) -> Result<FactSet> {
         // the project's own `node_modules` (its `@types/node` and dependencies)
         // the way its own `tsc` would, independent of where `hinzu` ran from.
         cwd_is_project: true,
-    }
-    .extract(project)
+    })
+}
+
+/// Extract effect facts from a TypeScript project by running the compiler-API
+/// adapter over it. Returns the parsed `FactSet`, or an honest error when Node
+/// or the adapter is missing.
+pub fn extract_facts(project: &Path) -> Result<FactSet> {
+    ts_script_adapter()?.extract(project)
 }

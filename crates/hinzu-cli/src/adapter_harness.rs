@@ -61,17 +61,19 @@ pub struct ScriptAdapter {
 }
 
 impl ScriptAdapter {
-    /// Run the adapter over `project`, capture its stdout, and parse the
-    /// `FactSet` JSON. Fails with an honest message — surfacing the adapter's own
-    /// stderr — rather than faking an analysis when the tool or a dependency is
-    /// missing.
-    pub fn extract(&self, project: &Path) -> Result<FactSet> {
+    /// Run the adapter over `project` with `extra_args`, capture its stdout, and
+    /// return it as a string. Fails with an honest message — surfacing the
+    /// adapter's own stderr — rather than faking an analysis when the tool or a
+    /// dependency is missing. The adapter logs progress to stderr and writes only
+    /// JSON to stdout, so a failure surfaces the adapter's own diagnostics.
+    /// Shared by the fact ([`Self::extract`]) and API modes.
+    pub fn run_capture(&self, project: &Path, extra_args: &[&str]) -> Result<String> {
         let project = project
             .canonicalize()
             .with_context(|| format!("resolving project path {}", project.display()))?;
 
         let mut cmd = Command::new(&self.binary);
-        cmd.arg(&self.script).arg(&project);
+        cmd.arg(&self.script).arg(&project).args(extra_args);
         if self.cwd_is_project {
             cmd.current_dir(&project);
         }
@@ -84,8 +86,6 @@ impl ScriptAdapter {
             )
         })?;
 
-        // The adapter logs progress to stderr and writes only JSON to stdout, so
-        // a failure surfaces the adapter's own diagnostics.
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
@@ -96,8 +96,12 @@ impl ScriptAdapter {
             );
         }
 
-        let json =
-            String::from_utf8(output.stdout).context("the adapter's output was not utf-8")?;
+        String::from_utf8(output.stdout).context("the adapter's output was not utf-8")
+    }
+
+    /// Run the adapter over `project` in fact mode and parse the `FactSet` JSON.
+    pub fn extract(&self, project: &Path) -> Result<FactSet> {
+        let json = self.run_capture(project, &[])?;
         let facts = FactSet::from_json(&json).with_context(|| {
             format!(
                 "parsing the {} adapter's FactSet JSON for {}",
