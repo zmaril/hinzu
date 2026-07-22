@@ -384,6 +384,11 @@ struct Converter {
     notes: BTreeMap<String, usize>,
     /// Models synthesized from inline/anonymous object literals, keyed by name.
     minted: BTreeMap<String, FlModel>,
+    /// Models minted from the JS/lib **builtin-type table** (see
+    /// [`builtin_model`]) on first reference — e.g. the JS `Error` builtin → a
+    /// declared `JsError { name, message, stack? }` model. Keyed by the minted
+    /// name so a surface with no builtin ref stays byte-identical.
+    builtin_models: BTreeMap<String, FlModel>,
     /// Field-set signature → minted model name, so identical inline objects
     /// collapse to a single model instead of emitting N copies.
     minted_by_sig: BTreeMap<String, String>,
@@ -455,6 +460,7 @@ impl Converter {
             reasons: BTreeMap::new(),
             notes: BTreeMap::new(),
             minted: BTreeMap::new(),
+            builtin_models: BTreeMap::new(),
             minted_by_sig: BTreeMap::new(),
             name_hint: Vec::new(),
             context_names: BTreeSet::new(),
@@ -647,6 +653,12 @@ impl Converter {
     /// and kept as honest `Json` — the conservative default, so a pi type is never
     /// misrepresented as external.
     fn resolve_unresolved(&mut self, s: &str) -> Parsed {
+        // A JS/lib builtin with a faithful DTO shape (`Error` → `JsError`) maps to
+        // a minted, declared model rather than degrading — checked first so a
+        // builtin is never misclassified as a generic/foreign/pi-internal ref.
+        if let Some(ty) = self.reference_builtin_model(s) {
+            return Parsed::clean(ty);
+        }
         if self.current_generics.contains(s) || is_generic_param(s) {
             // A generic type parameter has no external handle — keep the current
             // `Json` fallback, recorded so the residual is legible.
@@ -678,6 +690,19 @@ impl Converter {
         // to add — never misrepresented as external.
         Stats::bump(&mut self.context_expandable, s);
         self.degrade("unresolved type reference")
+    }
+
+    /// If `s` names a JS/lib builtin in the [`builtin_model`] table, mint (once)
+    /// its declared DTO model, register the minted name in the model namespace so
+    /// later minting cannot collide with it, and return a `Model` ref. `None` for
+    /// any non-builtin name, leaving the existing unresolved paths untouched.
+    fn reference_builtin_model(&mut self, s: &str) -> Option<FlType> {
+        let model = builtin_model(s)?;
+        let name = model.name.clone();
+        self.known_models.insert(name.clone());
+        self.builtin_models.entry(name.clone()).or_insert(model);
+        Stats::bump(&mut self.notes, "builtin type → declared model");
+        Some(FlType::Model { model: name })
     }
 
     /// Emit a `Foreign` opaque handle for a truly-external ref, counting it under
@@ -1206,6 +1231,10 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     stats.models_minted = conv.minted.len();
     models.extend(std::mem::take(&mut conv.minted).into_values());
 
+    // Fold in models minted from the builtin-type table (e.g. the JS `Error`
+    // builtin → a declared `JsError` model), so `{"model":"JsError"}` refs resolve.
+    models.extend(std::mem::take(&mut conv.builtin_models).into_values());
+
     // Subscription post-pass. Now that every model-ref is emitted, compute which
     // declared interfaces are CONSTRUCTIBLE (referenced by a `{"model":..}` handle
     // in a return/value position), then finalize each deferred register→unsubscribe
@@ -1454,3 +1483,6 @@ use helpers::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_builtin;

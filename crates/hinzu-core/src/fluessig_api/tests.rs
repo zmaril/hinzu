@@ -15,8 +15,8 @@ fn scalar(s: &str) -> FlType {
 }
 
 /// A single-module `@x/demo` report over `items` — the shared scaffold for the
-/// end-to-end `build_fluessig` tests.
-fn demo_report(items: Vec<ApiItem>) -> crate::api::ApiReport {
+/// end-to-end `build_fluessig` tests (also reused by the `tests_builtin` module).
+pub(super) fn demo_report(items: Vec<ApiItem>) -> crate::api::ApiReport {
     build_api(
         PackageInfo {
             name: "@x/demo".to_string(),
@@ -187,10 +187,21 @@ fn callback_types_parse() {
     );
     assert!(!p.degraded);
     // An optional param inside the callback (`error?: Error | undefined`) recurses
-    // through the union/nullable path; `Error` is an unresolved ref so the inner
-    // degrades, but the `Callback` wrapper itself is minted (the op counts it).
+    // through the union/nullable path; the JS builtin `Error` maps to the typed
+    // `JsError` model (builtin-type table), so the inner is a `Nullable<Model>`
+    // and the whole callback is CLEAN (not degraded).
     let p = c.parse_type("(error?: Error | undefined) => void");
-    assert!(matches!(p.ty, FlType::Callback { .. }));
+    assert_eq!(
+        p.ty,
+        FlType::Callback {
+            callback: FlCallbackSig::sync_void(vec![FlType::Nullable {
+                nullable: Box::new(FlType::Model {
+                    model: "JsError".to_string(),
+                }),
+            }]),
+        }
+    );
+    assert!(!p.degraded);
 }
 
 #[test]
@@ -1119,8 +1130,9 @@ fn in_scope_class_ref_is_unmodeled_not_context_gap() {
 // ─────────────────── interface model-refs & subscription ops ─────────────────
 
 /// A `function`/`method` item with the given signature. `receiver` names the
-/// owning class for a method; a `None` return is a `void` op.
-fn op_item(
+/// owning class for a method; a `None` return is a `void` op. Reused by the
+/// `tests_builtin` module.
+pub(super) fn op_item(
     kind: &str,
     name: &str,
     receiver: Option<&str>,
