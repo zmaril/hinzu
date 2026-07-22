@@ -142,11 +142,14 @@ fn function_and_object_types_degrade() {
     // An async callback (a `Promise<…>` return) likewise degrades honestly.
     assert!(c.parse_type("(x: string) => Promise<void>").degraded);
     assert_eq!(c.reasons.get("async callback"), Some(&1));
-    // An object with a call/method member is not a plain data record — it stays
-    // a `Json` fallback (the callback lane), under a distinct reason.
-    assert!(c.parse_type("{ handleRpc(x: string): void }").degraded);
+    // An object whose members are all METHOD signatures is now minted as a named
+    // interface handle (see `tests_mint`), not degraded — a clean `{"model":..}`
+    // ref rather than the old `Json` fallback.
+    let p = c.parse_type("{ handleRpc(x: string): void }");
+    assert!(!p.degraded);
+    assert!(matches!(p.ty, FlType::Model { .. }));
     assert_eq!(
-        c.reasons.get("inline object with call/index signature"),
+        c.notes.get("anonymous method-object → minted interface"),
         Some(&1)
     );
     assert!(c.parse_type("RequestMap[keyof RequestMap]").degraded);

@@ -298,6 +298,9 @@ pub struct Stats {
     pub models_minted: usize,
     pub enums_emitted: usize,
     pub interfaces_emitted: usize,
+    /// Of `interfaces_emitted`, how many were *minted* from an anonymous
+    /// object-of-methods (a handle return), rather than a source `class`.
+    pub interfaces_minted: usize,
     pub unions_synthesized: usize,
     /// Top-level exported consts emitted into `api.json`'s `consts[]` — a const
     /// whose declared type is representable (a scalar, or a model/union/foreign ref
@@ -428,6 +431,10 @@ struct Converter {
     /// post-pass into a `subscription` (if the owning interface is constructible)
     /// or an honest degraded unary op.
     sub_candidates: Vec<SubCandidate>,
+    /// Interfaces minted from anonymous objects-of-methods (handle returns), plus
+    /// their dedup table and the coverage tally for the ops they add. Folded by
+    /// [`fold_minted_interfaces`] once every op is parsed.
+    mint: MintAccum,
 }
 
 /// The outcome of parsing one rendered type string.
@@ -473,6 +480,7 @@ impl Converter {
             current_generics: BTreeSet::new(),
             known_interfaces: BTreeSet::new(),
             sub_candidates: Vec::new(),
+            mint: MintAccum::default(),
         }
     }
 
@@ -865,8 +873,15 @@ impl Converter {
         if inner.is_empty() {
             return self.degrade("empty inline object literal");
         }
+        let members = split_object_members(inner);
+        // An anonymous object-of-methods (`{ handleRpc(c): Promise<R>; close(): void }`)
+        // is a HANDLE, not a data record: mint a named interface and reference it as
+        // a `{"model":..}` handle rather than degrading to `Json` (see [`mint`]).
+        if let Some(parsed) = self.try_mint_method_interface(&members) {
+            return parsed;
+        }
         let mut fields: Vec<FlField> = Vec::new();
-        for member in split_object_members(inner) {
+        for member in members {
             if member.is_empty() {
                 continue;
             }
@@ -1235,6 +1250,11 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     // builtin → a declared `JsError` model), so `{"model":"JsError"}` refs resolve.
     models.extend(std::mem::take(&mut conv.builtin_models).into_values());
 
+    // Fold in interfaces minted from anonymous objects-of-methods (handle returns),
+    // and account the ops they ADD into the coverage tally (interface ops are
+    // counted in `ops_total`, so the denominator grows honestly).
+    fold_minted_interfaces(&mut conv, &mut stats, &mut interfaces);
+
     // Subscription post-pass. Now that every model-ref is emitted, compute which
     // declared interfaces are CONSTRUCTIBLE (referenced by a `{"model":..}` handle
     // in a return/value position), then finalize each deferred register→unsubscribe
@@ -1308,33 +1328,13 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, owner: &str, it: &ApiItem) 
     conv.current_generics.extend(generic_names(&sig.generics));
     let mut degraded = false;
 
-    // Return type: unwrap Promise (→ async) and Async{Iterable,Generator} (→ stream).
-    let mut is_async = sig.is_async;
-    let mut shape = "unary";
+    // Return type: unwrap Promise (→ async) and Async{Iterable,Generator} (→ stream),
+    // via the shared parser (also used for minted-interface ops).
     conv.name_hint.push(format!("{}Result", pascal(&it.name)));
-    let (returns, ret_degraded) = match sig.return_type.as_deref() {
-        None => (FlType::Scalar("void".to_string()), false),
-        Some(rt) => {
-            let n = normalize(rt);
-            let n = n.trim().to_string();
-            if let Some(inner) = strip_generic(&n, "Promise") {
-                is_async = true;
-                let p = conv.parse_type(&inner);
-                (p.ty, p.degraded)
-            } else if let Some(inner) = strip_generic(&n, "AsyncIterable")
-                .or_else(|| strip_generic(&n, "AsyncGenerator"))
-                .or_else(|| strip_generic(&n, "AsyncIterableIterator"))
-            {
-                shape = "stream";
-                let p = conv.parse_type(&inner);
-                (p.ty, p.degraded)
-            } else {
-                let p = conv.parse_type(&n);
-                (p.ty, p.degraded)
-            }
-        }
-    };
+    let (returns, ret_async, shape, ret_degraded) =
+        parse_op_return(conv, sig.return_type.as_deref());
     conv.name_hint.pop();
+    let is_async = sig.is_async || ret_async;
     // A callback in RETURN position is the register→unsubscribe idiom
     // (`(listener) => () => void`), whose only fluessig home is `Shape::Subscription`
     // — accepted only on a CONSTRUCTIBLE interface. That fact is a whole-API
@@ -1404,85 +1404,18 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, owner: &str, it: &ApiItem) 
     })
 }
 
-/// Build an [`FlConst`] from a `const` item, or `None` when the const has no
-/// representable type. The declared `type` is lowered through the shared
-/// [`Converter::parse_type`], so a scalar becomes a bare scalar (`number` →
-/// `float64`, `boolean` → `boolean`, …) and a model/union/foreign ref resolves
-/// exactly as it does for a field/param — no parallel scalar-mapping path.
-///
-/// An intrinsically-untyped const (`any`/`unknown`/`object`, or no declared type)
-/// has NO fluessig type form: emitting it would be a zero-information
-/// `{"type":"Json"}`. It is honestly skipped and counted under
-/// `dropped["const dropped (untyped)"]` rather than dropped silently or forged
-/// into a bogus typed const. A named-but-unmodeled ref (a `class` handle like
-/// `OrchestratorSupervisor`) is NOT untyped — it lowers to whatever `parse_type`
-/// yields (here honest `Json`) and is still emitted, so the const's existence and
-/// its referenced type stay visible in the surface.
-///
-/// `const_value` is RAW EXPRESSION TEXT, not a literal, so a `value` is attached
-/// only when it is a SIMPLE literal AND the type is a const-representable scalar
-/// (see [`const_value_for`]); any runtime expression leaves `value` absent.
-fn build_const(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlConst> {
-    let raw = it.const_type.as_deref().map(normalize).unwrap_or_default();
-    let raw = raw.trim();
-    if raw.is_empty() || is_untyped_ts_type(raw) {
-        Stats::bump(&mut stats.dropped, "const dropped (untyped)");
-        return None;
-    }
-    let parsed = conv.parse_type(raw);
-    let value = const_value_for(&parsed.ty, it.const_value.as_deref());
-    stats.consts_emitted += 1;
-    Some(FlConst {
-        name: it.name.clone(),
-        doc: it.doc.clone(),
-        ty: parsed.ty,
-        value,
-    })
-}
-
-/// Extract a [`FlConstValue`] from a const's raw `const_value` text — but ONLY
-/// when the value is a SIMPLE literal and the declared `ty` is a
-/// const-representable scalar the literal matches. Anything else (a runtime
-/// expression like `pkg.version || "0.0.0"`, a non-scalar type, a form/type
-/// mismatch) → `None`, so a runtime-valued const round-trips as a typed const
-/// with no value rather than a fabricated one. The value form follows the literal
-/// (untagged), matching fluessig's `ConstValue`.
-fn const_value_for(ty: &FlType, raw: Option<&str>) -> Option<FlConstValue> {
-    let raw = raw?.trim();
-    let FlType::Scalar(scalar) = ty else {
-        return None;
-    };
-    match scalar.as_str() {
-        "string" => simple_string_literal(raw).map(FlConstValue::Str),
-        "boolean" => match raw {
-            "true" => Some(FlConstValue::Bool(true)),
-            "false" => Some(FlConstValue::Bool(false)),
-            _ => None,
-        },
-        "int32" | "int64" => raw.parse::<i64>().ok().map(FlConstValue::Int),
-        "float64" => {
-            // A bare integer literal for a float const rides as `Int` (fluessig's
-            // untagged carrier and rust-core both accept it); a fractional literal
-            // rides as `Float`.
-            if let Ok(i) = raw.parse::<i64>() {
-                Some(FlConstValue::Int(i))
-            } else {
-                raw.parse::<f64>()
-                    .ok()
-                    .filter(|f| f.is_finite())
-                    .map(FlConstValue::Float)
-            }
-        }
-        _ => None,
-    }
-}
-
 mod helpers;
 pub use helpers::FlCallbackSig;
 use helpers::*;
+
+mod mint;
+use mint::{fold_minted_interfaces, MintAccum};
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod tests_builtin;
+
+#[cfg(test)]
+mod tests_mint;

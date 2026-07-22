@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use super::{
-    build_op, ApiItem, Converter, FlConst, FlEnum, FlEnumVariant, FlField, FlForeign, FlInterface,
-    FlModel, FlType, FlUnionVariant, Parsed, Stats,
+    build_op, ApiItem, Converter, FlConst, FlConstValue, FlEnum, FlEnumVariant, FlField, FlForeign,
+    FlInterface, FlModel, FlType, FlUnionVariant, Parsed, Stats,
 };
 
 // ─────────────────────────── string helpers ─────────────────────────────────
@@ -734,24 +734,19 @@ pub(super) fn split_top_arrow(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// If `s` is a single fully-parenthesized group — the first `(` matches the last
-/// char — return its trimmed interior. `(A | B)` → `A | B`; `((x) => void)` →
-/// `(x) => void`; but `(x: T) => void` (whose first `(` closes before the end)
-/// and `() => void` return `None`.
-///
-/// Tracks only grouping-bracket (`()`/`[]`/`{}`) depth and string state — it
-/// deliberately does NOT treat `<`/`>` as brackets, so the `>` in an inner arrow
-/// (`=>`) does not spuriously close the group. (The shared [`Brackets`] scanner
-/// counts `<>` for generics, which would misread a parenthesized callback here.)
-pub(super) fn strip_paren_group(s: &str) -> Option<&str> {
-    let s = s.trim();
-    if !s.starts_with('(') {
-        return None;
-    }
+/// The byte index of the grouping bracket that closes the one opened at byte
+/// `open` (which must be a `(`/`[`/`{`). Tracks only grouping-bracket
+/// (`()`/`[]`/`{}`) depth and string state — it deliberately does NOT treat
+/// `<`/`>` as brackets, so the `>` in an inner arrow (`=>`) does not spuriously
+/// close the group. `None` when unbalanced. Shared by [`strip_paren_group`] and
+/// the method-signature paren scan in [`super::mint`].
+pub(super) fn matching_close(s: &str, open: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str: Option<char> = None;
-    let mut byte = 0usize;
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
+        if i < open {
+            continue;
+        }
         if let Some(q) = in_str {
             if c == q {
                 in_str = None;
@@ -763,18 +758,28 @@ pub(super) fn strip_paren_group(s: &str) -> Option<&str> {
                 ')' | ']' | '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        // The paren matching the leading `(` — a full group only
-                        // when it is the final char.
-                        return (byte + c.len_utf8() == s.len() && c == ')')
-                            .then(|| s[1..byte].trim());
+                        return Some(i);
                     }
                 }
                 _ => {}
             }
         }
-        byte += c.len_utf8();
     }
     None
+}
+
+/// If `s` is a single fully-parenthesized group — the first `(` matches the last
+/// char — return its trimmed interior. `(A | B)` → `A | B`; `((x) => void)` →
+/// `(x) => void`; but `(x: T) => void` (whose first `(` closes before the end)
+/// and `() => void` return `None`.
+pub(super) fn strip_paren_group(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let close = matching_close(s, 0)?;
+    // A full group only when the matching `)` is the final char.
+    (close + 1 == s.len() && s.as_bytes()[close] == b')').then(|| s[1..close].trim())
 }
 
 /// Strip a `name:` / `name?:` / `readonly name:` prefix from one callback param,
@@ -837,6 +842,36 @@ impl Converter {
 }
 
 // ─────────────────────────── item → output builders ─────────────────────────
+
+/// Parse an op's rendered return type into `(type, is_async, shape, degraded)`.
+/// Unwraps `Promise<…>` (→ `is_async`), `Async{Iterable,Generator,IterableIterator}
+/// <…>` (→ `shape == "stream"`), else a plain return (`shape == "unary"`). The
+/// caller pushes the naming hint and folds `is_async` with the item's own
+/// async-ness. Shared by [`build_op`] and the minted-interface op builder in
+/// [`super::mint`] so both lower a return identically.
+pub(super) fn parse_op_return(
+    conv: &mut Converter,
+    raw: Option<&str>,
+) -> (FlType, bool, &'static str, bool) {
+    let Some(rt) = raw else {
+        return (FlType::Scalar("void".to_string()), false, "unary", false);
+    };
+    let n = normalize(rt);
+    let n = n.trim().to_string();
+    if let Some(inner) = strip_generic(&n, "Promise") {
+        let p = conv.parse_type(&inner);
+        (p.ty, true, "unary", p.degraded)
+    } else if let Some(inner) = strip_generic(&n, "AsyncIterable")
+        .or_else(|| strip_generic(&n, "AsyncGenerator"))
+        .or_else(|| strip_generic(&n, "AsyncIterableIterator"))
+    {
+        let p = conv.parse_type(&inner);
+        (p.ty, false, "stream", p.degraded)
+    } else {
+        let p = conv.parse_type(&n);
+        (p.ty, false, "unary", p.degraded)
+    }
+}
 
 /// Build a DTO model from an `interface`/`record` item, tallying degraded fields.
 pub(super) fn build_model(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> FlModel {
@@ -903,6 +938,83 @@ pub(super) fn build_class_interface(
         name: class.name.clone(),
         doc: class.doc.clone(),
         ops,
+    }
+}
+
+/// Build an [`FlConst`] from a `const` item, or `None` when the const has no
+/// representable type. The declared `type` is lowered through the shared
+/// [`Converter::parse_type`], so a scalar becomes a bare scalar (`number` →
+/// `float64`, `boolean` → `boolean`, …) and a model/union/foreign ref resolves
+/// exactly as it does for a field/param — no parallel scalar-mapping path.
+///
+/// An intrinsically-untyped const (`any`/`unknown`/`object`, or no declared type)
+/// has NO fluessig type form: emitting it would be a zero-information
+/// `{"type":"Json"}`. It is honestly skipped and counted under
+/// `dropped["const dropped (untyped)"]` rather than dropped silently or forged
+/// into a bogus typed const. A named-but-unmodeled ref (a `class` handle like
+/// `OrchestratorSupervisor`) is NOT untyped — it lowers to whatever `parse_type`
+/// yields (here honest `Json`) and is still emitted, so the const's existence and
+/// its referenced type stay visible in the surface.
+///
+/// `const_value` is RAW EXPRESSION TEXT, not a literal, so a `value` is attached
+/// only when it is a SIMPLE literal AND the type is a const-representable scalar
+/// (see [`const_value_for`]); any runtime expression leaves `value` absent.
+pub(super) fn build_const(
+    conv: &mut Converter,
+    stats: &mut Stats,
+    it: &ApiItem,
+) -> Option<FlConst> {
+    let raw = it.const_type.as_deref().map(normalize).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() || is_untyped_ts_type(raw) {
+        Stats::bump(&mut stats.dropped, "const dropped (untyped)");
+        return None;
+    }
+    let parsed = conv.parse_type(raw);
+    let value = const_value_for(&parsed.ty, it.const_value.as_deref());
+    stats.consts_emitted += 1;
+    Some(FlConst {
+        name: it.name.clone(),
+        doc: it.doc.clone(),
+        ty: parsed.ty,
+        value,
+    })
+}
+
+/// Extract a [`FlConstValue`] from a const's raw `const_value` text — but ONLY
+/// when the value is a SIMPLE literal and the declared `ty` is a
+/// const-representable scalar the literal matches. Anything else (a runtime
+/// expression like `pkg.version || "0.0.0"`, a non-scalar type, a form/type
+/// mismatch) → `None`, so a runtime-valued const round-trips as a typed const
+/// with no value rather than a fabricated one. The value form follows the literal
+/// (untagged), matching fluessig's `ConstValue`.
+pub(super) fn const_value_for(ty: &FlType, raw: Option<&str>) -> Option<FlConstValue> {
+    let raw = raw?.trim();
+    let FlType::Scalar(scalar) = ty else {
+        return None;
+    };
+    match scalar.as_str() {
+        "string" => simple_string_literal(raw).map(FlConstValue::Str),
+        "boolean" => match raw {
+            "true" => Some(FlConstValue::Bool(true)),
+            "false" => Some(FlConstValue::Bool(false)),
+            _ => None,
+        },
+        "int32" | "int64" => raw.parse::<i64>().ok().map(FlConstValue::Int),
+        "float64" => {
+            // A bare integer literal for a float const rides as `Int` (fluessig's
+            // untagged carrier and rust-core both accept it); a fractional literal
+            // rides as `Float`.
+            if let Ok(i) = raw.parse::<i64>() {
+                Some(FlConstValue::Int(i))
+            } else {
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(FlConstValue::Float)
+            }
+        }
+        _ => None,
     }
 }
 
