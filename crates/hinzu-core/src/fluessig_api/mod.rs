@@ -415,6 +415,14 @@ struct Converter {
     /// `TSchema`), so a bare ref to one is recognized as a generic rather than an
     /// unresolved external. Set around each item's fields/signature, then cleared.
     current_generics: BTreeSet<String>,
+    /// Names of primary `class` items emitted as method-bearing interfaces. A ref
+    /// to one resolves to a typed `{"model":..}` handle (reusing the Model
+    /// namespace) rather than degrading to `Json`.
+    known_interfaces: BTreeSet<String>,
+    /// Deferred register→unsubscribe ops, finalized by the constructibility
+    /// post-pass into a `subscription` (if the owning interface is constructible)
+    /// or an honest degraded unary op.
+    sub_candidates: Vec<SubCandidate>,
 }
 
 /// The outcome of parsing one rendered type string.
@@ -457,6 +465,8 @@ impl Converter {
             known_nonmodel: BTreeSet::new(),
             generic_params: BTreeMap::new(),
             current_generics: BTreeSet::new(),
+            known_interfaces: BTreeSet::new(),
+            sub_candidates: Vec::new(),
         }
     }
 
@@ -645,6 +655,16 @@ impl Converter {
         }
         if let Some(foreign) = builtin_foreign(s) {
             return self.emit_foreign(s, foreign);
+        }
+        if self.known_interfaces.contains(s) {
+            // A declared method-bearing interface (a `class` handle with ops).
+            // Emit a typed model-ref — reusing the Model namespace, which fluessig
+            // disambiguates from a DTO by interface-set membership — rather than
+            // degrading to `Json`.
+            Stats::bump(&mut self.notes, "interface ref → model");
+            return Parsed::clean(FlType::Model {
+                model: s.to_string(),
+            });
         }
         if self.known_nonmodel.contains(s) {
             // Declared in scope but with no DTO form (a `class` handle, a dropped
@@ -1056,17 +1076,25 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
         !known_models.contains(n) && !known_enums.contains(n) && !known_unions.contains(n)
     });
 
+    // Primary method-bearing classes emitted as interfaces — a ref to one resolves
+    // to a typed model-handle, and the set the subscription post-pass gates on.
+    let known_interfaces = method_bearing_classes(&items);
+
     let mut conv = Converter::new(known_enums, known_models);
     conv.known_unions = known_unions;
     conv.indexable = indexable;
     conv.context_names = context_names;
     conv.known_nonmodel = known_nonmodel;
+    conv.known_interfaces = known_interfaces.clone();
 
     // Pass 2 — models, interfaces, and free-function ops.
     let mut models: Vec<FlModel> = Vec::new();
     let mut interfaces: Vec<FlInterface> = Vec::new();
     let mut consts: Vec<FlConst> = Vec::new();
     let mut free_ops: Vec<FlOp> = Vec::new();
+    // The interface the free functions are grouped under — the owner key their ops
+    // carry into the subscription post-pass.
+    let free_iface = package_interface_name(&report.package.name);
 
     for it in &items {
         match it.kind.as_str() {
@@ -1077,7 +1105,7 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
                 interfaces.push(build_class_interface(&mut conv, &mut stats, &items, it));
             }
             "function" => {
-                if let Some(op) = build_op(&mut conv, &mut stats, it) {
+                if let Some(op) = build_op(&mut conv, &mut stats, &free_iface, it) {
                     free_ops.push(op);
                 }
             }
@@ -1126,7 +1154,7 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     if !free_ops.is_empty() {
         free_ops.sort_by(|a, b| a.name.cmp(&b.name));
         interfaces.push(FlInterface {
-            name: package_interface_name(&report.package.name),
+            name: free_iface.clone(),
             doc: Some(format!(
                 "Free functions of `{}`, grouped as one interface.",
                 report.package.name
@@ -1178,6 +1206,21 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     stats.models_minted = conv.minted.len();
     models.extend(std::mem::take(&mut conv.minted).into_values());
 
+    // Subscription post-pass. Now that every model-ref is emitted, compute which
+    // declared interfaces are CONSTRUCTIBLE (referenced by a `{"model":..}` handle
+    // in a return/value position), then finalize each deferred register→unsubscribe
+    // op: a constructible owner yields a `subscription` returning `void`, else the
+    // honest degraded unary op — never a subscription fluessig would reject.
+    let constructible = constructible_interfaces(&interfaces, &models, &consts, &known_interfaces);
+    let sub_candidates = std::mem::take(&mut conv.sub_candidates);
+    promote_subscriptions(
+        &mut interfaces,
+        &sub_candidates,
+        &constructible,
+        &mut stats,
+        &mut conv.reasons,
+    );
+
     models.sort_by(|a, b| a.name.cmp(&b.name));
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     consts.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1223,93 +1266,11 @@ pub fn build_fluessig(report: &ApiReport, context: &[ApiReport]) -> FluessigOutp
     }
 }
 
-/// Build a catalog [`FlEnum`] from a real `enum` item's variants (name + wire
-/// discriminant). Shared by the primary and context namespace passes.
-fn enum_from_item(it: &ApiItem) -> FlEnum {
-    FlEnum {
-        name: it.name.clone(),
-        variants: it
-            .variants
-            .iter()
-            .map(|v| FlEnumVariant {
-                name: v.name.clone(),
-                value: v.discriminant.clone(),
-            })
-            .collect(),
-    }
-}
-
-/// Build a DTO model from an `interface`/`record` item, tallying degraded fields.
-fn build_model(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> FlModel {
-    conv.current_generics = generic_names(&it.generics);
-    let mut fields = Vec::new();
-    for f in &it.fields {
-        // A method-shaped field on an interface (a rendered function type) has no
-        // DTO meaning — skip it rather than emitting a `Json` data field.
-        if has_top_level_arrow(&normalize(&f.ty)) {
-            Stats::bump(&mut stats.notes, "interface method-field skipped");
-            continue;
-        }
-        stats.fields_total += 1;
-        conv.name_hint
-            .push(format!("{}{}", pascal(&it.name), pascal(&f.name)));
-        let parsed = conv.parse_type(&f.ty);
-        conv.name_hint.pop();
-        let (ty, was_nullable) = unwrap_nullable(parsed.ty);
-        if parsed.degraded {
-            stats.fields_degraded += 1;
-        }
-        fields.push(FlField {
-            name: f.name.clone(),
-            ty,
-            nullable: f.optional || was_nullable,
-        });
-    }
-    conv.current_generics.clear();
-    FlModel {
-        name: it.name.clone(),
-        doc: it.doc.clone(),
-        fields,
-    }
-}
-
-/// Build an op-bearing interface from a `class` item and its `method` items
-/// (matched by receiver == class name).
-fn build_class_interface(
-    conv: &mut Converter,
-    stats: &mut Stats,
-    items: &[&ApiItem],
-    class: &ApiItem,
-) -> FlInterface {
-    let mut ops = Vec::new();
-    for it in items {
-        if it.kind != "method" {
-            continue;
-        }
-        let is_ours = it
-            .signature
-            .as_ref()
-            .and_then(|s| s.receiver.as_deref())
-            .map(|r| r == class.name)
-            .unwrap_or(false)
-            || it.id.starts_with(&format!("{}.", class.id));
-        if is_ours {
-            if let Some(op) = build_op(conv, stats, it) {
-                ops.push(op);
-            }
-        }
-    }
-    ops.sort_by(|a, b| a.name.cmp(&b.name));
-    FlInterface {
-        name: class.name.clone(),
-        doc: class.doc.clone(),
-        ops,
-    }
-}
-
 /// Build one op from a `function`/`method` item. Returns `None` only when the
-/// item has no signature.
-fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlOp> {
+/// item has no signature. `owner` is the name of the interface the op belongs to
+/// (a class, or the free-function package interface) — the key the subscription
+/// post-pass consults for constructibility.
+fn build_op(conv: &mut Converter, stats: &mut Stats, owner: &str, it: &ApiItem) -> Option<FlOp> {
     let sig = it.signature.as_ref()?;
     stats.ops_total += 1;
     // The op's own generics plus the owning item's — either can spell a bare
@@ -1346,24 +1307,14 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
     };
     conv.name_hint.pop();
     // A callback in RETURN position is the register→unsubscribe idiom
-    // (`(listener) => () => void`). Its only fluessig home is `Shape::Subscription`,
-    // which `load_api` accepts only on a STATEFUL interface (one carrying a
-    // `Shape::Ctor` op). No public constructor is extracted from the ApiReport
-    // surface, so no interface here has a ctor op and a subscription would be
-    // rejected. Degrade the return honestly rather than emit a callback fluessig
-    // cannot lower in this position — the callback PARAM is still emitted typed.
-    let returns = if returns_is_callback(&returns) {
-        Stats::bump(
-            &mut conv.reasons,
-            "subscription return: interface has no ctor op",
-        );
-        stats.returns_degraded += 1;
-        degraded = true;
-        FlType::json()
-    } else {
-        returns
-    };
-    if ret_degraded {
+    // (`(listener) => () => void`), whose only fluessig home is `Shape::Subscription`
+    // — accepted only on a CONSTRUCTIBLE interface. That fact is a whole-API
+    // property (is the owning interface referenced by a model-ref anywhere?), not
+    // known here, so the return/shape/tally are DEFERRED to the constructibility
+    // post-pass (see [`promote_subscriptions`]). Here we only carry the callback
+    // return through provisionally and record the op as a candidate below.
+    let ret_is_cb = returns_is_callback(&returns);
+    if !ret_is_cb && ret_degraded {
         stats.returns_degraded += 1;
         degraded = true;
     }
@@ -1399,7 +1350,16 @@ fn build_op(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> Option<FlO
     }
 
     conv.current_generics.clear();
-    if degraded {
+    if ret_is_cb {
+        // Defer the clean/degraded tally and the return/shape finalization to the
+        // subscription post-pass; `idiom` gates on the single-callback-param shape.
+        conv.sub_candidates.push(SubCandidate {
+            interface: owner.to_string(),
+            op: it.name.clone(),
+            idiom: params.len() == 1 && returns_is_callback(&params[0].ty),
+            param_degraded: degraded,
+        });
+    } else if degraded {
         stats.ops_degraded += 1;
     } else {
         stats.ops_clean += 1;

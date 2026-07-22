@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use super::{Converter, FlEnumVariant, FlField, FlForeign, FlType, FlUnionVariant, Parsed};
+use super::{
+    build_op, ApiItem, Converter, FlConst, FlEnum, FlEnumVariant, FlField, FlForeign, FlInterface,
+    FlModel, FlType, FlUnionVariant, Parsed, Stats,
+};
 
 // ─────────────────────────── string helpers ─────────────────────────────────
 
@@ -777,6 +780,217 @@ impl Converter {
                 callback: FlCallbackSig::sync_void(params),
             },
             degraded,
+        }
+    }
+}
+
+// ─────────────────────────── item → output builders ─────────────────────────
+
+/// Build a DTO model from an `interface`/`record` item, tallying degraded fields.
+pub(super) fn build_model(conv: &mut Converter, stats: &mut Stats, it: &ApiItem) -> FlModel {
+    conv.current_generics = generic_names(&it.generics);
+    let mut fields = Vec::new();
+    for f in &it.fields {
+        // A method-shaped field on an interface (a rendered function type) has no
+        // DTO meaning — skip it rather than emitting a `Json` data field.
+        if has_top_level_arrow(&normalize(&f.ty)) {
+            Stats::bump(&mut stats.notes, "interface method-field skipped");
+            continue;
+        }
+        stats.fields_total += 1;
+        conv.name_hint
+            .push(format!("{}{}", pascal(&it.name), pascal(&f.name)));
+        let parsed = conv.parse_type(&f.ty);
+        conv.name_hint.pop();
+        let (ty, was_nullable) = unwrap_nullable(parsed.ty);
+        if parsed.degraded {
+            stats.fields_degraded += 1;
+        }
+        fields.push(FlField {
+            name: f.name.clone(),
+            ty,
+            nullable: f.optional || was_nullable,
+        });
+    }
+    conv.current_generics.clear();
+    FlModel {
+        name: it.name.clone(),
+        doc: it.doc.clone(),
+        fields,
+    }
+}
+
+/// Build an op-bearing interface from a `class` item and its `method` items
+/// (matched by receiver == class name).
+pub(super) fn build_class_interface(
+    conv: &mut Converter,
+    stats: &mut Stats,
+    items: &[&ApiItem],
+    class: &ApiItem,
+) -> FlInterface {
+    let mut ops = Vec::new();
+    for it in items {
+        if it.kind != "method" {
+            continue;
+        }
+        let is_ours = it
+            .signature
+            .as_ref()
+            .and_then(|s| s.receiver.as_deref())
+            .map(|r| r == class.name)
+            .unwrap_or(false)
+            || it.id.starts_with(&format!("{}.", class.id));
+        if is_ours {
+            if let Some(op) = build_op(conv, stats, &class.name, it) {
+                ops.push(op);
+            }
+        }
+    }
+    ops.sort_by(|a, b| a.name.cmp(&b.name));
+    FlInterface {
+        name: class.name.clone(),
+        doc: class.doc.clone(),
+        ops,
+    }
+}
+
+// ─────────────────────── interface refs & subscriptions ─────────────────────
+
+/// Build a catalog [`FlEnum`] from a real `enum` item's variants (name + wire
+/// discriminant). Shared by the primary and context namespace passes.
+pub(super) fn enum_from_item(it: &ApiItem) -> FlEnum {
+    FlEnum {
+        name: it.name.clone(),
+        variants: it
+            .variants
+            .iter()
+            .map(|v| FlEnumVariant {
+                name: v.name.clone(),
+                value: v.discriminant.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The names of primary-package `class` items that carry at least one method — a
+/// method-bearing handle emitted as an interface. A value ref to one of these is
+/// a typed handle (a `{"model":..}` reuse of the Model namespace, disambiguated
+/// downstream by interface-set membership) rather than an untyped `Json`.
+pub(super) fn method_bearing_classes(items: &[&ApiItem]) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for c in items.iter().filter(|it| it.kind == "class") {
+        let has_method = items.iter().any(|it| {
+            it.kind == "method"
+                && (it
+                    .signature
+                    .as_ref()
+                    .and_then(|s| s.receiver.as_deref())
+                    .map(|r| r == c.name)
+                    .unwrap_or(false)
+                    || it.id.starts_with(&format!("{}.", c.id)))
+        });
+        if has_method {
+            set.insert(c.name.clone());
+        }
+    }
+    set
+}
+
+/// A deferred register→unsubscribe op whose subscription-vs-degrade fate is
+/// resolved by the constructibility post-pass (its owning interface must be
+/// referenced by an interface-model ref somewhere to accept a `Shape::Subscription`).
+pub(super) struct SubCandidate {
+    pub interface: String,
+    pub op: String,
+    /// The op has exactly one callback param — the register→unsubscribe idiom.
+    pub idiom: bool,
+    /// A param (not the callback return) degraded, so promoting to a subscription
+    /// does not by itself make the op clean.
+    pub param_degraded: bool,
+}
+
+/// Collect the interface-model refs reachable in a type (unwrapping `Nullable`/
+/// `List`, and descending into `Callback` params/return) into `out`.
+fn collect_model_refs(t: &FlType, out: &mut BTreeSet<String>) {
+    match t {
+        FlType::Model { model } => {
+            out.insert(model.clone());
+        }
+        FlType::List { list } => collect_model_refs(list, out),
+        FlType::Nullable { nullable } => collect_model_refs(nullable, out),
+        FlType::Callback { callback } => {
+            for p in &callback.params {
+                collect_model_refs(p, out);
+            }
+            collect_model_refs(&callback.returns, out);
+        }
+        _ => {}
+    }
+}
+
+/// The set of CONSTRUCTIBLE interfaces: declared interfaces (`iface_set`) that are
+/// referenced via a `FlType::Model` anywhere in an emitted return/value position.
+/// fluessig accepts a `Shape::Subscription` only on such an interface.
+pub(super) fn constructible_interfaces(
+    interfaces: &[FlInterface],
+    models: &[FlModel],
+    consts: &[FlConst],
+    iface_set: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    for i in interfaces {
+        for op in &i.ops {
+            collect_model_refs(&op.returns, &mut refs);
+            for p in &op.params {
+                collect_model_refs(&p.ty, &mut refs);
+            }
+        }
+    }
+    for m in models {
+        for f in &m.fields {
+            collect_model_refs(&f.ty, &mut refs);
+        }
+    }
+    for c in consts {
+        collect_model_refs(&c.ty, &mut refs);
+    }
+    refs.intersection(iface_set).cloned().collect()
+}
+
+/// Finalize each deferred register→unsubscribe op. When its owning interface is
+/// constructible AND it is the single-callback-param idiom, flip it to a
+/// `subscription` returning `void` (not counted degraded — a subscription fluessig
+/// accepts). Otherwise keep the honest unary shape and degrade the callback return
+/// to `Json` (counted), so no rejectable subscription is emitted.
+pub(super) fn promote_subscriptions(
+    interfaces: &mut [FlInterface],
+    candidates: &[SubCandidate],
+    constructible: &BTreeSet<String>,
+    stats: &mut Stats,
+    reasons: &mut BTreeMap<String, usize>,
+) {
+    for c in candidates {
+        let op = interfaces
+            .iter_mut()
+            .find(|i| i.name == c.interface)
+            .and_then(|i| i.ops.iter_mut().find(|o| o.name == c.op));
+        if c.idiom && constructible.contains(&c.interface) {
+            if let Some(op) = op {
+                op.shape = "subscription".to_string();
+                op.returns = FlType::Scalar("void".to_string());
+            }
+            if c.param_degraded {
+                stats.ops_degraded += 1;
+            } else {
+                stats.ops_clean += 1;
+            }
+        } else {
+            if let Some(op) = op {
+                op.returns = FlType::json();
+            }
+            Stats::bump(reasons, "subscription return: interface has no ctor op");
+            stats.returns_degraded += 1;
+            stats.ops_degraded += 1;
         }
     }
 }

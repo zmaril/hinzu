@@ -1116,6 +1116,162 @@ fn in_scope_class_ref_is_unmodeled_not_context_gap() {
     assert!(out.stats.foreign_types.is_empty());
 }
 
+// ─────────────────── interface model-refs & subscription ops ─────────────────
+
+/// A `function`/`method` item with the given signature. `receiver` names the
+/// owning class for a method; a `None` return is a `void` op.
+fn op_item(
+    kind: &str,
+    name: &str,
+    receiver: Option<&str>,
+    params: Vec<(&str, &str)>,
+    ret: Option<&str>,
+) -> ApiItem {
+    let prefix = receiver.map(|r| format!("{r}.")).unwrap_or_default();
+    let mut it = ApiItem::new(kind, &format!("m#{prefix}{name}"), name, "m");
+    it.signature = Some(Signature {
+        params: params
+            .into_iter()
+            .map(|(n, t)| Param {
+                name: n.to_string(),
+                ty: t.to_string(),
+                optional: false,
+                default: None,
+            })
+            .collect(),
+        return_type: ret.map(str::to_string),
+        is_async: false,
+        receiver: receiver.map(str::to_string),
+        error_type: None,
+        generics: vec![],
+    });
+    it
+}
+
+/// A return naming a DECLARED method-bearing interface resolves to a typed
+/// `{"model":"Name"}` handle — reusing the Model namespace (fluessig disambiguates
+/// it from a DTO by interface-set membership) — rather than degrading to `Json`.
+#[test]
+fn return_naming_declared_interface_emits_model_ref() {
+    let class = ApiItem::new("class", "m#RpcProcessInstance", "RpcProcessInstance", "m");
+    let ping = op_item(
+        "method",
+        "ping",
+        Some("RpcProcessInstance"),
+        vec![],
+        Some("void"),
+    );
+    let factory = op_item(
+        "function",
+        "createRpcProcessInstance",
+        None,
+        vec![],
+        Some("RpcProcessInstance"),
+    );
+    let out = build_fluessig(&demo_report(vec![class, ping, factory]), &[]);
+
+    let make = out
+        .api
+        .interfaces
+        .iter()
+        .flat_map(|i| &i.ops)
+        .find(|o| o.name == "createRpcProcessInstance")
+        .unwrap();
+    assert_eq!(
+        make.returns,
+        FlType::Model {
+            model: "RpcProcessInstance".to_string()
+        }
+    );
+    // Serializes to the reused Model wire shape.
+    assert_eq!(
+        serde_json::to_value(&make.returns).unwrap(),
+        serde_json::json!({"model": "RpcProcessInstance"})
+    );
+    // The interface-ref return is not a degradation.
+    assert_eq!(out.stats.unmodeled_refs.get("RpcProcessInstance"), None);
+}
+
+/// A register→unsubscribe op (single Callback param + `() => void` return) on a
+/// CONSTRUCTIBLE interface (referenced by a model-ref somewhere) flips to
+/// `shape:"subscription"` returning `void`, keeping its typed Callback param and
+/// counting clean — never a subscription fluessig would reject.
+#[test]
+fn constructible_interface_register_unsubscribe_becomes_subscription() {
+    let class = ApiItem::new("class", "m#RpcProcessInstance", "RpcProcessInstance", "m");
+    let on_event = op_item(
+        "method",
+        "onEvent",
+        Some("RpcProcessInstance"),
+        vec![("listener", "(event: string) => void")],
+        Some("() => void"),
+    );
+    let factory = op_item(
+        "function",
+        "createRpcProcessInstance",
+        None,
+        vec![],
+        Some("RpcProcessInstance"),
+    );
+    let out = build_fluessig(&demo_report(vec![class, on_event, factory]), &[]);
+
+    let op = out
+        .api
+        .interfaces
+        .iter()
+        .find(|i| i.name == "RpcProcessInstance")
+        .unwrap()
+        .ops
+        .iter()
+        .find(|o| o.name == "onEvent")
+        .unwrap();
+    assert_eq!(op.shape, "subscription");
+    assert_eq!(op.returns, FlType::Scalar("void".to_string()));
+    assert_eq!(op.params.len(), 1);
+    assert!(matches!(op.params[0].ty, FlType::Callback { .. }));
+    // The flip removed the return degradation: no honest-degrade reason recorded.
+    assert!(!out
+        .stats
+        .degradation_reasons
+        .contains_key("subscription return: interface has no ctor op"));
+}
+
+/// The constructibility GUARD: the same register→unsubscribe idiom on an interface
+/// NOT referenced anywhere (not constructible) keeps the honest unary shape with a
+/// degraded `Json` return — so no `Shape::Subscription` fluessig would reject is
+/// emitted.
+#[test]
+fn non_constructible_interface_register_unsubscribe_stays_unary_degraded() {
+    let class = ApiItem::new("class", "m#Lonely", "Lonely", "m");
+    let on_event = op_item(
+        "method",
+        "onEvent",
+        Some("Lonely"),
+        vec![("listener", "(event: string) => void")],
+        Some("() => void"),
+    );
+    let out = build_fluessig(&demo_report(vec![class, on_event]), &[]);
+
+    let op = out
+        .api
+        .interfaces
+        .iter()
+        .find(|i| i.name == "Lonely")
+        .unwrap()
+        .ops
+        .iter()
+        .find(|o| o.name == "onEvent")
+        .unwrap();
+    assert_eq!(op.shape, "unary");
+    assert_eq!(op.returns, FlType::json());
+    assert_eq!(
+        out.stats
+            .degradation_reasons
+            .get("subscription return: interface has no ctor op"),
+        Some(&1)
+    );
+}
+
 #[test]
 fn unused_variant_field_is_ignored() {
     // Guard: Variant is imported for completeness of the api surface but the
