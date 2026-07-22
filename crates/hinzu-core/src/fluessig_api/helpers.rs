@@ -434,6 +434,58 @@ pub(super) fn builtin_foreign(s: &str) -> Option<FlForeign> {
     })
 }
 
+/// A curated table of bare JS/lib **builtin** type names that have no pi
+/// declaration yet carry a faithful cross-language DTO shape — so rather than
+/// degrading them to `Json` (as an unresolved ref) they are mapped to a minted,
+/// declared model. Currently the sole entry is the standard `Error` interface,
+/// modeled as `{ name: string, message: string, stack?: string }` — the shape a
+/// JS `Error` presents when handed to a callback across the binding boundary.
+///
+/// The model is named **`JsError`** (not `Error`) so it cannot collide with
+/// Rust's `std::error::Error` / `anyhow::Error` in fluessig-gen's rust-core
+/// output. `stack` is optional in the platform (`Error.prototype.stack` is
+/// non-standard/absent in some engines), so it lowers to a nullable field.
+///
+/// FAITHFULNESS: only the three standard interface fields are modeled;
+/// implementation-specific extras a concrete error subclass may carry (`cause`,
+/// custom own-properties) are NOT captured — this is the portable common shape,
+/// not a lossless mirror of any one engine's `Error`.
+///
+/// Returns `None` for any name not in the builtin table, so an unknown
+/// PascalCase ref stays on the existing unresolved/foreign/pi-internal paths.
+pub(super) fn builtin_model(s: &str) -> Option<FlModel> {
+    match s {
+        "Error" => Some(FlModel {
+            name: "JsError".to_string(),
+            doc: Some(
+                "The standard JavaScript `Error` interface (name/message/stack), \
+                 mapped from the JS builtin `Error` by hinzu api-fluessig. \
+                 Implementation-specific extras (`cause`, custom properties) are \
+                 not modeled."
+                    .to_string(),
+            ),
+            fields: vec![
+                FlField {
+                    name: "name".to_string(),
+                    ty: FlType::Scalar("string".to_string()),
+                    nullable: false,
+                },
+                FlField {
+                    name: "message".to_string(),
+                    ty: FlType::Scalar("string".to_string()),
+                    nullable: false,
+                },
+                FlField {
+                    name: "stack".to_string(),
+                    ty: FlType::Scalar("string".to_string()),
+                    nullable: true,
+                },
+            ],
+        }),
+        _ => None,
+    }
+}
+
 /// If a type came back `Nullable<T>`, peel it and report that it was nullable
 /// (so the field/param `nullable`/`optional` flag carries it instead).
 pub(super) fn unwrap_nullable(t: FlType) -> (FlType, bool) {
